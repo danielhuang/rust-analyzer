@@ -197,7 +197,7 @@ pub fn resolve_completion_edits(
             current_crate,
             NameToImport::exact_case_sensitive(imported_name),
             items_locator::AssocItemSearch::Include,
-            Some(items_locator::DEFAULT_QUERY_SEARCH_LIMIT.inner()),
+            None,
         );
         let import = items_with_name
             .filter_map(|candidate| {
