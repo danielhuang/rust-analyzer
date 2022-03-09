@@ -2,8 +2,11 @@
 
 use std::env::var;
 
-use chalk_ir::GoalData;
-use chalk_recursive::Cache;
+use cached::proc_macro::cached;
+use chalk_ir::NoSolution;
+use chalk_ir::UCanonical;
+use chalk_ir::{Fallible, GoalData};
+use chalk_recursive::{Cache, UCanonicalGoal};
 use chalk_solve::{logging_db::LoggingRustIrDatabase, Solver};
 
 use base_db::CrateId;
@@ -25,11 +28,17 @@ pub(crate) struct ChalkContext<'a> {
     pub(crate) krate: CrateId,
 }
 
+#[cached]
+pub fn chalk_cache() -> Cache<UCanonical<InEnvironment<Goal>>, Result<Solution, NoSolution>> {
+    eprintln!("Created chalk cache");
+    Cache::new()
+}
+
 fn create_chalk_solver() -> chalk_recursive::RecursiveSolver<Interner> {
     let overflow_depth =
         var("CHALK_OVERFLOW_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let max_size = var("CHALK_SOLVER_MAX_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
-    chalk_recursive::RecursiveSolver::new(overflow_depth, max_size, Some(Cache::new()))
+    chalk_recursive::RecursiveSolver::new(overflow_depth, max_size, Some(chalk_cache()))
 }
 
 /// A set of clauses that we assume to be true. E.g. if we are inside this function:
@@ -65,11 +74,15 @@ impl TraitEnvironment {
 }
 
 /// Solve a trait goal using Chalk.
+// #[cached(convert = r#"{ format!("{:?}", (&krate, &goal)) }"#, key = "String")]
 pub(crate) fn trait_solve_query(
     db: &dyn HirDatabase,
     krate: CrateId,
     goal: Canonical<InEnvironment<Goal>>,
 ) -> Option<Solution> {
+    // dbg!(&krate, &goal);
+    // dbg!(&*db as *const dyn HirDatabase);
+
     let _p = profile::span("trait_solve_query").detail(|| match &goal.value.goal.data(Interner) {
         GoalData::DomainGoal(DomainGoal::Holds(WhereClause::Implemented(it))) => {
             db.trait_data(it.hir_trait_id()).name.to_string()
@@ -101,6 +114,7 @@ fn solve(
     krate: CrateId,
     goal: &chalk_ir::UCanonical<chalk_ir::InEnvironment<chalk_ir::Goal<Interner>>>,
 ) -> Option<chalk_solve::Solution<Interner>> {
+    let _p = profile::span("solve");
     let context = ChalkContext { db, krate };
     tracing::debug!("solve goal: {:?}", goal);
     let mut solver = create_chalk_solver();
@@ -111,6 +125,7 @@ fn solve(
         db.unwind_if_cancelled();
         let remaining = fuel.get();
         fuel.set(remaining - 1);
+        dbg!(&remaining);
         if remaining == 0 {
             tracing::debug!("fuel exhausted");
         }

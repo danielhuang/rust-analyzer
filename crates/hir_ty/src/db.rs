@@ -13,7 +13,9 @@ use la_arena::ArenaMap;
 use crate::{
     chalk_db,
     consteval::{ComputedExpr, ConstEvalError},
+    infer::infer_query,
     method_resolution::{InherentImpls, TraitImpls},
+    traits::trait_solve_query,
     Binders, CallableDefId, FnDefId, GenericArg, ImplTraitId, InferenceResult, Interner, PolyFnSig,
     QuantifiedWhereClause, ReturnTypeImplTraits, TraitRef, Ty, TyDefId, ValueTyDefId,
 };

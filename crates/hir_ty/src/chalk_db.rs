@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use cov_mark::hit;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
 use syntax::SmolStr;
 use tracing::debug;
 

@@ -9,6 +9,7 @@ use hir::{
     AsAssocItem, Crate, ItemInNs, Semantics,
 };
 use limit::Limit;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use syntax::{ast, AstNode, SyntaxKind::NAME};
 
 use crate::{
@@ -115,18 +116,21 @@ fn find_items<'a>(
         });
 
     // Query the local crate using the symbol index.
-    let local_results = symbol_index::crate_symbols(db, krate, local_query)
+    let local_results: Vec<_> = symbol_index::crate_symbols(db, krate.into(), local_query)
         .into_iter()
         .filter_map(move |local_candidate| get_name_definition(sema, &local_candidate))
         .filter_map(|name_definition_to_import| match name_definition_to_import {
             Definition::Macro(macro_def) => Some(ItemInNs::from(macro_def)),
             def => <Option<_>>::from(def),
-        });
+        })
+        .collect();
 
-    external_importables.chain(local_results).filter(move |&item| match assoc_item_search {
-        AssocItemSearch::Include => true,
-        AssocItemSearch::Exclude => !is_assoc_item(item, sema.db),
-        AssocItemSearch::AssocItemsOnly => is_assoc_item(item, sema.db),
+    external_importables.into_iter().chain(local_results).filter(move |&item| {
+        match assoc_item_search {
+            AssocItemSearch::Include => true,
+            AssocItemSearch::Exclude => !is_assoc_item(item, sema.db),
+            AssocItemSearch::AssocItemsOnly => is_assoc_item(item, sema.db),
+        }
     })
 }
 

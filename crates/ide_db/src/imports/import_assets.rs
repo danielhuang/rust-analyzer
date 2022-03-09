@@ -1,4 +1,5 @@
 //! Look up accessible paths for items.
+use cached::proc_macro::cached;
 use hir::{
     AsAssocItem, AssocItem, AssocItemContainer, Crate, ItemInNs, ModPath, Module, ModuleDef,
     PathResolution, PrefixKind, ScopeDef, Semantics, SemanticsScope, Type,
@@ -444,6 +445,10 @@ fn module_with_segment_name(
     None
 }
 
+// #[cached(
+//     convert = r#"{ format!("{:?}", (&current_crate, &scope, &trait_candidate, &trait_assoc_item)) }"#,
+//     key = "String"
+// )]
 fn trait_applicable_items(
     sema: &Semantics<RootDatabase>,
     current_crate: Crate,
