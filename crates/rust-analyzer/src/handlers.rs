@@ -3,6 +3,7 @@
 //! `ide` crate.
 
 use std::{
+    env::var,
     io::Write as _,
     process::{self, Stdio},
 };
@@ -812,7 +813,8 @@ pub(crate) fn handle_completion(
     let items =
         to_proto::completion_items(&snap.config, &line_index, text_document_position, items);
 
-    let completion_list = lsp_types::CompletionList { is_incomplete: true, items };
+    let completion_list =
+        lsp_types::CompletionList { is_incomplete: var("RA_COMPLETE").is_err(), items };
     Ok(Some(completion_list.into()))
 }
 

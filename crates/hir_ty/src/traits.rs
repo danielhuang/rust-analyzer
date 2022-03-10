@@ -1,6 +1,8 @@
 //! Trait solving using Chalk.
 
 use std::env::var;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use cached::proc_macro::cached;
 use chalk_ir::NoSolution;
@@ -18,9 +20,6 @@ use crate::{
     db::HirDatabase, AliasEq, AliasTy, Canonical, DomainGoal, Goal, Guidance, InEnvironment,
     Interner, Solution, TraitRefExt, Ty, TyKind, WhereClause,
 };
-
-/// This controls how much 'time' we give the Chalk solver before giving up.
-const CHALK_SOLVER_FUEL: i32 = 100;
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct ChalkContext<'a> {
@@ -119,14 +118,15 @@ fn solve(
     tracing::debug!("solve goal: {:?}", goal);
     let mut solver = create_chalk_solver();
 
-    let fuel = std::cell::Cell::new(CHALK_SOLVER_FUEL);
+    let fuel =
+        std::cell::Cell::new(var("RA_CHALK_FUEL").ok().and_then(|x| x.parse().ok()).unwrap_or(100));
 
     let should_continue = || {
         db.unwind_if_cancelled();
         let remaining = fuel.get();
         fuel.set(remaining - 1);
-        dbg!(&remaining);
         if remaining == 0 {
+            dbg!(&remaining, &krate, &goal);
             tracing::debug!("fuel exhausted");
         }
         remaining > 0
@@ -156,6 +156,7 @@ fn solve(
     if is_chalk_debug() {
         crate::tls::set_current_program(db, solve)
     } else {
+        let _p = profile::span("solve (chalk)");
         solve()
     }
 }
