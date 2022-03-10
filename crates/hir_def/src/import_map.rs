@@ -1,6 +1,6 @@
 //! A map of all publicly exported items in a crate.
 
-use std::{fmt, hash::BuildHasherDefault, sync::Arc};
+use std::{collections::BTreeSet, fmt, hash::BuildHasherDefault, sync::Arc};
 
 use base_db::CrateId;
 use fst::{self, Streamer};
@@ -259,7 +259,7 @@ fn fst_path(path: &ImportPath) -> String {
     s
 }
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, PartialOrd, Ord)]
 pub enum ImportKind {
     Module,
     Function,
@@ -275,7 +275,7 @@ pub enum ImportKind {
 }
 
 /// A way to match import map contents against the search query.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
 pub enum SearchMode {
     /// Import map entry should strictly match the query string.
     Equals,
@@ -286,7 +286,7 @@ pub enum SearchMode {
     Fuzzy,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq, Clone, Hash)]
 pub struct Query {
     query: String,
     lowercased: String,
@@ -295,7 +295,7 @@ pub struct Query {
     search_mode: SearchMode,
     case_sensitive: bool,
     limit: usize,
-    exclude_import_kinds: FxHashSet<ImportKind>,
+    exclude_import_kinds: BTreeSet<ImportKind>,
 }
 
 impl Query {
@@ -309,7 +309,7 @@ impl Query {
             search_mode: SearchMode::Contains,
             case_sensitive: false,
             limit: usize::max_value(),
-            exclude_import_kinds: FxHashSet::default(),
+            exclude_import_kinds: BTreeSet::default(),
         }
     }
 
@@ -393,8 +393,8 @@ impl Query {
 /// Searches dependencies of `krate` for an importable path matching `query`.
 ///
 /// This returns a list of items that could be imported from dependencies of `krate`.
-pub fn search_dependencies<'a>(
-    db: &'a dyn DefDatabase,
+pub fn search_dependencies_query(
+    db: &dyn DefDatabase,
     krate: CrateId,
     query: Query,
 ) -> FxHashSet<ItemInNs> {
@@ -489,7 +489,7 @@ mod tests {
             })
             .unwrap();
 
-        let actual = search_dependencies(db.upcast(), krate, query)
+        let actual = search_dependencies_query(db.upcast(), krate, query)
             .into_iter()
             .filter_map(|dependency| {
                 let dependency_krate = dependency.krate(db.upcast())?;

@@ -5,6 +5,7 @@ use base_db::{salsa, CrateId, SourceDatabase, Upcast};
 use either::Either;
 use hir_expand::{db::AstDatabase, HirFileId};
 use la_arena::ArenaMap;
+use rustc_hash::FxHashSet;
 use syntax::{ast, AstPtr, SmolStr};
 
 use crate::{
@@ -16,8 +17,9 @@ use crate::{
         TraitData, TypeAliasData,
     },
     generics::GenericParams,
-    import_map::ImportMap,
+    import_map::{ImportMap, Query},
     intern::Interned,
+    item_scope::ItemInNs,
     item_tree::ItemTree,
     lang_item::{LangItemTarget, LangItems},
     nameres::DefMap,
@@ -171,6 +173,9 @@ pub trait DefDatabase: InternDatabase + AstDatabase + Upcast<dyn AstDatabase> {
 
     #[salsa::invoke(ImportMap::import_map_query)]
     fn import_map(&self, krate: CrateId) -> Arc<ImportMap>;
+
+    #[salsa::invoke(crate::import_map::search_dependencies_query)]
+    fn search_dependencies(&self, krate: CrateId, query: Query) -> FxHashSet<ItemInNs>;
 
     #[salsa::invoke(visibility::field_visibilities_query)]
     fn field_visibilities(&self, var: VariantId) -> Arc<ArenaMap<LocalFieldId, Visibility>>;

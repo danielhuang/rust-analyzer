@@ -142,12 +142,17 @@ fn get_name_definition(
 
     let candidate_node = import_candidate.loc.syntax(sema)?;
     let candidate_name_node = if candidate_node.kind() != NAME {
+        let _p = profile::span("get_name_definition candidate_name_node from children")
+            .detail(|| candidate_node.children().count().to_string());
         candidate_node.children().find(|it| it.kind() == NAME)?
     } else {
         candidate_node
     };
-    let name = ast::Name::cast(candidate_name_node)?;
-    NameClass::classify(sema, &name)?.defined()
+    {
+        let _p = profile::span("get_name_definition NameClass::classify");
+        let name = ast::Name::cast(candidate_name_node)?;
+        NameClass::classify(sema, &name)?.defined()
+    }
 }
 
 fn is_assoc_item(item: ItemInNs, db: &RootDatabase) -> bool {
