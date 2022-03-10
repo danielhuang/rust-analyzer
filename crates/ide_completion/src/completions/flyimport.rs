@@ -242,10 +242,6 @@ fn import_assets(ctx: &CompletionContext, fuzzy_name: String) -> Option<ImportAs
             &ctx.sema,
             ctx.token.parent()?,
         )?;
-        if fuzzy_name_length < 3 {
-            cov_mark::hit!(flyimport_exact_on_short_path);
-            assets_for_path.path_fuzzy_name_to_exact(false);
-        }
         Some(assets_for_path)
     }
 }

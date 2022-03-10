@@ -1,12 +1,8 @@
 //! Trait solving using Chalk.
 
-use std::env::var;
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::fmt::Debug;
+use std::{env::var, sync::Arc};
 
-use cached::proc_macro::cached;
-use chalk_ir::NoSolution;
-use chalk_ir::UCanonical;
 use chalk_ir::{Fallible, GoalData};
 use chalk_recursive::{Cache, UCanonicalGoal};
 use chalk_solve::{logging_db::LoggingRustIrDatabase, Solver};
@@ -27,11 +23,38 @@ pub(crate) struct ChalkContext<'a> {
     pub(crate) krate: CrateId,
 }
 
-fn create_chalk_solver() -> chalk_recursive::RecursiveSolver<Interner> {
+#[derive(Clone)]
+pub struct ChalkCache {
+    cache: Arc<Cache<UCanonicalGoal<Interner>, Fallible<Solution>>>,
+}
+
+impl PartialEq for ChalkCache {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cache, &other.cache)
+    }
+}
+
+impl Eq for ChalkCache {}
+
+impl Debug for ChalkCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChalkCache").finish()
+    }
+}
+
+pub fn chalk_cache(_: &dyn HirDatabase) -> ChalkCache {
+    ChalkCache { cache: Arc::new(Cache::new()) }
+}
+
+fn create_chalk_solver(db: &dyn HirDatabase) -> chalk_recursive::RecursiveSolver<Interner> {
     let overflow_depth =
         var("CHALK_OVERFLOW_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let max_size = var("CHALK_SOLVER_MAX_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
-    chalk_recursive::RecursiveSolver::new(overflow_depth, max_size, Some(Cache::new()))
+    chalk_recursive::RecursiveSolver::new(
+        overflow_depth,
+        max_size,
+        Some(Cache::clone(&db.chalk_cache().cache)),
+    )
 }
 
 /// A set of clauses that we assume to be true. E.g. if we are inside this function:
@@ -110,7 +133,7 @@ fn solve(
     let _p = profile::span("solve");
     let context = ChalkContext { db, krate };
     tracing::debug!("solve goal: {:?}", goal);
-    let mut solver = create_chalk_solver();
+    let mut solver = create_chalk_solver(db);
 
     let fuel =
         std::cell::Cell::new(var("RA_CHALK_FUEL").ok().and_then(|x| x.parse().ok()).unwrap_or(100));
