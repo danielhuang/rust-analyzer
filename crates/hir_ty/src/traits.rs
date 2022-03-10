@@ -27,17 +27,11 @@ pub(crate) struct ChalkContext<'a> {
     pub(crate) krate: CrateId,
 }
 
-#[cached]
-pub fn chalk_cache() -> Cache<UCanonical<InEnvironment<Goal>>, Result<Solution, NoSolution>> {
-    eprintln!("Created chalk cache");
-    Cache::new()
-}
-
 fn create_chalk_solver() -> chalk_recursive::RecursiveSolver<Interner> {
     let overflow_depth =
         var("CHALK_OVERFLOW_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let max_size = var("CHALK_SOLVER_MAX_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
-    chalk_recursive::RecursiveSolver::new(overflow_depth, max_size, Some(chalk_cache()))
+    chalk_recursive::RecursiveSolver::new(overflow_depth, max_size, Some(Cache::new()))
 }
 
 /// A set of clauses that we assume to be true. E.g. if we are inside this function:
