@@ -1,17 +1,19 @@
 //! Trait solving using Chalk.
 
 use std::fmt::Debug;
+use std::hash::Hash;
 use std::{env::var, sync::Arc};
 
 use chalk_ir::{Fallible, GoalData};
 use chalk_recursive::{Cache, UCanonicalGoal};
 use chalk_solve::{logging_db::LoggingRustIrDatabase, Solver};
 
-use base_db::CrateId;
+use base_db::{CrateGraph, CrateId};
 use hir_def::{lang_item::LangItemTarget, TraitId};
 use stdx::panic_context;
 use syntax::SmolStr;
 
+use crate::method_resolution::TraitImpls;
 use crate::{
     db::HirDatabase, AliasEq, AliasTy, Canonical, DomainGoal, Goal, Guidance, InEnvironment,
     Interner, Solution, TraitRefExt, Ty, TyKind, WhereClause,
@@ -42,18 +44,43 @@ impl Debug for ChalkCache {
     }
 }
 
-pub fn chalk_cache(_: &dyn HirDatabase) -> ChalkCache {
+#[derive(Debug, Clone)]
+pub struct ChalkCacheKey {
+    trait_impls_in_crate: Arc<TraitImpls>,
+    crate_graph: Arc<CrateGraph>,
+}
+
+impl PartialEq for ChalkCacheKey {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.trait_impls_in_crate, &other.trait_impls_in_crate)
+            && Arc::ptr_eq(&self.crate_graph, &other.crate_graph)
+    }
+}
+
+impl Eq for ChalkCacheKey {}
+
+impl Hash for ChalkCacheKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.trait_impls_in_crate).hash(state);
+        Arc::as_ptr(&self.crate_graph).hash(state);
+    }
+}
+
+pub fn chalk_cache(_: &dyn HirDatabase, _: ChalkCacheKey) -> ChalkCache {
     ChalkCache { cache: Arc::new(Cache::new()) }
 }
 
-fn create_chalk_solver(db: &dyn HirDatabase) -> chalk_recursive::RecursiveSolver<Interner> {
+fn create_chalk_solver(
+    db: &dyn HirDatabase,
+    cache_key: ChalkCacheKey,
+) -> chalk_recursive::RecursiveSolver<Interner> {
     let overflow_depth =
         var("CHALK_OVERFLOW_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
     let max_size = var("CHALK_SOLVER_MAX_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
     chalk_recursive::RecursiveSolver::new(
         overflow_depth,
         max_size,
-        Some(Cache::clone(&db.chalk_cache().cache)),
+        Some(Cache::clone(&db.chalk_cache(cache_key).cache)),
     )
 }
 
@@ -133,7 +160,13 @@ fn solve(
     let _p = profile::span("solve");
     let context = ChalkContext { db, krate };
     tracing::debug!("solve goal: {:?}", goal);
-    let mut solver = create_chalk_solver(db);
+    let mut solver = create_chalk_solver(
+        db,
+        ChalkCacheKey {
+            trait_impls_in_crate: db.trait_impls_in_crate(krate),
+            crate_graph: db.crate_graph(),
+        },
+    );
 
     let fuel =
         std::cell::Cell::new(var("RA_CHALK_FUEL").ok().and_then(|x| x.parse().ok()).unwrap_or(100));

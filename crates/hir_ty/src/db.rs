@@ -15,7 +15,7 @@ use crate::{
     consteval::{ComputedExpr, ConstEvalError},
     infer::infer_query,
     method_resolution::{InherentImpls, TraitImpls},
-    traits::{trait_solve_query, ChalkCache},
+    traits::{trait_solve_query, ChalkCache, ChalkCacheKey},
     Binders, CallableDefId, FnDefId, GenericArg, ImplTraitId, InferenceResult, Interner, PolyFnSig,
     QuantifiedWhereClause, ReturnTypeImplTraits, TraitRef, Ty, TyDefId, ValueTyDefId,
 };
@@ -168,7 +168,7 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     ) -> chalk_ir::ProgramClauses<Interner>;
 
     #[salsa::invoke(crate::traits::chalk_cache)]
-    fn chalk_cache(&self) -> ChalkCache;
+    fn chalk_cache(&self, cache_key: ChalkCacheKey) -> ChalkCache;
 }
 
 fn infer_wait(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<InferenceResult> {
