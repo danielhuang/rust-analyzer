@@ -149,7 +149,7 @@ fn integrated_completion_benchmark() {
         };
         let position =
             FilePosition { file_id, offset: TextSize::try_from(completion_offset).unwrap() };
-        analysis.completions(&config, position).unwrap();
+        test(analysis, config, position);
     }
 
     let completion_offset = {
@@ -187,8 +187,13 @@ fn integrated_completion_benchmark() {
         };
         let position =
             FilePosition { file_id, offset: TextSize::try_from(completion_offset).unwrap() };
-        analysis.completions(&config, position).unwrap();
+        test(analysis, config, position);
     }
+}
+
+#[inline(never)]
+fn test(analysis: ide::Analysis, config: CompletionConfig, position: FilePosition) {
+    analysis.completions(&config, position).unwrap();
 }
 
 fn patch(what: &mut String, from: &str, to: &str) -> usize {
