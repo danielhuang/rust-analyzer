@@ -31,7 +31,7 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             trigger_characters: Some(vec![":".to_string(), ".".to_string(), "'".to_string()]),
             all_commit_characters: None,
             completion_item: None,
-            work_done_progress_options: WorkDoneProgressOptions { work_done_progress: Some(true) },
+            work_done_progress_options: WorkDoneProgressOptions { work_done_progress: None },
         }),
         signature_help_provider: Some(SignatureHelpOptions {
             trigger_characters: Some(vec!["(".to_string(), ",".to_string(), "<".to_string()]),
