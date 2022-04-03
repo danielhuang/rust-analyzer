@@ -129,7 +129,6 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             "ssr": true,
             "workspaceSymbolScopeKindFiltering": true,
         })),
-        inlay_hint_provider: Some(OneOf::Left(true)),
     }
 }
 
