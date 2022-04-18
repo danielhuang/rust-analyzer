@@ -127,8 +127,8 @@ export function joinLines(ctx: Ctx): Cmd {
             ranges: editor.selections.map((it) => client.code2ProtocolConverter.asRange(it)),
             textDocument: ctx.client.code2ProtocolConverter.asTextDocumentIdentifier(editor.document),
         });
-        await editor.edit((builder) => {
-            client.protocol2CodeConverter.asTextEdits(items).forEach((edit: any) => {
+        await editor.edit(async (builder) => {
+            (await client.protocol2CodeConverter.asTextEdits(items)).forEach((edit: any) => {
                 builder.replace(edit.range, edit.newText);
             });
         });
@@ -157,7 +157,7 @@ export function moveItem(ctx: Ctx, direction: ra.Direction): Cmd {
 
         if (!lcEdits) return;
 
-        const edits = client.protocol2CodeConverter.asTextEdits(lcEdits);
+        const edits = await client.protocol2CodeConverter.asTextEdits(lcEdits);
         await applySnippetTextEdits(editor, edits);
     };
 }
@@ -180,7 +180,7 @@ export function onEnter(ctx: Ctx): Cmd {
         });
         if (!lcEdits) return false;
 
-        const edits = client.protocol2CodeConverter.asTextEdits(lcEdits);
+        const edits = await client.protocol2CodeConverter.asTextEdits(lcEdits);
         await applySnippetTextEdits(editor, edits);
         return true;
     }
@@ -277,12 +277,12 @@ export function ssr(ctx: Ctx): Cmd {
             location: vscode.ProgressLocation.Notification,
             title: "Structured search replace in progress...",
             cancellable: false,
-        }, async (_progress, _token) => {
+        }, async (_progress, token) => {
             const edit = await client.sendRequest(ra.ssr, {
                 query: request, parseOnly: false, textDocument, position, selections,
             });
 
-            await vscode.workspace.applyEdit(client.protocol2CodeConverter.asWorkspaceEdit(edit));
+            await vscode.workspace.applyEdit(await client.protocol2CodeConverter.asWorkspaceEdit(edit, token));
         });
     };
 }
@@ -298,12 +298,12 @@ export function serverVersion(ctx: Ctx): Cmd {
     };
 }
 
-export function toggleInlayHints(ctx: Ctx): Cmd {
+export function toggleInlayHints(_ctx: Ctx): Cmd {
     return async () => {
-        await vscode
-            .workspace
-            .getConfiguration(`${ctx.config.rootSection}.inlayHints`)
-            .update('enable', !ctx.config.inlayHints.enable, vscode.ConfigurationTarget.Global);
+        const scope = vscode.ConfigurationTarget.Global;
+        const config = vscode.workspace.getConfiguration("editor.inlayHints");
+        const value = !config.get("enabled");
+        await config.update('enabled', value, scope);
     };
 }
 
@@ -432,6 +432,54 @@ export function viewHir(ctx: Ctx): Cmd {
     };
 }
 
+export function viewFileText(ctx: Ctx): Cmd {
+    const tdcp = new class implements vscode.TextDocumentContentProvider {
+        readonly uri = vscode.Uri.parse('rust-analyzer://viewFileText/file.rs');
+        readonly eventEmitter = new vscode.EventEmitter<vscode.Uri>();
+        constructor() {
+            vscode.workspace.onDidChangeTextDocument(this.onDidChangeTextDocument, this, ctx.subscriptions);
+            vscode.window.onDidChangeActiveTextEditor(this.onDidChangeActiveTextEditor, this, ctx.subscriptions);
+        }
+
+        private onDidChangeTextDocument(event: vscode.TextDocumentChangeEvent) {
+            if (isRustDocument(event.document)) {
+                // We need to order this after language server updates, but there's no API for that.
+                // Hence, good old sleep().
+                void sleep(10).then(() => this.eventEmitter.fire(this.uri));
+            }
+        }
+        private onDidChangeActiveTextEditor(editor: vscode.TextEditor | undefined) {
+            if (editor && isRustEditor(editor)) {
+                this.eventEmitter.fire(this.uri);
+            }
+        }
+
+        provideTextDocumentContent(_uri: vscode.Uri, ct: vscode.CancellationToken): vscode.ProviderResult<string> {
+            const rustEditor = ctx.activeRustEditor;
+            const client = ctx.client;
+            if (!rustEditor || !client) return '';
+
+            const params = client.code2ProtocolConverter.asTextDocumentIdentifier(rustEditor.document);
+            return client.sendRequest(ra.viewFileText, params, ct);
+        }
+
+        get onDidChange(): vscode.Event<vscode.Uri> {
+            return this.eventEmitter.event;
+        }
+    };
+
+    ctx.pushCleanup(vscode.workspace.registerTextDocumentContentProvider('rust-analyzer', tdcp));
+
+    return async () => {
+        const document = await vscode.workspace.openTextDocument(tdcp.uri);
+        tdcp.eventEmitter.fire(tdcp.uri);
+        void await vscode.window.showTextDocument(document, {
+            viewColumn: vscode.ViewColumn.Two,
+            preserveFocus: true
+        });
+    };
+}
+
 export function viewItemTree(ctx: Ctx): Cmd {
     const tdcp = new class implements vscode.TextDocumentContentProvider {
         readonly uri = vscode.Uri.parse('rust-analyzer://viewItemTree/itemtree.rs');
@@ -517,7 +565,7 @@ function crateGraph(ctx: Ctx, full: boolean): Cmd {
             </head>
             <body>
                 <script type="text/javascript" src="${uri}/d3/dist/d3.min.js"></script>
-                <script type="javascript/worker" src="${uri}/@hpcc-js/wasm/dist/index.min.js"></script>
+                <script type="text/javascript" src="${uri}/@hpcc-js/wasm/dist/index.min.js"></script>
                 <script type="text/javascript" src="${uri}/d3-graphviz/build/d3-graphviz.min.js"></script>
                 <div id="graph"></div>
                 <script>
@@ -680,11 +728,11 @@ export function resolveCodeAction(ctx: Ctx): Cmd {
             return;
         }
         const itemEdit = item.edit;
-        const edit = client.protocol2CodeConverter.asWorkspaceEdit(itemEdit);
+        const edit = await client.protocol2CodeConverter.asWorkspaceEdit(itemEdit);
         // filter out all text edits and recreate the WorkspaceEdit without them so we can apply
         // snippet edits on our own
         const lcFileSystemEdit = { ...itemEdit, documentChanges: itemEdit.documentChanges?.filter(change => "kind" in change) };
-        const fileSystemEdit = client.protocol2CodeConverter.asWorkspaceEdit(lcFileSystemEdit);
+        const fileSystemEdit = await client.protocol2CodeConverter.asWorkspaceEdit(lcFileSystemEdit);
         await vscode.workspace.applyEdit(fileSystemEdit);
         await applySnippetWorkspaceEdit(edit);
     };

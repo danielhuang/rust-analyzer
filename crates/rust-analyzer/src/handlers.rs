@@ -20,11 +20,11 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CodeLens, CompletionItem, Diagnostic, DiagnosticTag, DocumentFormattingParams, FoldingRange,
-    FoldingRangeParams, HoverContents, Location, LocationLink, NumberOrString, Position,
-    PrepareRenameResponse, Range, RenameParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation, SymbolTag,
-    TextDocumentIdentifier, Url, WorkspaceEdit,
+    FoldingRangeParams, HoverContents, InlayHint, InlayHintParams, Location, LocationLink,
+    NumberOrString, Position, PrepareRenameResponse, Range, RenameParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation,
+    SymbolTag, TextDocumentIdentifier, Url, WorkspaceEdit,
 };
 use project_model::{ManifestPath, ProjectWorkspace, TargetKind};
 use serde_json::json;
@@ -34,15 +34,12 @@ use vfs::AbsPathBuf;
 
 use crate::{
     cargo_target_spec::CargoTargetSpec,
-    config::RustfmtConfig,
+    config::{RustfmtConfig, WorkspaceSymbolConfig},
     diff::diff,
     from_proto,
     global_state::{GlobalState, GlobalStateSnapshot},
     line_index::LineEndings,
-    lsp_ext::{
-        self, InlayHint, InlayHintsParams, PositionOrRange, ViewCrateGraphParams,
-        WorkspaceSymbolParams,
-    },
+    lsp_ext::{self, PositionOrRange, ViewCrateGraphParams, WorkspaceSymbolParams},
     lsp_utils::{all_edits_are_disjoint, invalid_params_error},
     to_proto, LspError, Result,
 };
@@ -122,6 +119,14 @@ pub(crate) fn handle_view_hir(
     let position = from_proto::file_position(&snap, params)?;
     let res = snap.analysis.view_hir(position)?;
     Ok(res)
+}
+
+pub(crate) fn handle_view_file_text(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::TextDocumentIdentifier,
+) -> Result<String> {
+    let file_id = from_proto::file_id(&snap, &params.uri)?;
+    Ok(snap.analysis.file_text(file_id)?.to_string())
 }
 
 pub(crate) fn handle_view_item_tree(
@@ -396,7 +401,9 @@ pub(crate) fn handle_workspace_symbol(
 ) -> Result<Option<Vec<SymbolInformation>>> {
     let _p = profile::span("handle_workspace_symbol");
 
-    let (all_symbols, libs) = decide_search_scope_and_kind(&params, &snap);
+    let config = snap.config.workspace_symbol();
+    let (all_symbols, libs) = decide_search_scope_and_kind(&params, &config);
+    let limit = config.search_limit;
 
     let query = {
         let query: String = params.query.chars().filter(|&c| c != '#' && c != '*').collect();
@@ -407,13 +414,13 @@ pub(crate) fn handle_workspace_symbol(
         if libs {
             q.libs();
         }
-        q.limit(128);
+        q.limit(limit);
         q
     };
     let mut res = exec_query(&snap, query)?;
     if res.is_empty() && !all_symbols {
         let mut query = Query::new(params.query);
-        query.limit(128);
+        query.limit(limit);
         res = exec_query(&snap, query)?;
     }
 
@@ -421,13 +428,11 @@ pub(crate) fn handle_workspace_symbol(
 
     fn decide_search_scope_and_kind(
         params: &WorkspaceSymbolParams,
-        snap: &GlobalStateSnapshot,
+        config: &WorkspaceSymbolConfig,
     ) -> (bool, bool) {
         // Support old-style parsing of markers in the query.
         let mut all_symbols = params.query.contains('#');
         let mut libs = params.query.contains('*');
-
-        let config = snap.config.workspace_symbol();
 
         // If no explicit marker was set, check request params. If that's also empty
         // use global config.
@@ -1316,29 +1321,25 @@ pub(crate) fn publish_diagnostics(
 
 pub(crate) fn handle_inlay_hints(
     snap: GlobalStateSnapshot,
-    params: InlayHintsParams,
-) -> Result<Vec<InlayHint>> {
+    params: InlayHintParams,
+) -> Result<Option<Vec<InlayHint>>> {
     let _p = profile::span("handle_inlay_hints");
     let document_uri = &params.text_document.uri;
     let file_id = from_proto::file_id(&snap, document_uri)?;
     let line_index = snap.file_line_index(file_id)?;
-    let range = params
-        .range
-        .map(|range| {
-            from_proto::file_range(
-                &snap,
-                TextDocumentIdentifier::new(document_uri.to_owned()),
-                range,
-            )
-        })
-        .transpose()?;
+    let range = from_proto::file_range(
+        &snap,
+        TextDocumentIdentifier::new(document_uri.to_owned()),
+        params.range,
+    )?;
     let inlay_hints_config = snap.config.inlay_hints();
-    Ok(snap
-        .analysis
-        .inlay_hints(&inlay_hints_config, file_id, range)?
-        .into_iter()
-        .map(|it| to_proto::inlay_hint(inlay_hints_config.render_colons, &line_index, it))
-        .collect())
+    Ok(Some(
+        snap.analysis
+            .inlay_hints(&inlay_hints_config, file_id, Some(range))?
+            .into_iter()
+            .map(|it| to_proto::inlay_hint(inlay_hints_config.render_colons, &line_index, it))
+            .collect(),
+    ))
 }
 
 pub(crate) fn handle_call_hierarchy_prepare(

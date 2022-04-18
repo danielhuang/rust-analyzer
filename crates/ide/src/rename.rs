@@ -219,8 +219,13 @@ fn rename_to_self(sema: &Semantics<RootDatabase>, local: hir::Local) -> RenameRe
     let first_param = params
         .first()
         .ok_or_else(|| format_err!("Cannot rename local to self unless it is a parameter"))?;
-    if first_param.as_local(sema.db) != local {
-        bail!("Only the first parameter may be renamed to self");
+    match first_param.as_local(sema.db) {
+        Some(plocal) => {
+            if plocal != local {
+                bail!("Only the first parameter may be renamed to self");
+            }
+        }
+        None => bail!("rename_to_self invoked on destructuring parameter"),
     }
 
     let assoc_item = fn_def
@@ -963,15 +968,21 @@ mod fo$0o;
                         },
                     },
                     file_system_edits: [
-                        MoveFile {
-                            src: FileId(
+                        MoveDir {
+                            src: AnchoredPathBuf {
+                                anchor: FileId(
+                                    1,
+                                ),
+                                path: "foo",
+                            },
+                            src_id: FileId(
                                 1,
                             ),
                             dst: AnchoredPathBuf {
                                 anchor: FileId(
                                     1,
                                 ),
-                                path: "../foo2/mod.rs",
+                                path: "foo2",
                             },
                         },
                     ],
@@ -1108,6 +1119,68 @@ pub mod foo$0;
         );
     }
 
+    #[test]
+    fn test_rename_mod_recursive() {
+        check_expect(
+            "foo2",
+            r#"
+//- /lib.rs
+mod foo$0;
+
+//- /foo.rs
+mod bar;
+mod corge;
+
+//- /foo/bar.rs
+mod qux;
+
+//- /foo/bar/qux.rs
+mod quux;
+
+//- /foo/bar/qux/quux/mod.rs
+// empty
+
+//- /foo/corge.rs
+// empty
+"#,
+            expect![[r#"
+                SourceChange {
+                    source_file_edits: {
+                        FileId(
+                            0,
+                        ): TextEdit {
+                            indels: [
+                                Indel {
+                                    insert: "foo2",
+                                    delete: 4..7,
+                                },
+                            ],
+                        },
+                    },
+                    file_system_edits: [
+                        MoveDir {
+                            src: AnchoredPathBuf {
+                                anchor: FileId(
+                                    1,
+                                ),
+                                path: "foo",
+                            },
+                            src_id: FileId(
+                                1,
+                            ),
+                            dst: AnchoredPathBuf {
+                                anchor: FileId(
+                                    1,
+                                ),
+                                path: "foo2",
+                            },
+                        },
+                    ],
+                    is_snippet: false,
+                }
+            "#]],
+        )
+    }
     #[test]
     fn test_rename_mod_ref_by_super() {
         check(

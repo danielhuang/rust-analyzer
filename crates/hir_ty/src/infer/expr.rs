@@ -4,7 +4,6 @@ use std::{
     collections::hash_map::Entry,
     iter::{repeat, repeat_with},
     mem,
-    sync::Arc,
 };
 
 use chalk_ir::{
@@ -29,7 +28,7 @@ use crate::{
         const_or_path_to_chalk, generic_arg_to_chalk, lower_to_chalk_mutability, ParamLoweringMode,
     },
     mapping::{from_chalk, ToChalk},
-    method_resolution,
+    method_resolution::{self, VisibleFromModule},
     primitive::{self, UintTy},
     static_lifetime, to_chalk_trait_id,
     utils::{generics, Generics},
@@ -45,10 +44,6 @@ use super::{
 impl<'a> InferenceContext<'a> {
     pub(crate) fn infer_expr(&mut self, tgt_expr: ExprId, expected: &Expectation) -> Ty {
         let ty = self.infer_expr_inner(tgt_expr, expected);
-        if self.resolve_ty_shallow(&ty).is_never() {
-            // Any expression that produces a value of type `!` must have diverged
-            self.diverges = Diverges::Always;
-        }
         if let Some(expected_ty) = expected.only_has_type(&mut self.table) {
             let could_unify = self.unify(&ty, &expected_ty);
             if !could_unify {
@@ -69,12 +64,11 @@ impl<'a> InferenceContext<'a> {
             match self.coerce(Some(expr), &ty, &target) {
                 Ok(res) => res,
                 Err(_) => {
-                    self.result
-                        .type_mismatches
-                        .insert(expr.into(), TypeMismatch { expected: target, actual: ty.clone() });
-                    // Return actual type when type mismatch.
-                    // This is needed for diagnostic when return type mismatch.
-                    ty
+                    self.result.type_mismatches.insert(
+                        expr.into(),
+                        TypeMismatch { expected: target.clone(), actual: ty.clone() },
+                    );
+                    target
                 }
             }
         } else {
@@ -85,8 +79,7 @@ impl<'a> InferenceContext<'a> {
     fn infer_expr_inner(&mut self, tgt_expr: ExprId, expected: &Expectation) -> Ty {
         self.db.unwind_if_cancelled();
 
-        let body = Arc::clone(&self.body); // avoid borrow checker problem
-        let ty = match &body[tgt_expr] {
+        let ty = match &self.body[tgt_expr] {
             Expr::Missing => self.err_ty(),
             &Expr::If { condition, then_branch, else_branch } => {
                 self.infer_expr(
@@ -296,13 +289,18 @@ impl<'a> InferenceContext<'a> {
                         break;
                     }
                 }
+                // if the function is unresolved, we use is_varargs=true to
+                // suppress the arg count diagnostic here
+                let is_varargs =
+                    derefed_callee.callable_sig(self.db).map_or(false, |sig| sig.is_varargs)
+                        || res.is_none();
                 let (param_tys, ret_ty) = match res {
                     Some(res) => {
                         let adjustments = auto_deref_adjust_steps(&derefs);
                         self.write_expr_adj(*callee, adjustments);
                         res
                     }
-                    None => (Vec::new(), self.err_ty()),
+                    None => (Vec::new(), self.err_ty()), // FIXME diagnostic
                 };
                 let indices_to_skip = self.check_legacy_const_generics(derefed_callee, args);
                 self.register_obligations_for_call(&callee_ty);
@@ -313,7 +311,14 @@ impl<'a> InferenceContext<'a> {
                     param_tys.clone(),
                 );
 
-                self.check_call_arguments(args, &expected_inputs, &param_tys, &indices_to_skip);
+                self.check_call_arguments(
+                    tgt_expr,
+                    args,
+                    &expected_inputs,
+                    &param_tys,
+                    &indices_to_skip,
+                    is_varargs,
+                );
                 self.normalize_associated_types_in(ret_ty)
             }
             Expr::MethodCall { receiver, args, method_name, generic_args } => self
@@ -480,13 +485,8 @@ impl<'a> InferenceContext<'a> {
                         }
                         _ => return None,
                     };
-                    let module = self.resolver.module();
-                    let is_visible = module
-                        .map(|mod_id| {
-                            self.db.field_visibilities(field_id.parent)[field_id.local_id]
-                                .is_visible_from(self.db.upcast(), mod_id)
-                        })
-                        .unwrap_or(true);
+                    let is_visible = self.db.field_visibilities(field_id.parent)[field_id.local_id]
+                        .is_visible_from(self.db.upcast(), self.resolver.module());
                     if !is_visible {
                         // Write down the first field resolution even if it is not visible
                         // This aids IDE features for private fields like goto def and in
@@ -558,17 +558,7 @@ impl<'a> InferenceContext<'a> {
                 }
                 .intern(Interner)
             }
-            Expr::Box { expr } => {
-                let inner_ty = self.infer_expr_inner(*expr, &Expectation::none());
-                if let Some(box_) = self.resolve_boxed_box() {
-                    TyBuilder::adt(self.db, box_)
-                        .push(inner_ty)
-                        .fill_with_defaults(self.db, || self.table.new_type_var())
-                        .build()
-                } else {
-                    self.err_ty()
-                }
-            }
+            &Expr::Box { expr } => self.infer_expr_box(expr),
             Expr::UnaryOp { expr, op } => {
                 let inner_ty = self.infer_expr_inner(*expr, &Expectation::none());
                 let inner_ty = self.resolve_ty_shallow(&inner_ty);
@@ -789,7 +779,23 @@ impl<'a> InferenceContext<'a> {
         // use a new type variable if we got unknown here
         let ty = self.insert_type_vars_shallow(ty);
         self.write_expr_ty(tgt_expr, ty.clone());
+        if self.resolve_ty_shallow(&ty).is_never() {
+            // Any expression that produces a value of type `!` must have diverged
+            self.diverges = Diverges::Always;
+        }
         ty
+    }
+
+    fn infer_expr_box(&mut self, inner_expr: ExprId) -> chalk_ir::Ty<Interner> {
+        let inner_ty = self.infer_expr_inner(inner_expr, &Expectation::none());
+        if let Some(box_) = self.resolve_boxed_box() {
+            TyBuilder::adt(self.db, box_)
+                .push(inner_ty)
+                .fill_with_defaults(self.db, || self.table.new_type_var())
+                .build()
+        } else {
+            self.err_ty()
+        }
     }
 
     fn infer_overloadable_binop(
@@ -902,9 +908,16 @@ impl<'a> InferenceContext<'a> {
                 self.table.new_maybe_never_var()
             } else {
                 if let Some(t) = expected.only_has_type(&mut self.table) {
-                    let _ = self.coerce(Some(expr), &TyBuilder::unit(), &t);
+                    if self.coerce(Some(expr), &TyBuilder::unit(), &t).is_err() {
+                        self.result.type_mismatches.insert(
+                            expr.into(),
+                            TypeMismatch { expected: t.clone(), actual: TyBuilder::unit() },
+                        );
+                    }
+                    t
+                } else {
+                    TyBuilder::unit()
                 }
-                TyBuilder::unit()
             }
         }
     }
@@ -928,7 +941,7 @@ impl<'a> InferenceContext<'a> {
             self.db,
             self.trait_env.clone(),
             &traits_in_scope,
-            self.resolver.module().into(),
+            VisibleFromModule::Filter(self.resolver.module()),
             method_name,
         );
         let (receiver_ty, method_ty, substs) = match resolved {
@@ -948,22 +961,28 @@ impl<'a> InferenceContext<'a> {
         };
         let method_ty = method_ty.substitute(Interner, &substs);
         self.register_obligations_for_call(&method_ty);
-        let (formal_receiver_ty, param_tys, ret_ty) = match method_ty.callable_sig(self.db) {
-            Some(sig) => {
-                if !sig.params().is_empty() {
-                    (sig.params()[0].clone(), sig.params()[1..].to_vec(), sig.ret().clone())
-                } else {
-                    (self.err_ty(), Vec::new(), sig.ret().clone())
+        let (formal_receiver_ty, param_tys, ret_ty, is_varargs) =
+            match method_ty.callable_sig(self.db) {
+                Some(sig) => {
+                    if !sig.params().is_empty() {
+                        (
+                            sig.params()[0].clone(),
+                            sig.params()[1..].to_vec(),
+                            sig.ret().clone(),
+                            sig.is_varargs,
+                        )
+                    } else {
+                        (self.err_ty(), Vec::new(), sig.ret().clone(), sig.is_varargs)
+                    }
                 }
-            }
-            None => (self.err_ty(), Vec::new(), self.err_ty()),
-        };
+                None => (self.err_ty(), Vec::new(), self.err_ty(), true),
+            };
         self.unify(&formal_receiver_ty, &receiver_ty);
 
         let expected_inputs =
             self.expected_inputs_for_expected_output(expected, ret_ty.clone(), param_tys.clone());
 
-        self.check_call_arguments(args, &expected_inputs, &param_tys, &[]);
+        self.check_call_arguments(tgt_expr, args, &expected_inputs, &param_tys, &[], is_varargs);
         self.normalize_associated_types_in(ret_ty)
     }
 
@@ -996,11 +1015,21 @@ impl<'a> InferenceContext<'a> {
 
     fn check_call_arguments(
         &mut self,
+        expr: ExprId,
         args: &[ExprId],
         expected_inputs: &[Ty],
         param_tys: &[Ty],
         skip_indices: &[u32],
+        is_varargs: bool,
     ) {
+        if args.len() != param_tys.len() + skip_indices.len() && !is_varargs {
+            self.push_diagnostic(InferenceDiagnostic::MismatchedArgCount {
+                call_expr: expr,
+                expected: param_tys.len() + skip_indices.len(),
+                found: args.len(),
+            });
+        }
+
         // Quoting https://github.com/rust-lang/rust/blob/6ef275e6c3cb1384ec78128eceeb4963ff788dca/src/librustc_typeck/check/mod.rs#L3325 --
         // We do this in a pretty awful way: first we type-check any arguments
         // that are not closures, then we type-check the closures. This is so
@@ -1100,10 +1129,11 @@ impl<'a> InferenceContext<'a> {
                     arg,
                     self,
                     |this, type_ref| this.make_ty(type_ref),
-                    |this, c| {
+                    |this, c, ty| {
                         const_or_path_to_chalk(
                             this.db,
                             &this.resolver,
+                            ty,
                             c,
                             ParamLoweringMode::Placeholder,
                             || generics(this.db.upcast(), (&this.resolver).generic_def().unwrap()),
@@ -1188,7 +1218,15 @@ impl<'a> InferenceContext<'a> {
 
         // only use legacy const generics if the param count matches with them
         if data.params.len() + data.legacy_const_generics_indices.len() != args.len() {
-            return Vec::new();
+            if args.len() <= data.params.len() {
+                return Vec::new();
+            } else {
+                // there are more parameters than there should be without legacy
+                // const params; use them
+                let mut indices = data.legacy_const_generics_indices.clone();
+                indices.sort();
+                return indices;
+            }
         }
 
         // check legacy const parameters

@@ -40,10 +40,10 @@ use syntax::{
 };
 
 use crate::{
-    db::HirDatabase, semantics::PathResolution, Adt, BuiltinAttr, BuiltinType, Const, Field,
-    Function, Local, Macro, ModuleDef, Static, Struct, ToolModule, Trait, Type, TypeAlias, Variant,
+    db::HirDatabase, semantics::PathResolution, Adt, AssocItem, BuiltinAttr, BuiltinType, Const,
+    Field, Function, Local, Macro, ModuleDef, Static, Struct, ToolModule, Trait, Type, TypeAlias,
+    Variant,
 };
-use base_db::CrateId;
 
 /// `SourceAnalyzer` is a convenience wrapper which exposes HIR API in terms of
 /// original source files. It should not be used inside the HIR itself.
@@ -109,8 +109,8 @@ impl SourceAnalyzer {
 
     fn expr_id(&self, db: &dyn HirDatabase, expr: &ast::Expr) -> Option<ExprId> {
         let src = match expr {
-            ast::Expr::MacroCall(call) => {
-                self.expand_expr(db, InFile::new(self.file_id, call.clone()))?
+            ast::Expr::MacroExpr(expr) => {
+                self.expand_expr(db, InFile::new(self.file_id, expr.macro_call()?.clone()))?
             }
             _ => InFile::new(self.file_id, expr.clone()),
         };
@@ -169,7 +169,7 @@ impl SourceAnalyzer {
             .and_then(|adjusts| adjusts.last().map(|adjust| adjust.target.clone()));
         let ty = infer[expr_id].clone();
         let mk_ty = |ty| Type::new_with_resolver(db, &self.resolver, ty);
-        mk_ty(ty).zip(Some(coerced.and_then(mk_ty)))
+        Some((mk_ty(ty), coerced.map(mk_ty)))
     }
 
     pub(crate) fn type_of_pat(
@@ -185,7 +185,7 @@ impl SourceAnalyzer {
             .and_then(|adjusts| adjusts.last().map(|adjust| adjust.target.clone()));
         let ty = infer[pat_id].clone();
         let mk_ty = |ty| Type::new_with_resolver(db, &self.resolver, ty);
-        mk_ty(ty).zip(Some(coerced.and_then(mk_ty)))
+        Some((mk_ty(ty), coerced.map(mk_ty)))
     }
 
     pub(crate) fn type_of_self(
@@ -196,7 +196,7 @@ impl SourceAnalyzer {
         let src = InFile { file_id: self.file_id, value: param };
         let pat_id = self.body_source_map()?.node_self_param(src)?;
         let ty = self.infer.as_ref()?[pat_id].clone();
-        Type::new_with_resolver(db, &self.resolver, ty)
+        Some(Type::new_with_resolver(db, &self.resolver, ty))
     }
 
     pub(crate) fn resolve_method_call(
@@ -244,7 +244,7 @@ impl SourceAnalyzer {
         let field = FieldId { parent: variant, local_id: variant_data.field(&local_name)? };
         let field_ty =
             db.field_types(variant).get(field.local_id)?.clone().substitute(Interner, subst);
-        Some((field.into(), local, Type::new_with_resolver(db, &self.resolver, field_ty)?))
+        Some((field.into(), local, Type::new_with_resolver(db, &self.resolver, field_ty)))
     }
 
     pub(crate) fn resolve_record_pat_field(
@@ -298,45 +298,53 @@ impl SourceAnalyzer {
         let parent = || parent.clone();
 
         let mut prefer_value_ns = false;
-        if let Some(path_expr) = parent().and_then(ast::PathExpr::cast) {
-            let expr_id = self.expr_id(db, &path_expr.into())?;
-            let infer = self.infer.as_ref()?;
-            if let Some(assoc) = infer.assoc_resolutions_for_expr(expr_id) {
-                return Some(PathResolution::AssocItem(assoc.into()));
+        let resolved = (|| {
+            if let Some(path_expr) = parent().and_then(ast::PathExpr::cast) {
+                let expr_id = self.expr_id(db, &path_expr.into())?;
+                let infer = self.infer.as_ref()?;
+                if let Some(assoc) = infer.assoc_resolutions_for_expr(expr_id) {
+                    return Some(PathResolution::Def(AssocItem::from(assoc).into()));
+                }
+                if let Some(VariantId::EnumVariantId(variant)) =
+                    infer.variant_resolution_for_expr(expr_id)
+                {
+                    return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
+                }
+                prefer_value_ns = true;
+            } else if let Some(path_pat) = parent().and_then(ast::PathPat::cast) {
+                let pat_id = self.pat_id(&path_pat.into())?;
+                if let Some(assoc) = self.infer.as_ref()?.assoc_resolutions_for_pat(pat_id) {
+                    return Some(PathResolution::Def(AssocItem::from(assoc).into()));
+                }
+                if let Some(VariantId::EnumVariantId(variant)) =
+                    self.infer.as_ref()?.variant_resolution_for_pat(pat_id)
+                {
+                    return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
+                }
+            } else if let Some(rec_lit) = parent().and_then(ast::RecordExpr::cast) {
+                let expr_id = self.expr_id(db, &rec_lit.into())?;
+                if let Some(VariantId::EnumVariantId(variant)) =
+                    self.infer.as_ref()?.variant_resolution_for_expr(expr_id)
+                {
+                    return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
+                }
+            } else {
+                let record_pat = parent().and_then(ast::RecordPat::cast).map(ast::Pat::from);
+                let tuple_struct_pat =
+                    || parent().and_then(ast::TupleStructPat::cast).map(ast::Pat::from);
+                if let Some(pat) = record_pat.or_else(tuple_struct_pat) {
+                    let pat_id = self.pat_id(&pat)?;
+                    let variant_res_for_pat =
+                        self.infer.as_ref()?.variant_resolution_for_pat(pat_id);
+                    if let Some(VariantId::EnumVariantId(variant)) = variant_res_for_pat {
+                        return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
+                    }
+                }
             }
-            if let Some(VariantId::EnumVariantId(variant)) =
-                infer.variant_resolution_for_expr(expr_id)
-            {
-                return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
-            }
-            prefer_value_ns = true;
-        } else if let Some(path_pat) = parent().and_then(ast::PathPat::cast) {
-            let pat_id = self.pat_id(&path_pat.into())?;
-            if let Some(assoc) = self.infer.as_ref()?.assoc_resolutions_for_pat(pat_id) {
-                return Some(PathResolution::AssocItem(assoc.into()));
-            }
-            if let Some(VariantId::EnumVariantId(variant)) =
-                self.infer.as_ref()?.variant_resolution_for_pat(pat_id)
-            {
-                return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
-            }
-        } else if let Some(rec_lit) = parent().and_then(ast::RecordExpr::cast) {
-            let expr_id = self.expr_id(db, &rec_lit.into())?;
-            if let Some(VariantId::EnumVariantId(variant)) =
-                self.infer.as_ref()?.variant_resolution_for_expr(expr_id)
-            {
-                return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
-            }
-        }
-
-        let record_pat = parent().and_then(ast::RecordPat::cast).map(ast::Pat::from);
-        let tuple_struct_pat = || parent().and_then(ast::TupleStructPat::cast).map(ast::Pat::from);
-        if let Some(pat) = record_pat.or_else(tuple_struct_pat) {
-            let pat_id = self.pat_id(&pat)?;
-            let variant_res_for_pat = self.infer.as_ref()?.variant_resolution_for_pat(pat_id);
-            if let Some(VariantId::EnumVariantId(variant)) = variant_res_for_pat {
-                return Some(PathResolution::Def(ModuleDef::Variant(variant.into())));
-            }
+            None
+        })();
+        if let Some(_) = resolved {
+            return resolved;
         }
 
         // This must be a normal source file rather than macro file.
@@ -366,11 +374,8 @@ impl SourceAnalyzer {
             return match resolve_hir_path_qualifier(db, &self.resolver, &hir_path) {
                 None if is_path_of_attr => {
                     path.first_segment().and_then(|it| it.name_ref()).and_then(|name_ref| {
-                        match self.resolver.krate() {
-                            Some(krate) => ToolModule::by_name(db, krate.into(), &name_ref.text()),
-                            None => ToolModule::builtin(&name_ref.text()),
-                        }
-                        .map(PathResolution::ToolModule)
+                        ToolModule::by_name(db, self.resolver.krate().into(), &name_ref.text())
+                            .map(PathResolution::ToolModule)
                     })
                 }
                 res => res,
@@ -380,11 +385,10 @@ impl SourceAnalyzer {
             // in this case we have to check for inert/builtin attributes and tools and prioritize
             // resolution of attributes over other namespaces
             let name_ref = path.as_single_name_ref();
-            let builtin = name_ref.as_ref().and_then(|name_ref| match self.resolver.krate() {
-                Some(krate) => BuiltinAttr::by_name(db, krate.into(), &name_ref.text()),
-                None => BuiltinAttr::builtin(&name_ref.text()),
+            let builtin = name_ref.as_ref().and_then(|name_ref| {
+                BuiltinAttr::by_name(db, self.resolver.krate().into(), &name_ref.text())
             });
-            if let builtin @ Some(_) = builtin {
+            if let Some(_) = builtin {
                 return builtin.map(PathResolution::BuiltinAttr);
             }
             return match resolve_hir_path_as_macro(db, &self.resolver, &hir_path) {
@@ -392,11 +396,8 @@ impl SourceAnalyzer {
                 // this labels any path that starts with a tool module as the tool itself, this is technically wrong
                 // but there is no benefit in differentiating these two cases for the time being
                 None => path.first_segment().and_then(|it| it.name_ref()).and_then(|name_ref| {
-                    match self.resolver.krate() {
-                        Some(krate) => ToolModule::by_name(db, krate.into(), &name_ref.text()),
-                        None => ToolModule::builtin(&name_ref.text()),
-                    }
-                    .map(PathResolution::ToolModule)
+                    ToolModule::by_name(db, self.resolver.krate().into(), &name_ref.text())
+                        .map(PathResolution::ToolModule)
                 }),
             };
         }
@@ -412,7 +413,6 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         literal: &ast::RecordExpr,
     ) -> Option<Vec<(Field, Type)>> {
-        let krate = self.resolver.krate()?;
         let body = self.body()?;
         let infer = self.infer.as_ref()?;
 
@@ -421,7 +421,7 @@ impl SourceAnalyzer {
 
         let (variant, missing_fields, _exhaustive) =
             record_literal_missing_fields(db, infer, expr_id, &body[expr_id])?;
-        let res = self.missing_fields(db, krate, substs, variant, missing_fields);
+        let res = self.missing_fields(db, substs, variant, missing_fields);
         Some(res)
     }
 
@@ -430,7 +430,6 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         pattern: &ast::RecordPat,
     ) -> Option<Vec<(Field, Type)>> {
-        let krate = self.resolver.krate()?;
         let body = self.body()?;
         let infer = self.infer.as_ref()?;
 
@@ -439,14 +438,13 @@ impl SourceAnalyzer {
 
         let (variant, missing_fields, _exhaustive) =
             record_pattern_missing_fields(db, infer, pat_id, &body[pat_id])?;
-        let res = self.missing_fields(db, krate, substs, variant, missing_fields);
+        let res = self.missing_fields(db, substs, variant, missing_fields);
         Some(res)
     }
 
     fn missing_fields(
         &self,
         db: &dyn HirDatabase,
-        krate: CrateId,
         substs: &Substitution,
         variant: VariantId,
         missing_fields: Vec<LocalFieldId>,
@@ -458,7 +456,7 @@ impl SourceAnalyzer {
             .map(|local_id| {
                 let field = FieldId { parent: variant, local_id };
                 let ty = field_types[local_id].clone().substitute(Interner, substs);
-                (field.into(), Type::new_with_resolver_inner(db, krate, &self.resolver, ty))
+                (field.into(), Type::new_with_resolver_inner(db, &self.resolver, ty))
             })
             .collect()
     }
@@ -468,7 +466,7 @@ impl SourceAnalyzer {
         db: &dyn HirDatabase,
         macro_call: InFile<&ast::MacroCall>,
     ) -> Option<HirFileId> {
-        let krate = self.resolver.krate()?;
+        let krate = self.resolver.krate();
         let macro_call_id = macro_call.as_call_id(db.upcast(), krate, |path| {
             self.resolver
                 .resolve_path_as_macro(db.upcast(), &path)
@@ -755,22 +753,23 @@ fn resolve_hir_path_qualifier(
     resolver: &Resolver,
     path: &Path,
 ) -> Option<PathResolution> {
-    let items = resolver
-        .resolve_module_path_in_items(db.upcast(), path.mod_path())
-        .take_types()
-        .map(|it| PathResolution::Def(it.into()));
-
-    if items.is_some() {
-        return items;
-    }
-
-    resolver.resolve_path_in_type_ns_fully(db.upcast(), path.mod_path()).map(|ty| match ty {
-        TypeNs::SelfType(it) => PathResolution::SelfType(it.into()),
-        TypeNs::GenericParam(id) => PathResolution::TypeParam(id.into()),
-        TypeNs::AdtSelfType(it) | TypeNs::AdtId(it) => PathResolution::Def(Adt::from(it).into()),
-        TypeNs::EnumVariantId(it) => PathResolution::Def(Variant::from(it).into()),
-        TypeNs::TypeAliasId(it) => PathResolution::Def(TypeAlias::from(it).into()),
-        TypeNs::BuiltinType(it) => PathResolution::Def(BuiltinType::from(it).into()),
-        TypeNs::TraitId(it) => PathResolution::Def(Trait::from(it).into()),
-    })
+    resolver
+        .resolve_path_in_type_ns_fully(db.upcast(), path.mod_path())
+        .map(|ty| match ty {
+            TypeNs::SelfType(it) => PathResolution::SelfType(it.into()),
+            TypeNs::GenericParam(id) => PathResolution::TypeParam(id.into()),
+            TypeNs::AdtSelfType(it) | TypeNs::AdtId(it) => {
+                PathResolution::Def(Adt::from(it).into())
+            }
+            TypeNs::EnumVariantId(it) => PathResolution::Def(Variant::from(it).into()),
+            TypeNs::TypeAliasId(it) => PathResolution::Def(TypeAlias::from(it).into()),
+            TypeNs::BuiltinType(it) => PathResolution::Def(BuiltinType::from(it).into()),
+            TypeNs::TraitId(it) => PathResolution::Def(Trait::from(it).into()),
+        })
+        .or_else(|| {
+            resolver
+                .resolve_module_path_in_items(db.upcast(), path.mod_path())
+                .take_types()
+                .map(|it| PathResolution::Def(it.into()))
+        })
 }

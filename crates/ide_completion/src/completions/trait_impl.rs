@@ -36,11 +36,13 @@ use ide_db::{path_transform::PathTransform, traits::get_missing_assoc_items, Sym
 use syntax::{
     ast::{self, edit_in_place::AttrsOwnerEdit},
     display::function_declaration,
-    AstNode, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, T,
+    AstNode, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, T,
 };
 use text_edit::TextEdit;
 
-use crate::{CompletionContext, CompletionItem, CompletionItemKind, Completions};
+use crate::{
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionRelevance, Completions,
+};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ImplCompletionKind {
@@ -51,22 +53,22 @@ enum ImplCompletionKind {
 }
 
 pub(crate) fn complete_trait_impl(acc: &mut Completions, ctx: &CompletionContext) {
-    if let Some((kind, trigger, impl_def)) = completion_match(ctx.token.clone()) {
+    if let Some((kind, replacement_range, impl_def)) = completion_match(ctx) {
         if let Some(hir_impl) = ctx.sema.to_def(&impl_def) {
             get_missing_assoc_items(&ctx.sema, &impl_def).into_iter().for_each(|item| {
                 match (item, kind) {
                     (
                         hir::AssocItem::Function(fn_item),
                         ImplCompletionKind::All | ImplCompletionKind::Fn,
-                    ) => add_function_impl(acc, ctx, &trigger, fn_item, hir_impl),
+                    ) => add_function_impl(acc, ctx, replacement_range, fn_item, hir_impl),
                     (
                         hir::AssocItem::TypeAlias(type_item),
                         ImplCompletionKind::All | ImplCompletionKind::TypeAlias,
-                    ) => add_type_alias_impl(acc, ctx, &trigger, type_item),
+                    ) => add_type_alias_impl(acc, ctx, replacement_range, type_item),
                     (
                         hir::AssocItem::Const(const_item),
                         ImplCompletionKind::All | ImplCompletionKind::Const,
-                    ) => add_const_impl(acc, ctx, &trigger, const_item, hir_impl),
+                    ) => add_const_impl(acc, ctx, replacement_range, const_item, hir_impl),
                     _ => {}
                 }
             });
@@ -74,61 +76,79 @@ pub(crate) fn complete_trait_impl(acc: &mut Completions, ctx: &CompletionContext
     }
 }
 
-fn completion_match(mut token: SyntaxToken) -> Option<(ImplCompletionKind, SyntaxNode, ast::Impl)> {
+fn completion_match(ctx: &CompletionContext) -> Option<(ImplCompletionKind, TextRange, ast::Impl)> {
+    let token = ctx.token.clone();
+
     // For keyword without name like `impl .. { fn $0 }`, the current position is inside
     // the whitespace token, which is outside `FN` syntax node.
     // We need to follow the previous token in this case.
+    let mut token_before_ws = token.clone();
     if token.kind() == SyntaxKind::WHITESPACE {
-        token = token.prev_token()?;
+        token_before_ws = token.prev_token()?;
     }
 
-    let parent_kind = token.parent().map_or(SyntaxKind::EOF, |it| it.kind());
-    let impl_item_offset = match token.kind() {
-        // `impl .. { const $0 }`
-        // ERROR      0
-        //   CONST_KW <- *
-        T![const] => 0,
-        // `impl .. { fn/type $0 }`
-        // FN/TYPE_ALIAS  0
-        //   FN_KW        <- *
-        T![fn] | T![type] => 0,
-        // `impl .. { fn/type/const foo$0 }`
-        // FN/TYPE_ALIAS/CONST  1
-        //  NAME                0
-        //    IDENT             <- *
-        SyntaxKind::IDENT if parent_kind == SyntaxKind::NAME => 1,
-        // `impl .. { foo$0 }`
-        // MACRO_CALL       3
-        //  PATH            2
-        //    PATH_SEGMENT  1
-        //      NAME_REF    0
-        //        IDENT     <- *
-        SyntaxKind::IDENT if parent_kind == SyntaxKind::NAME_REF => 3,
-        _ => return None,
-    };
+    let parent_kind = token_before_ws.parent().map_or(SyntaxKind::EOF, |it| it.kind());
+    if token.parent().map(|n| n.kind()) == Some(SyntaxKind::ASSOC_ITEM_LIST)
+        && matches!(
+            token_before_ws.kind(),
+            SyntaxKind::SEMICOLON | SyntaxKind::R_CURLY | SyntaxKind::L_CURLY
+        )
+    {
+        let impl_def = ast::Impl::cast(token.parent()?.parent()?)?;
+        let kind = ImplCompletionKind::All;
+        let replacement_range = TextRange::empty(ctx.position.offset);
+        Some((kind, replacement_range, impl_def))
+    } else {
+        let impl_item_offset = match token_before_ws.kind() {
+            // `impl .. { const $0 }`
+            // ERROR      0
+            //   CONST_KW <- *
+            T![const] => 0,
+            // `impl .. { fn/type $0 }`
+            // FN/TYPE_ALIAS  0
+            //   FN_KW        <- *
+            T![fn] | T![type] => 0,
+            // `impl .. { fn/type/const foo$0 }`
+            // FN/TYPE_ALIAS/CONST  1
+            //  NAME                0
+            //    IDENT             <- *
+            SyntaxKind::IDENT if parent_kind == SyntaxKind::NAME => 1,
+            // `impl .. { foo$0 }`
+            // MACRO_CALL       3
+            //  PATH            2
+            //    PATH_SEGMENT  1
+            //      NAME_REF    0
+            //        IDENT     <- *
+            SyntaxKind::IDENT if parent_kind == SyntaxKind::NAME_REF => 3,
+            _ => return None,
+        };
 
-    let impl_item = token.ancestors().nth(impl_item_offset)?;
-    // Must directly belong to an impl block.
-    // IMPL
-    //   ASSOC_ITEM_LIST
-    //     <item>
-    let impl_def = ast::Impl::cast(impl_item.parent()?.parent()?)?;
-    let kind = match impl_item.kind() {
-        // `impl ... { const $0 fn/type/const }`
-        _ if token.kind() == T![const] => ImplCompletionKind::Const,
-        SyntaxKind::CONST | SyntaxKind::ERROR => ImplCompletionKind::Const,
-        SyntaxKind::TYPE_ALIAS => ImplCompletionKind::TypeAlias,
-        SyntaxKind::FN => ImplCompletionKind::Fn,
-        SyntaxKind::MACRO_CALL => ImplCompletionKind::All,
-        _ => return None,
-    };
-    Some((kind, impl_item, impl_def))
+        let impl_item = token_before_ws.ancestors().nth(impl_item_offset)?;
+        // Must directly belong to an impl block.
+        // IMPL
+        //   ASSOC_ITEM_LIST
+        //     <item>
+        let impl_def = ast::Impl::cast(impl_item.parent()?.parent()?)?;
+        let kind = match impl_item.kind() {
+            // `impl ... { const $0 fn/type/const }`
+            _ if token_before_ws.kind() == T![const] => ImplCompletionKind::Const,
+            SyntaxKind::CONST | SyntaxKind::ERROR => ImplCompletionKind::Const,
+            SyntaxKind::TYPE_ALIAS => ImplCompletionKind::TypeAlias,
+            SyntaxKind::FN => ImplCompletionKind::Fn,
+            SyntaxKind::MACRO_CALL => ImplCompletionKind::All,
+            _ => return None,
+        };
+
+        let replacement_range = replacement_range(ctx, &impl_item);
+
+        Some((kind, replacement_range, impl_def))
+    }
 }
 
 fn add_function_impl(
     acc: &mut Completions,
     ctx: &CompletionContext,
-    fn_def_node: &SyntaxNode,
+    replacement_range: TextRange,
     func: hir::Function,
     impl_def: hir::Impl,
 ) {
@@ -146,9 +166,10 @@ fn add_function_impl(
         CompletionItemKind::SymbolKind(SymbolKind::Function)
     };
 
-    let range = replacement_range(ctx, fn_def_node);
-    let mut item = CompletionItem::new(completion_kind, range, label);
-    item.lookup_by(fn_name).set_documentation(func.docs(ctx.db));
+    let mut item = CompletionItem::new(completion_kind, replacement_range, label);
+    item.lookup_by(format!("fn {}", fn_name))
+        .set_documentation(func.docs(ctx.db))
+        .set_relevance(CompletionRelevance { is_item_from_trait: true, ..Default::default() });
 
     if let Some(source) = ctx.sema.source(func) {
         let assoc_item = ast::AssocItem::Fn(source.value);
@@ -162,11 +183,11 @@ fn add_function_impl(
             match ctx.config.snippet_cap {
                 Some(cap) => {
                     let snippet = format!("{} {{\n    $0\n}}", function_decl);
-                    item.snippet_edit(cap, TextEdit::replace(range, snippet));
+                    item.snippet_edit(cap, TextEdit::replace(replacement_range, snippet));
                 }
                 None => {
                     let header = format!("{} {{", function_decl);
-                    item.text_edit(TextEdit::replace(range, header));
+                    item.text_edit(TextEdit::replace(replacement_range, header));
                 }
             };
             item.add_to(acc);
@@ -183,7 +204,7 @@ fn get_transformed_assoc_item(
     let assoc_item = assoc_item.clone_for_update();
     let trait_ = impl_def.trait_(ctx.db)?;
     let source_scope = &ctx.sema.scope_for_def(trait_);
-    let target_scope = &ctx.sema.scope(ctx.sema.source(impl_def)?.syntax().value);
+    let target_scope = &ctx.sema.scope(ctx.sema.source(impl_def)?.syntax().value)?;
     let transform = PathTransform::trait_impl(
         target_scope,
         source_scope,
@@ -201,25 +222,30 @@ fn get_transformed_assoc_item(
 fn add_type_alias_impl(
     acc: &mut Completions,
     ctx: &CompletionContext,
-    type_def_node: &SyntaxNode,
+    replacement_range: TextRange,
     type_alias: hir::TypeAlias,
 ) {
     let alias_name = type_alias.name(ctx.db).to_smol_str();
 
-    let snippet = format!("type {} = ", alias_name);
+    let label = format!("type {} =", alias_name);
+    let replacement = format!("type {} = ", alias_name);
 
-    let range = replacement_range(ctx, type_def_node);
-    let mut item = CompletionItem::new(SymbolKind::TypeAlias, range, &snippet);
-    item.text_edit(TextEdit::replace(range, snippet))
-        .lookup_by(alias_name)
-        .set_documentation(type_alias.docs(ctx.db));
+    let mut item = CompletionItem::new(SymbolKind::TypeAlias, replacement_range, label);
+    item.lookup_by(format!("type {}", alias_name))
+        .set_documentation(type_alias.docs(ctx.db))
+        .set_relevance(CompletionRelevance { is_item_from_trait: true, ..Default::default() });
+    match ctx.config.snippet_cap {
+        Some(cap) => item
+            .snippet_edit(cap, TextEdit::replace(replacement_range, format!("{}$0;", replacement))),
+        None => item.text_edit(TextEdit::replace(replacement_range, replacement)),
+    };
     item.add_to(acc);
 }
 
 fn add_const_impl(
     acc: &mut Completions,
     ctx: &CompletionContext,
-    const_def_node: &SyntaxNode,
+    replacement_range: TextRange,
     const_: hir::Const,
     impl_def: hir::Impl,
 ) {
@@ -234,13 +260,23 @@ fn add_const_impl(
                     _ => unreachable!(),
                 };
 
-                let snippet = make_const_compl_syntax(&transformed_const);
+                let label = make_const_compl_syntax(&transformed_const);
+                let replacement = format!("{} ", label);
 
-                let range = replacement_range(ctx, const_def_node);
-                let mut item = CompletionItem::new(SymbolKind::Const, range, &snippet);
-                item.text_edit(TextEdit::replace(range, snippet))
-                    .lookup_by(const_name)
-                    .set_documentation(const_.docs(ctx.db));
+                let mut item = CompletionItem::new(SymbolKind::Const, replacement_range, label);
+                item.lookup_by(format!("const {}", const_name))
+                    .set_documentation(const_.docs(ctx.db))
+                    .set_relevance(CompletionRelevance {
+                        is_item_from_trait: true,
+                        ..Default::default()
+                    });
+                match ctx.config.snippet_cap {
+                    Some(cap) => item.snippet_edit(
+                        cap,
+                        TextEdit::replace(replacement_range, format!("{}$0;", replacement)),
+                    ),
+                    None => item.text_edit(TextEdit::replace(replacement_range, replacement)),
+                };
                 item.add_to(acc);
             }
         }
@@ -267,7 +303,7 @@ fn make_const_compl_syntax(const_: &ast::Const) -> String {
 
     let syntax = const_.syntax().text().slice(range).to_string();
 
-    format!("{} = ", syntax.trim_end())
+    format!("{} =", syntax.trim_end())
 }
 
 fn replacement_range(ctx: &CompletionContext, item: &SyntaxNode) -> TextRange {
@@ -523,7 +559,7 @@ impl Test for T {
     #[test]
     fn name_ref_single_function() {
         check_edit(
-            "test",
+            "fn test",
             r#"
 trait Test {
     fn test();
@@ -552,7 +588,7 @@ impl Test for T {
     #[test]
     fn single_function() {
         check_edit(
-            "test",
+            "fn test",
             r#"
 trait Test {
     fn test();
@@ -581,7 +617,7 @@ impl Test for T {
     #[test]
     fn generic_fn() {
         check_edit(
-            "foo",
+            "fn foo",
             r#"
 trait Test {
     fn foo<T>();
@@ -606,7 +642,7 @@ impl Test for T {
 "#,
         );
         check_edit(
-            "foo",
+            "fn foo",
             r#"
 trait Test {
     fn foo<T>() where T: Into<String>;
@@ -636,7 +672,7 @@ where T: Into<String> {
     #[test]
     fn associated_type() {
         check_edit(
-            "SomeType",
+            "type SomeType",
             r#"
 trait Test {
     type SomeType;
@@ -652,7 +688,7 @@ trait Test {
 }
 
 impl Test for () {
-    type SomeType = \n\
+    type SomeType = $0;\n\
 }
 ",
         );
@@ -661,7 +697,7 @@ impl Test for () {
     #[test]
     fn associated_const() {
         check_edit(
-            "SOME_CONST",
+            "const SOME_CONST",
             r#"
 trait Test {
     const SOME_CONST: u16;
@@ -677,13 +713,13 @@ trait Test {
 }
 
 impl Test for () {
-    const SOME_CONST: u16 = \n\
+    const SOME_CONST: u16 = $0;\n\
 }
 ",
         );
 
         check_edit(
-            "SOME_CONST",
+            "const SOME_CONST",
             r#"
 trait Test {
     const SOME_CONST: u16 = 92;
@@ -699,7 +735,7 @@ trait Test {
 }
 
 impl Test for () {
-    const SOME_CONST: u16 = \n\
+    const SOME_CONST: u16 = $0;\n\
 }
 ",
         );
@@ -757,9 +793,9 @@ impl Test for T {{
             "default type OtherType = i32;",
             "default const OTHER_CONST: i32 = 0;",
         ] {
-            test("bar", "fn $0", "fn bar() {\n    $0\n}", next_sibling);
-            test("Foo", "type $0", "type Foo = ", next_sibling);
-            test("CONST", "const $0", "const CONST: u16 = ", next_sibling);
+            test("fn bar", "fn $0", "fn bar() {\n    $0\n}", next_sibling);
+            test("type Foo", "type $0", "type Foo = $0;", next_sibling);
+            test("const CONST", "const $0", "const CONST: u16 = $0;", next_sibling);
         }
     }
 
@@ -804,15 +840,15 @@ impl Foo for T {{
                 ),
             )
         };
-        test("function", "fn f$0", "fn function() {\n    $0\n}");
-        test("Type", "type T$0", "type Type = ");
-        test("CONST", "const C$0", "const CONST: i32 = ");
+        test("fn function", "fn f$0", "fn function() {\n    $0\n}");
+        test("type Type", "type T$0", "type Type = $0;");
+        test("const CONST", "const C$0", "const CONST: i32 = $0;");
     }
 
     #[test]
     fn generics_are_inlined_in_return_type() {
         check_edit(
-            "function",
+            "fn function",
             r#"
 trait Foo<T> {
     fn function() -> T;
@@ -841,7 +877,7 @@ impl Foo<u32> for Bar {
     #[test]
     fn generics_are_inlined_in_parameter() {
         check_edit(
-            "function",
+            "fn function",
             r#"
 trait Foo<T> {
     fn function(bar: T);
@@ -870,7 +906,7 @@ impl Foo<u32> for Bar {
     #[test]
     fn generics_are_inlined_when_part_of_other_types() {
         check_edit(
-            "function",
+            "fn function",
             r#"
 trait Foo<T> {
     fn function(bar: Vec<T>);
@@ -899,7 +935,7 @@ impl Foo<u32> for Bar {
     #[test]
     fn generics_are_inlined_complex() {
         check_edit(
-            "function",
+            "fn function",
             r#"
 trait Foo<T, U, V> {
     fn function(bar: Vec<T>, baz: U) -> Arc<Vec<V>>;
@@ -928,7 +964,7 @@ impl Foo<u32, Vec<usize>, u8> for Bar {
     #[test]
     fn generics_are_inlined_in_associated_const() {
         check_edit(
-            "BAR",
+            "const BAR",
             r#"
 trait Foo<T> {
     const BAR: T;
@@ -936,7 +972,7 @@ trait Foo<T> {
 struct Bar;
 
 impl Foo<u32> for Bar {
-    const B$0;
+    const B$0
 }
 "#,
             r#"
@@ -946,7 +982,7 @@ trait Foo<T> {
 struct Bar;
 
 impl Foo<u32> for Bar {
-    const BAR: u32 = ;
+    const BAR: u32 = $0;
 }
 "#,
         )
@@ -955,7 +991,7 @@ impl Foo<u32> for Bar {
     #[test]
     fn generics_are_inlined_in_where_clause() {
         check_edit(
-            "function",
+            "fn function",
             r#"
 trait SomeTrait<T> {}
 
@@ -986,5 +1022,39 @@ where Self: SomeTrait<u32> {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn works_directly_in_impl() {
+        check(
+            r#"
+trait Tr {
+    fn required();
+}
+
+impl Tr for () {
+    $0
+}
+"#,
+            expect![[r#"
+            fn fn required()
+        "#]],
+        );
+        check(
+            r#"
+trait Tr {
+    fn provided() {}
+    fn required();
+}
+
+impl Tr for () {
+    fn provided() {}
+    $0
+}
+"#,
+            expect![[r#"
+            fn fn required()
+        "#]],
+        );
     }
 }

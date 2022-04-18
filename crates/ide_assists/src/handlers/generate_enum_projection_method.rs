@@ -1,3 +1,4 @@
+use ide_db::assists::GroupLabel;
 use itertools::Itertools;
 use stdx::to_lower_snake_case;
 use syntax::ast::HasVisibility;
@@ -10,7 +11,7 @@ use crate::{
 
 // Assist: generate_enum_try_into_method
 //
-// Generate an `try_into_` method for an enum variant.
+// Generate a `try_into_` method for this enum variant.
 //
 // ```
 // enum Value {
@@ -40,7 +41,7 @@ pub(crate) fn generate_enum_try_into_method(acc: &mut Assists, ctx: &AssistConte
         acc,
         ctx,
         "generate_enum_try_into_method",
-        "Generate an `try_into_` method for an enum variant",
+        "Generate a `try_into_` method for this enum variant",
         ProjectionProps {
             fn_name_prefix: "try_into",
             self_param: "self",
@@ -54,7 +55,7 @@ pub(crate) fn generate_enum_try_into_method(acc: &mut Assists, ctx: &AssistConte
 
 // Assist: generate_enum_as_method
 //
-// Generate an `as_` method for an enum variant.
+// Generate an `as_` method for this enum variant.
 //
 // ```
 // enum Value {
@@ -84,7 +85,7 @@ pub(crate) fn generate_enum_as_method(acc: &mut Assists, ctx: &AssistContext) ->
         acc,
         ctx,
         "generate_enum_as_method",
-        "Generate an `as_` method for an enum variant",
+        "Generate an `as_` method for this enum variant",
         ProjectionProps {
             fn_name_prefix: "as",
             self_param: "&self",
@@ -139,31 +140,37 @@ fn generate_enum_projection_method(
     let impl_def = find_struct_impl(ctx, &parent_enum, &fn_name)?;
 
     let target = variant.syntax().text_range();
-    acc.add(AssistId(assist_id, AssistKind::Generate), assist_description, target, |builder| {
-        let vis = parent_enum.visibility().map_or(String::new(), |v| format!("{} ", v));
-        let method = format!(
-            "    {0}fn {1}({2}) -> {3}{4}{5} {{
+    acc.add_group(
+        &GroupLabel("Generate an `is_`,`as_`, or `try_into_` for this enum variant".to_owned()),
+        AssistId(assist_id, AssistKind::Generate),
+        assist_description,
+        target,
+        |builder| {
+            let vis = parent_enum.visibility().map_or(String::new(), |v| format!("{} ", v));
+            let method = format!(
+                "    {0}fn {1}({2}) -> {3}{4}{5} {{
         if let Self::{6}{7} = self {{
             {8}({9})
         }} else {{
             {10}
         }}
     }}",
-            vis,
-            fn_name,
-            props.self_param,
-            props.return_prefix,
-            field_type.syntax(),
-            props.return_suffix,
-            variant_name,
-            pattern_suffix,
-            props.happy_case,
-            bound_name,
-            props.sad_case,
-        );
+                vis,
+                fn_name,
+                props.self_param,
+                props.return_prefix,
+                field_type.syntax(),
+                props.return_suffix,
+                variant_name,
+                pattern_suffix,
+                props.happy_case,
+                bound_name,
+                props.sad_case,
+            );
 
-        add_method_to_adt(builder, &parent_enum, impl_def, &method);
-    })
+            add_method_to_adt(builder, &parent_enum, impl_def, &method);
+        },
+    )
 }
 
 #[cfg(test)]

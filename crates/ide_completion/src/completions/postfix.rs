@@ -12,9 +12,11 @@ use syntax::{
 use text_edit::TextEdit;
 
 use crate::{
-    completions::postfix::format_like::add_format_like_completions, context::CompletionContext,
-    item::Builder, patterns::ImmediateLocation, CompletionItem, CompletionItemKind,
-    CompletionRelevance, Completions, SnippetScope,
+    completions::postfix::format_like::add_format_like_completions,
+    context::CompletionContext,
+    item::{Builder, CompletionRelevancePostfixMatch},
+    patterns::ImmediateLocation,
+    CompletionItem, CompletionItemKind, CompletionRelevance, Completions, SnippetScope,
 };
 
 pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
@@ -240,12 +242,15 @@ fn build_postfix_snippet_builder<'ctx>(
             let mut item =
                 CompletionItem::new(CompletionItemKind::Snippet, ctx.source_range(), label);
             item.detail(detail).snippet_edit(cap, edit);
-            if ctx.original_token.text() == label {
-                let relevance =
-                    CompletionRelevance { exact_postfix_snippet_match: true, ..Default::default() };
-                item.set_relevance(relevance);
-            }
-
+            let postfix_match = if ctx.original_token.text() == label {
+                cov_mark::hit!(postfix_exact_match_is_high_priority);
+                Some(CompletionRelevancePostfixMatch::Exact)
+            } else {
+                cov_mark::hit!(postfix_inexact_match_is_low_priority);
+                Some(CompletionRelevancePostfixMatch::NonExact)
+            };
+            let relevance = CompletionRelevance { postfix_match, ..Default::default() };
+            item.set_relevance(relevance);
             item
         }
     }
@@ -258,10 +263,12 @@ fn add_custom_postfix_completions(
     postfix_snippet: impl Fn(&str, &str, &str) -> Builder,
     receiver_text: &str,
 ) -> Option<()> {
-    let import_scope = ImportScope::find_insert_use_container(&ctx.token.parent()?, &ctx.sema)?;
+    if ImportScope::find_insert_use_container(&ctx.token.parent()?, &ctx.sema).is_none() {
+        return None;
+    }
     ctx.config.postfix_snippets().filter(|(_, snip)| snip.scope == SnippetScope::Expr).for_each(
         |(trigger, snippet)| {
-            let imports = match snippet.imports(ctx, &import_scope) {
+            let imports = match snippet.imports(ctx) {
                 Some(imports) => imports,
                 None => return,
             };

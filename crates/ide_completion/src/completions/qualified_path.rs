@@ -23,6 +23,13 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
         Some(PathCompletionCtx { qualifier: Some(ref qualifier), kind, .. }) => (qualifier, kind),
         _ => return,
     };
+    let traits_in_scope = |ctx: &CompletionContext| {
+        let mut traits_in_scope = ctx.scope.visible_traits();
+        if let Some(drop) = ctx.famous_defs().core_ops_Drop() {
+            traits_in_scope.remove(&drop.into());
+        }
+        traits_in_scope
+    };
 
     // special case `<_>::$0` as this doesn't resolve to anything.
     if qualifier.path.qualifier().is_none() {
@@ -34,8 +41,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
             })
         ) {
             cov_mark::hit!(completion_type_anchor_empty);
-            ctx.scope
-                .visible_traits()
+            traits_in_scope(ctx)
                 .into_iter()
                 .flat_map(|it| Trait::from(it).items(ctx.sema.db))
                 .for_each(|item| add_assoc_item(acc, ctx, item));
@@ -51,7 +57,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
     match ctx.completion_location {
         Some(ImmediateLocation::ItemList | ImmediateLocation::Trait | ImmediateLocation::Impl) => {
             if let hir::PathResolution::Def(hir::ModuleDef::Module(module)) = resolution {
-                for (name, def) in module.scope(ctx.db, ctx.module) {
+                for (name, def) in module.scope(ctx.db, Some(ctx.module)) {
                     if let Some(def) = module_or_fn_macro(ctx.db, def) {
                         acc.add_resolution(ctx, name, def);
                     }
@@ -83,7 +89,7 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
 
     match resolution {
         hir::PathResolution::Def(hir::ModuleDef::Module(module)) => {
-            let module_scope = module.scope(ctx.db, ctx.module);
+            let module_scope = module.scope(ctx.db, Some(ctx.module));
             for (name, def) in module_scope {
                 let add_resolution = match def {
                     // Don't suggest attribute macros and derives.
@@ -126,12 +132,8 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
                     ty
                 }
                 hir::ModuleDef::BuiltinType(builtin) => {
-                    let module = match ctx.module {
-                        Some(it) => it,
-                        None => return,
-                    };
                     cov_mark::hit!(completes_primitive_assoc_const);
-                    builtin.ty(ctx.db, module)
+                    builtin.ty(ctx.db)
                 }
                 _ => unreachable!(),
             };
@@ -139,29 +141,26 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
             // XXX: For parity with Rust bug #22519, this does not complete Ty::AssocType.
             // (where AssocType is defined on a trait, not an inherent impl)
 
-            let krate = ctx.krate;
-            if let Some(krate) = krate {
-                let traits_in_scope = ctx.scope.visible_traits();
-                ty.iterate_path_candidates(
-                    ctx.db,
-                    &ctx.scope,
-                    &traits_in_scope,
-                    ctx.module,
-                    None,
-                    |item| {
-                        add_assoc_item(acc, ctx, item);
-                        None::<()>
-                    },
-                );
-
-                // Iterate assoc types separately
-                ty.iterate_assoc_items(ctx.db, krate, |item| {
-                    if let hir::AssocItem::TypeAlias(ty) = item {
-                        acc.add_type_alias(ctx, ty)
-                    }
+            let traits_in_scope = traits_in_scope(ctx);
+            ty.iterate_path_candidates(
+                ctx.db,
+                &ctx.scope,
+                &traits_in_scope,
+                Some(ctx.module),
+                None,
+                |item| {
+                    add_assoc_item(acc, ctx, item);
                     None::<()>
-                });
-            }
+                },
+            );
+
+            // Iterate assoc types separately
+            ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+                if let hir::AssocItem::TypeAlias(ty) = item {
+                    acc.add_type_alias(ctx, ty)
+                }
+                None::<()>
+            });
         }
         hir::PathResolution::Def(hir::ModuleDef::Trait(t)) => {
             // Handles `Trait::assoc` as well as `<Ty as Trait>::assoc`.
@@ -179,14 +178,13 @@ pub(crate) fn complete_qualified_path(acc: &mut Completions, ctx: &CompletionCon
             if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
                 add_enum_variants(acc, ctx, e);
             }
-
-            let traits_in_scope = ctx.scope.visible_traits();
+            let traits_in_scope = traits_in_scope(ctx);
             let mut seen = FxHashSet::default();
             ty.iterate_path_candidates(
                 ctx.db,
                 &ctx.scope,
                 &traits_in_scope,
-                ctx.module,
+                Some(ctx.module),
                 None,
                 |item| {
                     // We might iterate candidates of a trait multiple times here, so deduplicate

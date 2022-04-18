@@ -117,20 +117,48 @@ impl ops::Deref for CrateName {
 }
 
 /// Origin of the crates. It is used in emitting monikers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CrateOrigin {
     /// Crates that are from crates.io official registry,
     CratesIo { repo: Option<String> },
     /// Crates that are provided by the language, like std, core, proc-macro, ...
-    Lang,
-    /// Crates that we don't know their origin.
-    // Ideally this enum should cover all cases, and then we remove this variant.
-    Unknown,
+    Lang(LangCrateOrigin),
 }
 
-impl Default for CrateOrigin {
-    fn default() -> Self {
-        Self::Unknown
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LangCrateOrigin {
+    Alloc,
+    Core,
+    ProcMacro,
+    Std,
+    Test,
+    Other,
+}
+
+impl From<&str> for LangCrateOrigin {
+    fn from(s: &str) -> Self {
+        match s {
+            "alloc" => LangCrateOrigin::Alloc,
+            "core" => LangCrateOrigin::Core,
+            "proc-macro" => LangCrateOrigin::ProcMacro,
+            "std" => LangCrateOrigin::Std,
+            "test" => LangCrateOrigin::Test,
+            _ => LangCrateOrigin::Other,
+        }
+    }
+}
+
+impl fmt::Display for LangCrateOrigin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            LangCrateOrigin::Alloc => "alloc",
+            LangCrateOrigin::Core => "core",
+            LangCrateOrigin::ProcMacro => "proc_macro",
+            LangCrateOrigin::Std => "std",
+            LangCrateOrigin::Test => "test",
+            LangCrateOrigin::Other => "other",
+        };
+        f.write_str(text)
     }
 }
 
@@ -333,7 +361,7 @@ impl CrateGraph {
 
     /// Returns an iterator over all transitive dependencies of the given crate,
     /// including the crate itself.
-    pub fn transitive_deps(&self, of: CrateId) -> impl Iterator<Item = CrateId> + '_ {
+    pub fn transitive_deps(&self, of: CrateId) -> impl Iterator<Item = CrateId> {
         let mut worklist = vec![of];
         let mut deps = FxHashSet::default();
 
@@ -350,7 +378,7 @@ impl CrateGraph {
 
     /// Returns all transitive reverse dependencies of the given crate,
     /// including the crate itself.
-    pub fn transitive_rev_deps(&self, of: CrateId) -> impl Iterator<Item = CrateId> + '_ {
+    pub fn transitive_rev_deps(&self, of: CrateId) -> impl Iterator<Item = CrateId> {
         let mut worklist = vec![of];
         let mut rev_deps = FxHashSet::default();
         rev_deps.insert(of);
@@ -585,6 +613,8 @@ impl fmt::Display for CyclicDependenciesError {
 
 #[cfg(test)]
 mod tests {
+    use crate::CrateOrigin;
+
     use super::{CfgOptions, CrateGraph, CrateName, Dependency, Edition::Edition2018, Env, FileId};
 
     #[test]
@@ -600,7 +630,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         let crate2 = graph.add_crate_root(
             FileId(2u32),
@@ -612,7 +642,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         let crate3 = graph.add_crate_root(
             FileId(3u32),
@@ -624,7 +654,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         assert!(graph
             .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2))
@@ -650,7 +680,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         let crate2 = graph.add_crate_root(
             FileId(2u32),
@@ -662,7 +692,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         assert!(graph
             .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2))
@@ -685,7 +715,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         let crate2 = graph.add_crate_root(
             FileId(2u32),
@@ -697,7 +727,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         let crate3 = graph.add_crate_root(
             FileId(3u32),
@@ -709,7 +739,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         assert!(graph
             .add_dep(crate1, Dependency::new(CrateName::new("crate2").unwrap(), crate2))
@@ -732,7 +762,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         let crate2 = graph.add_crate_root(
             FileId(2u32),
@@ -744,7 +774,7 @@ mod tests {
             Env::default(),
             Default::default(),
             false,
-            Default::default(),
+            CrateOrigin::CratesIo { repo: None },
         );
         assert!(graph
             .add_dep(

@@ -1,3 +1,4 @@
+use ide_db::assists::GroupLabel;
 use stdx::to_lower_snake_case;
 use syntax::ast::HasVisibility;
 use syntax::ast::{self, AstNode, HasName};
@@ -9,7 +10,7 @@ use crate::{
 
 // Assist: generate_enum_is_method
 //
-// Generate an `is_` method for an enum variant.
+// Generate an `is_` method for this enum variant.
 //
 // ```
 // enum Version {
@@ -54,9 +55,10 @@ pub(crate) fn generate_enum_is_method(acc: &mut Assists, ctx: &AssistContext) ->
     let impl_def = find_struct_impl(ctx, &parent_enum, &fn_name)?;
 
     let target = variant.syntax().text_range();
-    acc.add(
+    acc.add_group(
+        &GroupLabel("Generate an `is_`,`as_`, or `try_into_` for this enum variant".to_owned()),
         AssistId("generate_enum_is_method", AssistKind::Generate),
-        "Generate an `is_` method for an enum variant",
+        "Generate an `is_` method for this enum variant",
         target,
         |builder| {
             let vis = parent_enum.visibility().map_or(String::new(), |v| format!("{} ", v));

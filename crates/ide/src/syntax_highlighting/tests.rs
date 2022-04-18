@@ -31,6 +31,7 @@ struct Foo;
         false,
     );
 }
+
 #[test]
 fn macros() {
     check_highlighting(
@@ -171,6 +172,7 @@ fn never() -> ! {
 }
 
 fn const_param<const FOO: usize>() -> usize {
+    const_param::<{ FOO }>();
     FOO
 }
 
@@ -277,6 +279,10 @@ fn baz<T>(t: T)
 where
     T: Baz,
     <T as Baz>::Qux: Bar {}
+
+fn gp_shadows_trait<Baz: Bar>() {
+    Baz::bar;
+}
 
 //- /foo.rs crate:foo
 pub struct Person {
@@ -643,6 +649,11 @@ impl Foo {
     /// ```rust,no_run
     /// let foobar = Foo::new().bar();
     /// ```
+    ///
+    /// ~~~rust,no_run
+    /// // code block with tilde.
+    /// let foobar = Foo::new().bar();
+    /// ~~~
     ///
     /// ```
     /// // functions

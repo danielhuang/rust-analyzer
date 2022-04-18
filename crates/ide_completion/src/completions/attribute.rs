@@ -91,7 +91,7 @@ pub(crate) fn complete_attribute(acc: &mut Completions, ctx: &CompletionContext)
                 _ => return,
             };
 
-            for (name, def) in module.scope(ctx.db, ctx.module) {
+            for (name, def) in module.scope(ctx.db, Some(ctx.module)) {
                 if let Some(def) = module_or_attr(ctx.db, def) {
                     acc.add_resolution(ctx, name, def);
                 }
@@ -107,7 +107,7 @@ pub(crate) fn complete_attribute(acc: &mut Completions, ctx: &CompletionContext)
                     acc.add_resolution(ctx, name, def);
                 }
             });
-            acc.add_nameref_keywords(ctx);
+            acc.add_nameref_keywords_with_colon(ctx);
         }
     }
 

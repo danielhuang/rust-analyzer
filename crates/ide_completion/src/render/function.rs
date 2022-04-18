@@ -3,7 +3,7 @@
 use hir::{db::HirDatabase, AsAssocItem, HirDisplay};
 use ide_db::{SnippetCap, SymbolKind};
 use itertools::Itertools;
-use stdx::format_to;
+use stdx::{format_to, to_lower_snake_case};
 use syntax::SmolStr;
 
 use crate::{
@@ -22,7 +22,7 @@ pub(crate) fn render_fn(
     ctx: RenderContext<'_>,
     local_name: Option<hir::Name>,
     func: hir::Function,
-) -> CompletionItem {
+) -> Builder {
     let _p = profile::span("render_fn");
     render(ctx, local_name, func, FuncKind::Function)
 }
@@ -32,7 +32,7 @@ pub(crate) fn render_method(
     receiver: Option<hir::Name>,
     local_name: Option<hir::Name>,
     func: hir::Function,
-) -> CompletionItem {
+) -> Builder {
     let _p = profile::span("render_method");
     render(ctx, local_name, func, FuncKind::Method(receiver))
 }
@@ -42,7 +42,7 @@ fn render(
     local_name: Option<hir::Name>,
     func: hir::Function,
     func_kind: FuncKind,
-) -> CompletionItem {
+) -> Builder {
     let db = completion.db;
 
     let name = local_name.unwrap_or_else(|| func.name(db));
@@ -74,10 +74,10 @@ fn render(
     });
 
     if let Some(ref_match) = compute_ref_match(completion, &ret_type) {
-        // FIXME
-        // For now we don't properly calculate the edits for ref match
-        // completions on methods, so we've disabled them. See #8058.
-        if matches!(func_kind, FuncKind::Function) {
+        // FIXME For now we don't properly calculate the edits for ref match
+        // completions on methods or qualified paths, so we've disabled them.
+        // See #8058.
+        if matches!(func_kind, FuncKind::Function) && ctx.completion.path_qual().is_none() {
             item.ref_match(ref_match);
         }
     }
@@ -107,7 +107,7 @@ fn render(
             }
         }
     }
-    item.build()
+    item
 }
 
 pub(super) fn add_call_parens<'b>(
@@ -135,7 +135,17 @@ pub(super) fn add_call_parens<'b>(
                             let ref_ = ref_of_param(ctx, text, param.ty());
                             f(&format_args!("${{{}:{}{}}}", index + offset, ref_, text))
                         }
-                        None => f(&format_args!("${{{}:_}}", index + offset,)),
+                        None => {
+                            let name = match param.ty().as_adt() {
+                                None => "_".to_string(),
+                                Some(adt) => adt
+                                    .name(ctx.db)
+                                    .as_text()
+                                    .map(|s| to_lower_snake_case(s.as_str()))
+                                    .unwrap_or_else(|| "_".to_string()),
+                            };
+                            f(&format_args!("${{{}:{}}}", index + offset, name))
+                        }
                     }
                 });
             match self_param {
@@ -218,7 +228,7 @@ fn should_add_parens(ctx: &CompletionContext) -> bool {
 }
 
 fn detail(db: &dyn HirDatabase, func: hir::Function) -> String {
-    let ret_ty = func.ret_type(db);
+    let mut ret_ty = func.ret_type(db);
     let mut detail = String::new();
 
     if func.is_const(db) {
@@ -226,8 +236,11 @@ fn detail(db: &dyn HirDatabase, func: hir::Function) -> String {
     }
     if func.is_async(db) {
         format_to!(detail, "async ");
+        if let Some(async_ret) = func.async_ret_type(db) {
+            ret_ty = async_ret;
+        }
     }
-    if func.is_unsafe(db) {
+    if func.is_unsafe_to_call(db) {
         format_to!(detail, "unsafe ");
     }
 
@@ -515,6 +528,39 @@ fn take_mutably(mut x: &i32) {}
 
 fn main() {
     take_mutably(${1:x})$0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn complete_pattern_args_with_type_name_if_adt() {
+        check_edit(
+            "qux",
+            r#"
+struct Foo {
+    bar: i32
+}
+
+fn qux(Foo { bar }: Foo) {
+    println!("{}", bar);
+}
+
+fn main() {
+  qu$0
+}
+"#,
+            r#"
+struct Foo {
+    bar: i32
+}
+
+fn qux(Foo { bar }: Foo) {
+    println!("{}", bar);
+}
+
+fn main() {
+  qux(${1:foo})$0
 }
 "#,
         );

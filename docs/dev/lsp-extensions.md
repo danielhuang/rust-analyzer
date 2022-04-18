@@ -1,5 +1,5 @@
 <!---
-lsp_ext.rs hash: 854109e98d02a780
+lsp_ext.rs hash: 326ad62235135223
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -494,6 +494,17 @@ Primarily for debugging, but very useful for all people working on rust-analyzer
 Returns a textual representation of the HIR of the function containing the cursor.
 For debugging or when working on rust-analyzer itself.
 
+## View File Text
+
+**Method:** `rust-analyzer/viewFileText`
+
+**Request:** `TextDocumentIdentifier`
+
+**Response:** `string`
+
+Returns the text of a file as seen by the server.
+This is for debugging file sync problems.
+
 ## View ItemTree
 
 **Method:** `rust-analyzer/viewItemTree`
@@ -559,36 +570,6 @@ interface ExpandedMacro {
 ```
 
 Expands macro call at a given position.
-
-## Inlay Hints
-
-**Method:** `experimental/inlayHints`
-
-This request is sent from client to server to render "inlay hints" -- virtual text inserted into editor to show things like inferred types.
-Generally, the client should re-query inlay hints after every modification.
-Until it gets upstreamed, this follows the VS Code API.
-Upstream issues: https://github.com/microsoft/language-server-protocol/issues/956 , https://github.com/rust-analyzer/rust-analyzer/issues/2797
-
-**Request:**
-
-```typescript
-interface InlayHintsParams {
-    textDocument: TextDocumentIdentifier,
-}
-```
-
-**Response:** `InlayHint[]`
-
-```typescript
-interface InlayHint {
-    position: Position;
-    label: string | InlayHintLabelPart[];
-    tooltip?: string | MarkdownString | undefined;
-    kind?: InlayHintKind;
-    paddingLeft?: boolean;
-    paddingRight?: boolean;
-}
-```
 
 ## Hover Actions
 

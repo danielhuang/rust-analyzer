@@ -1139,7 +1139,6 @@ struct Ctx<T: Clone> {
 }
 
 impl<T: Clone> Ctx<T> {
-    #[must_use]
     fn $0new(data: T) -> Self { Self { data } }
 }
 "#####,
@@ -2103,6 +2102,21 @@ use std::fmt::{Debug, Display$0};
         r#####"
 use std::fmt::{Debug};
 use std::fmt::Display;
+"#####,
+    )
+}
+
+#[test]
+fn doctest_unnecessary_async() {
+    check_doc_test(
+        "unnecessary_async",
+        r#####"
+pub async f$0n foo() {}
+pub async fn bar() { foo().await }
+"#####,
+        r#####"
+pub fn foo() {}
+pub async fn bar() { foo() }
 "#####,
     )
 }

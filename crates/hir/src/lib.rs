@@ -148,6 +148,10 @@ impl Crate {
         db.crate_graph()[self.id].origin.clone()
     }
 
+    pub fn is_builtin(self, db: &dyn HirDatabase) -> bool {
+        matches!(self.origin(db), CrateOrigin::Lang(_))
+    }
+
     pub fn dependencies(self, db: &dyn HirDatabase) -> Vec<CrateDependency> {
         db.crate_graph()[self.id]
             .dependencies
@@ -171,8 +175,11 @@ impl Crate {
             .collect()
     }
 
-    pub fn transitive_reverse_dependencies(self, db: &dyn HirDatabase) -> Vec<Crate> {
-        db.crate_graph().transitive_rev_deps(self.id).into_iter().map(|id| Crate { id }).collect()
+    pub fn transitive_reverse_dependencies(
+        self,
+        db: &dyn HirDatabase,
+    ) -> impl Iterator<Item = Crate> {
+        db.crate_graph().transitive_rev_deps(self.id).map(|id| Crate { id })
     }
 
     pub fn root_module(self, db: &dyn HirDatabase) -> Module {
@@ -802,7 +809,7 @@ impl Field {
         };
         let substs = TyBuilder::placeholder_subst(db, generic_def_id);
         let ty = db.field_types(var_id)[self.id].clone().substitute(Interner, &substs);
-        Type::new(db, self.parent.module(db).id.krate(), var_id, ty)
+        Type::new(db, var_id, ty)
     }
 
     pub fn parent_def(&self, _db: &dyn HirDatabase) -> VariantDef {
@@ -843,7 +850,7 @@ impl Struct {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
-        Type::from_def(db, self.id.lookup(db.upcast()).container.krate(), self.id)
+        Type::from_def(db, self.id)
     }
 
     pub fn repr(self, db: &dyn HirDatabase) -> Option<ReprKind> {
@@ -880,7 +887,7 @@ impl Union {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
-        Type::from_def(db, self.id.lookup(db.upcast()).container.krate(), self.id)
+        Type::from_def(db, self.id)
     }
 
     pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
@@ -922,7 +929,7 @@ impl Enum {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
-        Type::from_def(db, self.id.lookup(db.upcast()).container.krate(), self.id)
+        Type::from_def(db, self.id)
     }
 }
 
@@ -998,7 +1005,7 @@ impl Adt {
     /// general set of completions, but will not look very nice when printed.
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
         let id = AdtId::from(self);
-        Type::from_def(db, id.module(db.upcast()).krate(), id)
+        Type::from_def(db, id)
     }
 
     /// Turns this ADT into a type with the given type parameters. This isn't
@@ -1015,8 +1022,7 @@ impl Adt {
                 }
             })
             .build();
-        let krate = id.module(db.upcast()).krate();
-        Type::new(db, krate, id, ty)
+        Type::new(db, id, ty)
     }
 
     pub fn module(self, db: &dyn HirDatabase) -> Module {
@@ -1183,6 +1189,19 @@ impl DefWithBody {
                         .expect("break outside of loop in synthetic syntax");
                     acc.push(BreakOutsideOfLoop { expr }.into())
                 }
+                hir_ty::InferenceDiagnostic::MismatchedArgCount { call_expr, expected, found } => {
+                    match source_map.expr_syntax(*call_expr) {
+                        Ok(source_ptr) => acc.push(
+                            MismatchedArgCount {
+                                call_expr: source_ptr,
+                                expected: *expected,
+                                found: *found,
+                            }
+                            .into(),
+                        ),
+                        Err(SyntheticSyntax) => (),
+                    }
+                }
             }
         }
         for (expr, mismatch) in infer.expr_type_mismatches() {
@@ -1193,18 +1212,8 @@ impl DefWithBody {
             acc.push(
                 TypeMismatch {
                     expr,
-                    expected: Type::new(
-                        db,
-                        krate,
-                        DefWithBodyId::from(self),
-                        mismatch.expected.clone(),
-                    ),
-                    actual: Type::new(
-                        db,
-                        krate,
-                        DefWithBodyId::from(self),
-                        mismatch.actual.clone(),
-                    ),
+                    expected: Type::new(db, DefWithBodyId::from(self), mismatch.expected.clone()),
+                    actual: Type::new(db, DefWithBodyId::from(self), mismatch.actual.clone()),
                 }
                 .into(),
             );
@@ -1297,14 +1306,6 @@ impl DefWithBody {
                         );
                     }
                 }
-                BodyValidationDiagnostic::MismatchedArgCount { call_expr, expected, found } => {
-                    match source_map.expr_syntax(call_expr) {
-                        Ok(source_ptr) => acc.push(
-                            MismatchedArgCount { call_expr: source_ptr, expected, found }.into(),
-                        ),
-                        Err(SyntheticSyntax) => (),
-                    }
-                }
                 BodyValidationDiagnostic::MissingMatchArms { match_expr } => {
                     match source_map.expr_syntax(match_expr) {
                         Ok(source_ptr) => {
@@ -1357,11 +1358,27 @@ impl Function {
     /// Get this function's return type
     pub fn ret_type(self, db: &dyn HirDatabase) -> Type {
         let resolver = self.id.resolver(db.upcast());
-        let krate = self.krate_id(db);
-        let ret_type = &db.function_data(self.id).ret_type;
-        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
-        let ty = ctx.lower_ty(ret_type);
-        Type::new_with_resolver_inner(db, krate, &resolver, ty)
+        let substs = TyBuilder::placeholder_subst(db, self.id);
+        let callable_sig = db.callable_item_signature(self.id.into()).substitute(Interner, &substs);
+        let ty = callable_sig.ret().clone();
+        Type::new_with_resolver_inner(db, &resolver, ty)
+    }
+
+    pub fn async_ret_type(self, db: &dyn HirDatabase) -> Option<Type> {
+        if !self.is_async(db) {
+            return None;
+        }
+        let resolver = self.id.resolver(db.upcast());
+        let substs = TyBuilder::placeholder_subst(db, self.id);
+        let callable_sig = db.callable_item_signature(self.id.into()).substitute(Interner, &substs);
+        let ret_ty = callable_sig.ret().clone();
+        for pred in ret_ty.impl_trait_bounds(db).into_iter().flatten() {
+            if let WhereClause::AliasEq(output_eq) = pred.into_value_and_skipped_binders().0 {
+                return Type::new_with_resolver_inner(db, &resolver, output_eq.ty).into();
+            }
+        }
+        never!("Async fn ret_type should be impl Future");
+        None
     }
 
     pub fn self_param(self, db: &dyn HirDatabase) -> Option<SelfParam> {
@@ -1372,16 +1389,15 @@ impl Function {
     }
 
     pub fn assoc_fn_params(self, db: &dyn HirDatabase) -> Vec<Param> {
-        let resolver = self.id.resolver(db.upcast());
-        let krate = self.krate_id(db);
-        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
         let environment = db.trait_environment(self.id.into());
-        db.function_data(self.id)
-            .params
+        let substs = TyBuilder::placeholder_subst(db, self.id);
+        let callable_sig = db.callable_item_signature(self.id.into()).substitute(Interner, &substs);
+        callable_sig
+            .params()
             .iter()
             .enumerate()
-            .map(|(idx, (_, type_ref))| {
-                let ty = Type { krate, env: environment.clone(), ty: ctx.lower_ty(type_ref) };
+            .map(|(idx, ty)| {
+                let ty = Type { env: environment.clone(), ty: ty.clone() };
                 Param { func: self, ty, idx }
             })
             .collect()
@@ -1395,33 +1411,32 @@ impl Function {
     }
 
     pub fn params_without_self(self, db: &dyn HirDatabase) -> Vec<Param> {
-        let resolver = self.id.resolver(db.upcast());
-        let krate = self.krate_id(db);
-        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
         let environment = db.trait_environment(self.id.into());
+        let substs = TyBuilder::placeholder_subst(db, self.id);
+        let callable_sig = db.callable_item_signature(self.id.into()).substitute(Interner, &substs);
         let skip = if db.function_data(self.id).has_self_param() { 1 } else { 0 };
-        db.function_data(self.id)
-            .params
+        callable_sig
+            .params()
             .iter()
             .enumerate()
             .skip(skip)
-            .map(|(idx, (_, type_ref))| {
-                let ty = Type { krate, env: environment.clone(), ty: ctx.lower_ty(type_ref) };
+            .map(|(idx, ty)| {
+                let ty = Type { env: environment.clone(), ty: ty.clone() };
                 Param { func: self, ty, idx }
             })
             .collect()
     }
 
-    pub fn is_unsafe(self, db: &dyn HirDatabase) -> bool {
-        db.function_data(self.id).is_unsafe()
-    }
-
     pub fn is_const(self, db: &dyn HirDatabase) -> bool {
-        db.function_data(self.id).is_const()
+        db.function_data(self.id).has_const_kw()
     }
 
     pub fn is_async(self, db: &dyn HirDatabase) -> bool {
-        db.function_data(self.id).is_async()
+        db.function_data(self.id).has_async_kw()
+    }
+
+    pub fn is_unsafe_to_call(self, db: &dyn HirDatabase) -> bool {
+        hir_ty::is_fn_unsafe_to_call(db, self.id)
     }
 
     /// Whether this function declaration has a definition.
@@ -1458,10 +1473,6 @@ impl Function {
 
         result
     }
-
-    fn krate_id(self, db: &dyn HirDatabase) -> CrateId {
-        self.id.lookup(db.upcast()).module(db.upcast()).krate()
-    }
 }
 
 // Note: logically, this belongs to `hir_ty`, but we are not using it there yet.
@@ -1497,10 +1508,15 @@ impl Param {
         db.function_data(self.func.id).params[self.idx].0.clone()
     }
 
-    pub fn as_local(&self, db: &dyn HirDatabase) -> Local {
+    pub fn as_local(&self, db: &dyn HirDatabase) -> Option<Local> {
         let parent = DefWithBodyId::FunctionId(self.func.into());
         let body = db.body(parent);
-        Local { parent, pat_id: body.params[self.idx] }
+        let pat_id = body.params[self.idx];
+        if let Pat::Bind { .. } = &body[pat_id] {
+            Some(Local { parent, pat_id: body.params[self.idx] })
+        } else {
+            None
+        }
     }
 
     pub fn pattern_source(&self, db: &dyn HirDatabase) -> Option<ast::Pat> {
@@ -1557,12 +1573,12 @@ impl SelfParam {
     }
 
     pub fn ty(&self, db: &dyn HirDatabase) -> Type {
-        let resolver = self.func.resolver(db.upcast());
-        let krate = self.func.lookup(db.upcast()).container.module(db.upcast()).krate();
-        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
+        let substs = TyBuilder::placeholder_subst(db, self.func);
+        let callable_sig =
+            db.callable_item_signature(self.func.into()).substitute(Interner, &substs);
         let environment = db.trait_environment(self.func.into());
-
-        Type { krate, env: environment, ty: ctx.lower_ty(&db.function_data(self.func).params[0].1) }
+        let ty = callable_sig.params()[0].clone();
+        Type { env: environment, ty }
     }
 }
 
@@ -1593,10 +1609,9 @@ impl Const {
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
         let data = db.const_data(self.id);
         let resolver = self.id.resolver(db.upcast());
-        let krate = self.id.lookup(db.upcast()).container.krate(db);
         let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
         let ty = ctx.lower_ty(&data.type_ref);
-        Type::new_with_resolver_inner(db, krate.id, &resolver, ty)
+        Type::new_with_resolver_inner(db, &resolver, ty)
     }
 
     pub fn eval(self, db: &dyn HirDatabase) -> Result<ComputedExpr, ConstEvalError> {
@@ -1635,10 +1650,9 @@ impl Static {
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
         let data = db.static_data(self.id);
         let resolver = self.id.resolver(db.upcast());
-        let krate = self.id.lookup(db.upcast()).container.module(db.upcast()).krate();
         let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
         let ty = ctx.lower_ty(&data.type_ref);
-        Type::new_with_resolver_inner(db, krate, &resolver, ty)
+        Type::new_with_resolver_inner(db, &resolver, ty)
     }
 }
 
@@ -1710,7 +1724,7 @@ impl TypeAlias {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
-        Type::from_def(db, self.id.lookup(db.upcast()).module(db.upcast()).krate(), self.id)
+        Type::from_def(db, self.id)
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
@@ -1736,10 +1750,8 @@ impl BuiltinType {
         BuiltinType { inner: hir_def::builtin_type::BuiltinType::Str }
     }
 
-    pub fn ty(self, db: &dyn HirDatabase, module: Module) -> Type {
-        let resolver = module.id.resolver(db.upcast());
-        Type::new_with_resolver(db, &resolver, TyBuilder::builtin(self.inner))
-            .expect("crate not present in resolver")
+    pub fn ty(self, db: &dyn HirDatabase) -> Type {
+        Type::new_for_crate(db.crate_graph().iter().next().unwrap(), TyBuilder::builtin(self.inner))
     }
 
     pub fn name(self) -> Name {
@@ -2170,8 +2182,7 @@ impl Local {
         let def = self.parent;
         let infer = db.infer(def);
         let ty = infer[self.pat_id].clone();
-        let krate = def.module(db.upcast()).krate();
-        Type::new(db, krate, def, ty)
+        Type::new(db, def, ty)
     }
 
     pub fn associated_locals(self, db: &dyn HirDatabase) -> Box<[Local]> {
@@ -2217,7 +2228,7 @@ impl BuiltinAttr {
         Some(BuiltinAttr { krate: Some(krate.id), idx })
     }
 
-    pub(crate) fn builtin(name: &str) -> Option<Self> {
+    fn builtin(name: &str) -> Option<Self> {
         hir_def::builtin_attr::INERT_ATTRIBUTES
             .iter()
             .position(|tool| tool.name == name)
@@ -2256,7 +2267,7 @@ impl ToolModule {
         Some(ToolModule { krate: Some(krate.id), idx })
     }
 
-    pub(crate) fn builtin(name: &str) -> Option<Self> {
+    fn builtin(name: &str) -> Option<Self> {
         hir_def::builtin_attr::TOOL_MODULES
             .iter()
             .position(|&tool| tool == name)
@@ -2358,10 +2369,9 @@ impl TypeParam {
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
         let resolver = self.id.parent().resolver(db.upcast());
-        let krate = self.id.parent().module(db.upcast()).krate();
         let ty =
             TyKind::Placeholder(hir_ty::to_placeholder_idx(db, self.id.into())).intern(Interner);
-        Type::new_with_resolver_inner(db, krate, &resolver, ty)
+        Type::new_with_resolver_inner(db, &resolver, ty)
     }
 
     /// FIXME: this only lists trait bounds from the item defining the type
@@ -2383,14 +2393,11 @@ impl TypeParam {
         let params = db.generic_defaults(self.id.parent());
         let local_idx = hir_ty::param_idx(db, self.id.into())?;
         let resolver = self.id.parent().resolver(db.upcast());
-        let krate = self.id.parent().module(db.upcast()).krate();
         let ty = params.get(local_idx)?.clone();
         let subst = TyBuilder::placeholder_subst(db, self.id.parent());
         let ty = ty.substitute(Interner, &subst_prefix(&subst, local_idx));
         match ty.data(Interner) {
-            GenericArgData::Ty(x) => {
-                Some(Type::new_with_resolver_inner(db, krate, &resolver, x.clone()))
-            }
+            GenericArgData::Ty(x) => Some(Type::new_with_resolver_inner(db, &resolver, x.clone())),
             _ => None,
         }
     }
@@ -2446,9 +2453,7 @@ impl ConstParam {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
-        let def = self.id.parent();
-        let krate = def.module(db.upcast()).krate();
-        Type::new(db, krate, def, db.const_param_ty(self.id))
+        Type::new(db, self.id.parent(), db.const_param_ty(self.id))
     }
 }
 
@@ -2507,8 +2512,8 @@ impl Impl {
         inherent.all_impls().chain(trait_.all_impls()).map(Self::from).collect()
     }
 
-    pub fn all_for_type(db: &dyn HirDatabase, Type { krate, ty, .. }: Type) -> Vec<Impl> {
-        let def_crates = match method_resolution::def_crates(db, &ty, krate) {
+    pub fn all_for_type(db: &dyn HirDatabase, Type { ty, env }: Type) -> Vec<Impl> {
+        let def_crates = match method_resolution::def_crates(db, &ty, env.krate) {
             Some(def_crates) => def_crates,
             None => return Vec::new(),
         };
@@ -2572,12 +2577,10 @@ impl Impl {
     }
 
     pub fn self_ty(self, db: &dyn HirDatabase) -> Type {
-        let impl_data = db.impl_data(self.id);
         let resolver = self.id.resolver(db.upcast());
-        let krate = self.id.lookup(db.upcast()).container.krate();
-        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
-        let ty = ctx.lower_ty(&impl_data.self_ty);
-        Type::new_with_resolver_inner(db, krate, &resolver, ty)
+        let substs = TyBuilder::placeholder_subst(db, self.id);
+        let ty = db.impl_self_ty(self.id).substitute(Interner, &substs);
+        Type::new_with_resolver_inner(db, &resolver, ty)
     }
 
     pub fn items(self, db: &dyn HirDatabase) -> Vec<AssocItem> {
@@ -2600,30 +2603,29 @@ impl Impl {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Type {
-    krate: CrateId, // FIXME this is probably redundant with the TraitEnvironment
     env: Arc<TraitEnvironment>,
     ty: Ty,
 }
 
 impl Type {
-    pub(crate) fn new_with_resolver(
-        db: &dyn HirDatabase,
-        resolver: &Resolver,
-        ty: Ty,
-    ) -> Option<Type> {
-        let krate = resolver.krate()?;
-        Some(Type::new_with_resolver_inner(db, krate, resolver, ty))
+    pub(crate) fn new_with_resolver(db: &dyn HirDatabase, resolver: &Resolver, ty: Ty) -> Type {
+        Type::new_with_resolver_inner(db, resolver, ty)
     }
+
     pub(crate) fn new_with_resolver_inner(
         db: &dyn HirDatabase,
-        krate: CrateId,
         resolver: &Resolver,
         ty: Ty,
     ) -> Type {
-        let environment = resolver
-            .generic_def()
-            .map_or_else(|| Arc::new(TraitEnvironment::empty(krate)), |d| db.trait_environment(d));
-        Type { krate, env: environment, ty }
+        let environment = resolver.generic_def().map_or_else(
+            || Arc::new(TraitEnvironment::empty(resolver.krate())),
+            |d| db.trait_environment(d),
+        );
+        Type { env: environment, ty }
+    }
+
+    pub(crate) fn new_for_crate(krate: CrateId, ty: Ty) -> Type {
+        Type { env: Arc::new(TraitEnvironment::empty(krate)), ty }
     }
 
     pub fn reference(inner: &Type, m: Mutability) -> Type {
@@ -2637,25 +2639,22 @@ impl Type {
         )
     }
 
-    fn new(db: &dyn HirDatabase, krate: CrateId, lexical_env: impl HasResolver, ty: Ty) -> Type {
+    fn new(db: &dyn HirDatabase, lexical_env: impl HasResolver, ty: Ty) -> Type {
         let resolver = lexical_env.resolver(db.upcast());
-        let environment = resolver
-            .generic_def()
-            .map_or_else(|| Arc::new(TraitEnvironment::empty(krate)), |d| db.trait_environment(d));
-        Type { krate, env: environment, ty }
+        let environment = resolver.generic_def().map_or_else(
+            || Arc::new(TraitEnvironment::empty(resolver.krate())),
+            |d| db.trait_environment(d),
+        );
+        Type { env: environment, ty }
     }
 
-    fn from_def(
-        db: &dyn HirDatabase,
-        krate: CrateId,
-        def: impl HasResolver + Into<TyDefId>,
-    ) -> Type {
+    fn from_def(db: &dyn HirDatabase, def: impl HasResolver + Into<TyDefId>) -> Type {
         let ty = TyBuilder::def_ty(db, def.into()).fill_with_unknown().build();
-        Type::new(db, krate, def, ty)
+        Type::new(db, def, ty)
     }
 
     pub fn new_slice(ty: Type) -> Type {
-        Type { krate: ty.krate, env: ty.env, ty: TyBuilder::slice(ty.ty) }
+        Type { env: ty.env, ty: TyBuilder::slice(ty.ty) }
     }
 
     pub fn is_unit(&self) -> bool {
@@ -2711,7 +2710,7 @@ impl Type {
     /// This function is used in `.await` syntax completion.
     pub fn impls_future(&self, db: &dyn HirDatabase) -> bool {
         let std_future_trait = db
-            .lang_item(self.krate, SmolStr::new_inline("future_trait"))
+            .lang_item(self.env.krate, SmolStr::new_inline("future_trait"))
             .and_then(|it| it.as_trait());
         let std_future_trait = match std_future_trait {
             Some(it) => it,
@@ -2728,7 +2727,7 @@ impl Type {
     /// This function can be used to check if a particular type is callable, since FnOnce is a
     /// supertrait of Fn and FnMut, so all callable types implements at least FnOnce.
     pub fn impls_fnonce(&self, db: &dyn HirDatabase) -> bool {
-        let fnonce_trait = match FnTrait::FnOnce.get_id(db, self.krate) {
+        let fnonce_trait = match FnTrait::FnOnce.get_id(db, self.env.krate) {
             Some(it) => it,
             None => return false,
         };
@@ -2764,7 +2763,7 @@ impl Type {
             binders: CanonicalVarKinds::empty(Interner),
         };
 
-        db.trait_solve(self.krate, goal).is_some()
+        db.trait_solve(self.env.krate, goal).is_some()
     }
 
     pub fn normalize_trait_assoc_type(
@@ -2799,7 +2798,7 @@ impl Type {
             [TyVariableKind::General].into_iter(),
         );
 
-        match db.trait_solve(self.krate, goal)? {
+        match db.trait_solve(self.env.krate, goal)? {
             Solution::Unique(s) => s
                 .value
                 .subst
@@ -2811,7 +2810,7 @@ impl Type {
     }
 
     pub fn is_copy(&self, db: &dyn HirDatabase) -> bool {
-        let lang_item = db.lang_item(self.krate, SmolStr::new_inline("copy"));
+        let lang_item = db.lang_item(self.env.krate, SmolStr::new_inline("copy"));
         let copy_trait = match lang_item {
             Some(LangItemTarget::TraitId(it)) => it,
             _ => return false,
@@ -3026,10 +3025,7 @@ impl Type {
         // There should be no inference vars in types passed here
         let canonical = hir_ty::replace_errors_with_variables(&self.ty);
 
-        let krate = match scope.krate() {
-            Some(k) => k,
-            None => return,
-        };
+        let krate = scope.krate();
         let environment = scope.resolver().generic_def().map_or_else(
             || Arc::new(TraitEnvironment::empty(krate.id)),
             |d| db.trait_environment(d),
@@ -3086,10 +3082,7 @@ impl Type {
     ) {
         let canonical = hir_ty::replace_errors_with_variables(&self.ty);
 
-        let krate = match scope.krate() {
-            Some(k) => k,
-            None => return,
-        };
+        let krate = scope.krate();
         let environment = scope.resolver().generic_def().map_or_else(
             || Arc::new(TraitEnvironment::empty(krate.id)),
             |d| db.trait_environment(d),
@@ -3160,7 +3153,7 @@ impl Type {
     }
 
     fn derived(&self, ty: Ty) -> Type {
-        Type { krate: self.krate, env: self.env.clone(), ty }
+        Type { env: self.env.clone(), ty }
     }
 
     pub fn walk(&self, db: &dyn HirDatabase, mut cb: impl FnMut(Type)) {
@@ -3470,7 +3463,7 @@ impl HasCrate for TypeAlias {
 
 impl HasCrate for Type {
     fn krate(&self, _db: &dyn HirDatabase) -> Crate {
-        self.krate.into()
+        self.env.krate.into()
     }
 }
 

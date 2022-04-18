@@ -30,9 +30,9 @@ use crate::{
     db::HirDatabase,
     semantics::source_to_def::{ChildContainer, SourceToDefCache, SourceToDefCtx},
     source_analyzer::{resolve_hir_path, SourceAnalyzer},
-    Access, AssocItem, BuiltinAttr, Callable, ConstParam, Crate, Field, Function, HasSource,
-    HirFileId, Impl, InFile, Label, LifetimeParam, Local, Macro, Module, ModuleDef, Name, Path,
-    ScopeDef, ToolModule, Trait, Type, TypeAlias, TypeParam, VariantDef,
+    Access, BuiltinAttr, Callable, ConstParam, Crate, Field, Function, HasSource, HirFileId, Impl,
+    InFile, Label, LifetimeParam, Local, Macro, Module, ModuleDef, Name, Path, ScopeDef,
+    ToolModule, Trait, Type, TypeAlias, TypeParam, VariantDef,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +46,6 @@ pub enum PathResolution {
     /// A const parameter
     ConstParam(ConstParam),
     SelfType(Impl),
-    AssocItem(AssocItem),
     BuiltinAttr(BuiltinAttr),
     ToolModule(ToolModule),
 }
@@ -76,10 +75,6 @@ impl PathResolution {
             | PathResolution::ConstParam(_) => None,
             PathResolution::TypeParam(param) => Some(TypeNs::GenericParam((*param).into())),
             PathResolution::SelfType(impl_def) => Some(TypeNs::SelfType((*impl_def).into())),
-            PathResolution::AssocItem(AssocItem::Const(_) | AssocItem::Function(_)) => None,
-            PathResolution::AssocItem(AssocItem::TypeAlias(alias)) => {
-                Some(TypeNs::TypeAliasId((*alias).into()))
-            }
         }
     }
 }
@@ -211,6 +206,16 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
     /// Descend the token into macrocalls to all its mapped counterparts.
     pub fn descend_into_macros(&self, token: SyntaxToken) -> SmallVec<[SyntaxToken; 1]> {
         self.imp.descend_into_macros(token)
+    }
+
+    /// Descend the token into macrocalls to all its mapped counterparts.
+    ///
+    /// Returns the original non descended token if none of the mapped counterparts have the same syntax kind.
+    pub fn descend_into_macros_with_same_kind(
+        &self,
+        token: SyntaxToken,
+    ) -> SmallVec<[SyntaxToken; 1]> {
+        self.imp.descend_into_macros_with_same_kind(token)
     }
 
     /// Maps a node down by mapping its first and last token down.
@@ -403,11 +408,15 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
         self.imp.to_module_def(file)
     }
 
-    pub fn scope(&self, node: &SyntaxNode) -> SemanticsScope<'db> {
+    pub fn scope(&self, node: &SyntaxNode) -> Option<SemanticsScope<'db>> {
         self.imp.scope(node)
     }
 
-    pub fn scope_at_offset(&self, node: &SyntaxNode, offset: TextSize) -> SemanticsScope<'db> {
+    pub fn scope_at_offset(
+        &self,
+        node: &SyntaxNode,
+        offset: TextSize,
+    ) -> Option<SemanticsScope<'db>> {
         self.imp.scope_at_offset(node, offset)
     }
 
@@ -456,7 +465,7 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn expand(&self, macro_call: &ast::MacroCall) -> Option<SyntaxNode> {
-        let sa = self.analyze_no_infer(macro_call.syntax());
+        let sa = self.analyze_no_infer(macro_call.syntax())?;
         let file_id = sa.expand(self.db, InFile::new(sa.file_id, macro_call))?;
         let node = self.parse_or_expand(file_id)?;
         Some(node)
@@ -535,9 +544,9 @@ impl<'db> SemanticsImpl<'db> {
         token_to_map: SyntaxToken,
     ) -> Option<(SyntaxNode, SyntaxToken)> {
         let SourceAnalyzer { file_id, resolver, .. } =
-            self.analyze_no_infer(actual_macro_call.syntax());
+            self.analyze_no_infer(actual_macro_call.syntax())?;
         let macro_call = InFile::new(file_id, actual_macro_call);
-        let krate = resolver.krate()?;
+        let krate = resolver.krate();
         let macro_call_id = macro_call.as_call_id(self.db.upcast(), krate, |path| {
             resolver
                 .resolve_path_as_macro(self.db.upcast(), &path)
@@ -600,25 +609,19 @@ impl<'db> SemanticsImpl<'db> {
         };
 
         if first == last {
-            self.descend_into_macros_impl(
-                first,
-                &mut |InFile { value, .. }| {
-                    if let Some(node) = value.ancestors().find_map(N::cast) {
-                        res.push(node)
-                    }
-                },
-                false,
-            );
+            self.descend_into_macros_impl(first, &mut |InFile { value, .. }| {
+                if let Some(node) = value.ancestors().find_map(N::cast) {
+                    res.push(node)
+                }
+                false
+            });
         } else {
             // Descend first and last token, then zip them to look for the node they belong to
             let mut scratch: SmallVec<[_; 1]> = smallvec![];
-            self.descend_into_macros_impl(
-                first,
-                &mut |token| {
-                    scratch.push(token);
-                },
-                false,
-            );
+            self.descend_into_macros_impl(first, &mut |token| {
+                scratch.push(token);
+                false
+            });
 
             let mut scratch = scratch.into_iter();
             self.descend_into_macros_impl(
@@ -639,8 +642,8 @@ impl<'db> SemanticsImpl<'db> {
                             }
                         }
                     }
+                    false
                 },
-                false,
             );
         }
         res
@@ -648,28 +651,51 @@ impl<'db> SemanticsImpl<'db> {
 
     fn descend_into_macros(&self, token: SyntaxToken) -> SmallVec<[SyntaxToken; 1]> {
         let mut res = smallvec![];
-        self.descend_into_macros_impl(token, &mut |InFile { value, .. }| res.push(value), false);
+        self.descend_into_macros_impl(token, &mut |InFile { value, .. }| {
+            res.push(value);
+            false
+        });
+        res
+    }
+
+    fn descend_into_macros_with_same_kind(&self, token: SyntaxToken) -> SmallVec<[SyntaxToken; 1]> {
+        let kind = token.kind();
+        let mut res = smallvec![];
+        self.descend_into_macros_impl(token.clone(), &mut |InFile { value, .. }| {
+            if value.kind() == kind {
+                res.push(value);
+            }
+            false
+        });
+        if res.is_empty() {
+            res.push(token);
+        }
         res
     }
 
     fn descend_into_macros_single(&self, token: SyntaxToken) -> SyntaxToken {
         let mut res = token.clone();
-        self.descend_into_macros_impl(token, &mut |InFile { value, .. }| res = value, true);
+        self.descend_into_macros_impl(token, &mut |InFile { value, .. }| {
+            res = value;
+            true
+        });
         res
     }
 
     fn descend_into_macros_impl(
         &self,
         token: SyntaxToken,
-        f: &mut dyn FnMut(InFile<SyntaxToken>),
-        single: bool,
+        f: &mut dyn FnMut(InFile<SyntaxToken>) -> bool,
     ) {
         let _p = profile::span("descend_into_macros");
         let parent = match token.parent() {
             Some(it) => it,
             None => return,
         };
-        let sa = self.analyze_no_infer(&parent);
+        let sa = match self.analyze_no_infer(&parent) {
+            Some(it) => it,
+            None => return,
+        };
         let mut stack: SmallVec<[_; 4]> = smallvec![InFile::new(sa.file_id, token)];
         let mut cache = self.expansion_info_cache.borrow_mut();
         let mut mcache = self.macro_call_cache.borrow_mut();
@@ -686,16 +712,11 @@ impl<'db> SemanticsImpl<'db> {
                     self.cache(value, file_id);
                 }
 
-                let mut mapped_tokens =
-                    expansion_info.map_token_down(self.db.upcast(), item, token)?;
-
+                let mapped_tokens = expansion_info.map_token_down(self.db.upcast(), item, token)?;
                 let len = stack.len();
+
                 // requeue the tokens we got from mapping our current token down
-                if single {
-                    stack.extend(mapped_tokens.next());
-                } else {
-                    stack.extend(mapped_tokens);
-                }
+                stack.extend(mapped_tokens);
                 // if the length changed we have found a mapping for the token
                 (stack.len() != len).then(|| ())
             };
@@ -785,8 +806,8 @@ impl<'db> SemanticsImpl<'db> {
             })()
             .is_none();
 
-            if was_not_remapped {
-                f(token)
+            if was_not_remapped && f(token) {
+                break;
             }
         }
     }
@@ -903,70 +924,74 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn resolve_type(&self, ty: &ast::Type) -> Option<Type> {
-        let scope = self.scope(ty.syntax());
-        let ctx = body::LowerCtx::new(self.db.upcast(), scope.file_id);
-        let ty = hir_ty::TyLoweringContext::new(self.db, &scope.resolver)
+        let analyze = self.analyze(ty.syntax())?;
+        let ctx = body::LowerCtx::new(self.db.upcast(), analyze.file_id);
+        let ty = hir_ty::TyLoweringContext::new(self.db, &analyze.resolver)
             .lower_ty(&crate::TypeRef::from_ast(&ctx, ty.clone()));
-        Type::new_with_resolver(self.db, &scope.resolver, ty)
+        Some(Type::new_with_resolver(self.db, &analyze.resolver, ty))
     }
 
     fn is_implicit_reborrow(&self, expr: &ast::Expr) -> Option<Mutability> {
-        self.analyze(expr.syntax()).is_implicit_reborrow(self.db, expr)
+        self.analyze(expr.syntax())?.is_implicit_reborrow(self.db, expr)
     }
 
     fn type_of_expr(&self, expr: &ast::Expr) -> Option<TypeInfo> {
-        self.analyze(expr.syntax())
+        self.analyze(expr.syntax())?
             .type_of_expr(self.db, expr)
             .map(|(ty, coerced)| TypeInfo { original: ty, adjusted: coerced })
     }
 
     fn type_of_pat(&self, pat: &ast::Pat) -> Option<TypeInfo> {
-        self.analyze(pat.syntax())
+        self.analyze(pat.syntax())?
             .type_of_pat(self.db, pat)
             .map(|(ty, coerced)| TypeInfo { original: ty, adjusted: coerced })
     }
 
     fn type_of_self(&self, param: &ast::SelfParam) -> Option<Type> {
-        self.analyze(param.syntax()).type_of_self(self.db, param)
+        self.analyze(param.syntax())?.type_of_self(self.db, param)
     }
 
     fn resolve_method_call(&self, call: &ast::MethodCallExpr) -> Option<FunctionId> {
-        self.analyze(call.syntax()).resolve_method_call(self.db, call).map(|(id, _)| id)
+        self.analyze(call.syntax())?.resolve_method_call(self.db, call).map(|(id, _)| id)
     }
 
     fn resolve_method_call_as_callable(&self, call: &ast::MethodCallExpr) -> Option<Callable> {
-        let (func, subst) = self.analyze(call.syntax()).resolve_method_call(self.db, call)?;
+        let source_analyzer = self.analyze(call.syntax())?;
+        let (func, subst) = source_analyzer.resolve_method_call(self.db, call)?;
         let ty = self.db.value_ty(func.into()).substitute(Interner, &subst);
-        let resolver = self.analyze(call.syntax()).resolver;
-        let ty = Type::new_with_resolver(self.db, &resolver, ty)?;
+        let resolver = source_analyzer.resolver;
+        let ty = Type::new_with_resolver(self.db, &resolver, ty);
         let mut res = ty.as_callable(self.db)?;
         res.is_bound_method = true;
         Some(res)
     }
 
     fn resolve_field(&self, field: &ast::FieldExpr) -> Option<Field> {
-        self.analyze(field.syntax()).resolve_field(self.db, field)
+        self.analyze(field.syntax())?.resolve_field(self.db, field)
     }
 
     fn resolve_record_field(
         &self,
         field: &ast::RecordExprField,
     ) -> Option<(Field, Option<Local>, Type)> {
-        self.analyze(field.syntax()).resolve_record_field(self.db, field)
+        self.analyze(field.syntax())?.resolve_record_field(self.db, field)
     }
 
     fn resolve_record_pat_field(&self, field: &ast::RecordPatField) -> Option<Field> {
-        self.analyze(field.syntax()).resolve_record_pat_field(self.db, field)
+        self.analyze(field.syntax())?.resolve_record_pat_field(self.db, field)
     }
 
     fn resolve_macro_call(&self, macro_call: &ast::MacroCall) -> Option<Macro> {
-        let sa = self.analyze(macro_call.syntax());
+        let sa = self.analyze(macro_call.syntax())?;
         let macro_call = self.find_file(macro_call.syntax()).with_value(macro_call);
         sa.resolve_macro_call(self.db, macro_call)
     }
 
     fn is_unsafe_macro_call(&self, macro_call: &ast::MacroCall) -> bool {
-        let sa = self.analyze(macro_call.syntax());
+        let sa = match self.analyze(macro_call.syntax()) {
+            Some(it) => it,
+            None => return false,
+        };
         let macro_call = self.find_file(macro_call.syntax()).with_value(macro_call);
         sa.is_unsafe_macro_call(self.db, macro_call)
     }
@@ -981,11 +1006,11 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn resolve_path(&self, path: &ast::Path) -> Option<PathResolution> {
-        self.analyze(path.syntax()).resolve_path(self.db, path)
+        self.analyze(path.syntax())?.resolve_path(self.db, path)
     }
 
     fn resolve_extern_crate(&self, extern_crate: &ast::ExternCrate) -> Option<Crate> {
-        let krate = self.scope(extern_crate.syntax()).krate()?;
+        let krate = self.scope(extern_crate.syntax())?.krate();
         let name = extern_crate.name_ref()?.as_name();
         if name == known::SELF_PARAM {
             return Some(krate);
@@ -997,22 +1022,22 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn resolve_variant(&self, record_lit: ast::RecordExpr) -> Option<VariantId> {
-        self.analyze(record_lit.syntax()).resolve_variant(self.db, record_lit)
+        self.analyze(record_lit.syntax())?.resolve_variant(self.db, record_lit)
     }
 
     fn resolve_bind_pat_to_const(&self, pat: &ast::IdentPat) -> Option<ModuleDef> {
-        self.analyze(pat.syntax()).resolve_bind_pat_to_const(self.db, pat)
+        self.analyze(pat.syntax())?.resolve_bind_pat_to_const(self.db, pat)
     }
 
     fn record_literal_missing_fields(&self, literal: &ast::RecordExpr) -> Vec<(Field, Type)> {
         self.analyze(literal.syntax())
-            .record_literal_missing_fields(self.db, literal)
+            .and_then(|it| it.record_literal_missing_fields(self.db, literal))
             .unwrap_or_default()
     }
 
     fn record_pattern_missing_fields(&self, pattern: &ast::RecordPat) -> Vec<(Field, Type)> {
         self.analyze(pattern.syntax())
-            .record_pattern_missing_fields(self.db, pattern)
+            .and_then(|it| it.record_pattern_missing_fields(self.db, pattern))
             .unwrap_or_default()
     }
 
@@ -1026,15 +1051,22 @@ impl<'db> SemanticsImpl<'db> {
         self.with_ctx(|ctx| ctx.file_to_def(file)).into_iter().map(Module::from)
     }
 
-    fn scope(&self, node: &SyntaxNode) -> SemanticsScope<'db> {
-        let SourceAnalyzer { file_id, resolver, .. } = self.analyze_no_infer(node);
-        SemanticsScope { db: self.db, file_id, resolver }
+    fn scope(&self, node: &SyntaxNode) -> Option<SemanticsScope<'db>> {
+        self.analyze_no_infer(node).map(|SourceAnalyzer { file_id, resolver, .. }| SemanticsScope {
+            db: self.db,
+            file_id,
+            resolver,
+        })
     }
 
-    fn scope_at_offset(&self, node: &SyntaxNode, offset: TextSize) -> SemanticsScope<'db> {
-        let SourceAnalyzer { file_id, resolver, .. } =
-            self.analyze_with_offset_no_infer(node, offset);
-        SemanticsScope { db: self.db, file_id, resolver }
+    fn scope_at_offset(&self, node: &SyntaxNode, offset: TextSize) -> Option<SemanticsScope<'db>> {
+        self.analyze_with_offset_no_infer(node, offset).map(
+            |SourceAnalyzer { file_id, resolver, .. }| SemanticsScope {
+                db: self.db,
+                file_id,
+                resolver,
+            },
+        )
     }
 
     fn scope_for_def(&self, def: Trait) -> SemanticsScope<'db> {
@@ -1052,15 +1084,21 @@ impl<'db> SemanticsImpl<'db> {
         Some(res)
     }
 
-    fn analyze(&self, node: &SyntaxNode) -> SourceAnalyzer {
+    /// Returns none if the file of the node is not part of a crate.
+    fn analyze(&self, node: &SyntaxNode) -> Option<SourceAnalyzer> {
         self.analyze_impl(node, None, true)
     }
 
-    fn analyze_no_infer(&self, node: &SyntaxNode) -> SourceAnalyzer {
+    /// Returns none if the file of the node is not part of a crate.
+    fn analyze_no_infer(&self, node: &SyntaxNode) -> Option<SourceAnalyzer> {
         self.analyze_impl(node, None, false)
     }
 
-    fn analyze_with_offset_no_infer(&self, node: &SyntaxNode, offset: TextSize) -> SourceAnalyzer {
+    fn analyze_with_offset_no_infer(
+        &self,
+        node: &SyntaxNode,
+        offset: TextSize,
+    ) -> Option<SourceAnalyzer> {
         self.analyze_impl(node, Some(offset), false)
     }
 
@@ -1069,22 +1107,22 @@ impl<'db> SemanticsImpl<'db> {
         node: &SyntaxNode,
         offset: Option<TextSize>,
         infer_body: bool,
-    ) -> SourceAnalyzer {
+    ) -> Option<SourceAnalyzer> {
         let _p = profile::span("Semantics::analyze_impl");
         let node = self.find_file(node);
 
         let container = match self.with_ctx(|ctx| ctx.find_container(node)) {
             Some(it) => it,
-            None => return SourceAnalyzer::new_for_resolver(Resolver::default(), node),
+            None => return None,
         };
 
         let resolver = match container {
             ChildContainer::DefWithBodyId(def) => {
-                return if infer_body {
+                return Some(if infer_body {
                     SourceAnalyzer::new_for_body(self.db, def, node, offset)
                 } else {
                     SourceAnalyzer::new_for_body_no_infer(self.db, def, node, offset)
-                }
+                })
             }
             ChildContainer::TraitId(it) => it.resolver(self.db.upcast()),
             ChildContainer::ImplId(it) => it.resolver(self.db.upcast()),
@@ -1094,7 +1132,7 @@ impl<'db> SemanticsImpl<'db> {
             ChildContainer::TypeAliasId(it) => it.resolver(self.db.upcast()),
             ChildContainer::GenericDefId(it) => it.resolver(self.db.upcast()),
         };
-        SourceAnalyzer::new_for_resolver(resolver, node)
+        Some(SourceAnalyzer::new_for_resolver(resolver, node))
     }
 
     fn cache(&self, root_node: SyntaxNode, file_id: HirFileId) {
@@ -1118,6 +1156,7 @@ impl<'db> SemanticsImpl<'db> {
         InFile::new(file_id, node)
     }
 
+    /// Wraps the node in a [`InFile`] with the file id it belongs to.
     fn find_file<'node>(&self, node: &'node SyntaxNode) -> InFile<&'node SyntaxNode> {
         let root_node = find_root(node);
         let file_id = self.lookup(&root_node).unwrap_or_else(|| {
@@ -1319,12 +1358,12 @@ pub struct SemanticsScope<'a> {
 }
 
 impl<'a> SemanticsScope<'a> {
-    pub fn module(&self) -> Option<Module> {
-        Some(Module { id: self.resolver.module()? })
+    pub fn module(&self) -> Module {
+        Module { id: self.resolver.module() }
     }
 
-    pub fn krate(&self) -> Option<Crate> {
-        Some(Crate { id: self.resolver.krate()? })
+    pub fn krate(&self) -> Crate {
+        Crate { id: self.resolver.krate() }
     }
 
     pub(crate) fn resolver(&self) -> &Resolver {

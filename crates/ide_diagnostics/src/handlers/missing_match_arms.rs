@@ -396,14 +396,14 @@ fn main() {
         //^ error: missing match arm
     match a {
         Either::A { } => (),
-      //^^^^^^^^^ error: missing structure fields:
+      //^^^^^^^^^ 💡 error: missing structure fields:
       //        | - foo
         Either::B => (),
     }
     match a {
         //^ error: missing match arm
         Either::A { } => (),
-    } //^^^^^^^^^ error: missing structure fields:
+    } //^^^^^^^^^ 💡 error: missing structure fields:
       //        | - foo
 
     match a {
@@ -928,6 +928,22 @@ fn f(ty: Enum) {
     }
 }
 "#,
+        );
+    }
+
+    #[test]
+    fn unexpected_ty_fndef() {
+        cov_mark::check!(validate_match_bailed_out);
+        check_diagnostics(
+            r"
+enum Exp {
+    Tuple(()),
+}
+fn f() {
+    match __unknown {
+        Exp::Tuple => {}
+    }
+}",
         );
     }
 

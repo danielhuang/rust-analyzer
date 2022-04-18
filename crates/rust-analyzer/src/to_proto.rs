@@ -107,6 +107,7 @@ pub(crate) fn completion_item_kind(
     match completion_item_kind {
         CompletionItemKind::Binding => lsp_types::CompletionItemKind::VARIABLE,
         CompletionItemKind::BuiltinType => lsp_types::CompletionItemKind::STRUCT,
+        CompletionItemKind::InferredType => lsp_types::CompletionItemKind::SNIPPET,
         CompletionItemKind::Keyword => lsp_types::CompletionItemKind::KEYWORD,
         CompletionItemKind::Method => lsp_types::CompletionItemKind::METHOD,
         CompletionItemKind::Snippet => lsp_types::CompletionItemKind::SNIPPET,
@@ -283,7 +284,7 @@ fn completion_item(
             let imports: Vec<_> = imports
                 .iter()
                 .filter_map(|import_edit| {
-                    let import_path = &import_edit.import.import_path;
+                    let import_path = &import_edit.import_path;
                     let import_name = import_path.segments().last()?;
                     Some(lsp_ext::CompletionImport {
                         full_import_path: import_path.to_string(),
@@ -417,14 +418,8 @@ pub(crate) fn inlay_hint(
     render_colons: bool,
     line_index: &LineIndex,
     inlay_hint: InlayHint,
-) -> lsp_ext::InlayHint {
-    lsp_ext::InlayHint {
-        label: lsp_ext::InlayHintLabel::String(match inlay_hint.kind {
-            InlayKind::ParameterHint if render_colons => format!("{}:", inlay_hint.label),
-            InlayKind::TypeHint if render_colons => format!(": {}", inlay_hint.label),
-            InlayKind::ClosureReturnTypeHint => format!(" -> {}", inlay_hint.label),
-            _ => inlay_hint.label.to_string(),
-        }),
+) -> lsp_types::InlayHint {
+    lsp_types::InlayHint {
         position: match inlay_hint.kind {
             // before annotated thing
             InlayKind::ParameterHint | InlayKind::ImplicitReborrow => {
@@ -437,10 +432,16 @@ pub(crate) fn inlay_hint(
             | InlayKind::GenericParamListHint
             | InlayKind::LifetimeHint => position(line_index, inlay_hint.range.end()),
         },
+        label: lsp_types::InlayHintLabel::String(match inlay_hint.kind {
+            InlayKind::ParameterHint if render_colons => format!("{}:", inlay_hint.label),
+            InlayKind::TypeHint if render_colons => format!(": {}", inlay_hint.label),
+            InlayKind::ClosureReturnTypeHint => format!(" -> {}", inlay_hint.label),
+            _ => inlay_hint.label.to_string(),
+        }),
         kind: match inlay_hint.kind {
-            InlayKind::ParameterHint => Some(lsp_ext::InlayHintKind::PARAMETER),
+            InlayKind::ParameterHint => Some(lsp_types::InlayHintKind::PARAMETER),
             InlayKind::ClosureReturnTypeHint | InlayKind::TypeHint | InlayKind::ChainingHint => {
-                Some(lsp_ext::InlayHintKind::TYPE)
+                Some(lsp_types::InlayHintKind::TYPE)
             }
             InlayKind::GenericParamListHint
             | InlayKind::LifetimeHint
@@ -464,6 +465,8 @@ pub(crate) fn inlay_hint(
             InlayKind::GenericParamListHint => false,
             InlayKind::ImplicitReborrow => false,
         }),
+        text_edits: None,
+        data: None,
     }
 }
 
@@ -856,6 +859,20 @@ pub(crate) fn snippet_text_document_ops(
             let mut rename_file =
                 lsp_types::RenameFile { old_uri, new_uri, options: None, annotation_id: None };
             if snap.analysis.is_library_file(src).ok() == Some(true)
+                && snap.config.change_annotation_support()
+            {
+                rename_file.annotation_id = Some(outside_workspace_annotation_id())
+            }
+            ops.push(lsp_ext::SnippetDocumentChangeOperation::Op(lsp_types::ResourceOp::Rename(
+                rename_file,
+            )))
+        }
+        FileSystemEdit::MoveDir { src, src_id, dst } => {
+            let old_uri = snap.anchored_path(&src);
+            let new_uri = snap.anchored_path(&dst);
+            let mut rename_file =
+                lsp_types::RenameFile { old_uri, new_uri, options: None, annotation_id: None };
+            if snap.analysis.is_library_file(src_id).ok() == Some(true)
                 && snap.config.change_annotation_support()
             {
                 rename_file.annotation_id = Some(outside_workspace_annotation_id())

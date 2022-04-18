@@ -14,6 +14,7 @@ use chalk_ir::interner::HasInterner;
 use chalk_ir::{cast::Cast, fold::Shift, Mutability, Safety};
 use hir_def::generics::TypeOrConstParamData;
 use hir_def::intern::Interned;
+use hir_def::lang_item::lang_attr;
 use hir_def::path::{ModPath, PathKind};
 use hir_def::type_ref::ConstScalarOrPath;
 use hir_def::{
@@ -37,11 +38,12 @@ use smallvec::SmallVec;
 use stdx::{impl_from, never};
 use syntax::{ast, SmolStr};
 
-use crate::consteval::{path_to_const, unknown_const_as_generic, unknown_const_usize, usize_const};
+use crate::consteval::{
+    intern_scalar_const, path_to_const, unknown_const, unknown_const_as_generic,
+};
 use crate::utils::Generics;
 use crate::{all_super_traits, make_binders, Const, GenericArgData, ParamKind};
 use crate::{
-    consteval,
     db::HirDatabase,
     mapping::ToChalk,
     static_lifetime, to_assoc_type_id, to_chalk_trait_id, to_placeholder_idx,
@@ -202,10 +204,11 @@ impl<'a> TyLoweringContext<'a> {
                 let const_len = const_or_path_to_chalk(
                     self.db,
                     self.resolver,
+                    TyBuilder::usize(),
                     len,
                     self.type_param_mode,
                     || self.generics(),
-                    DebruijnIndex::INNERMOST,
+                    self.in_binders,
                 );
 
                 TyKind::Array(inner_ty, const_len).intern(Interner)
@@ -335,12 +338,13 @@ impl<'a> TyLoweringContext<'a> {
                     let mut expander = self.expander.borrow_mut();
                     if expander.is_some() {
                         (Some(expander), false)
-                    } else if let Some(module_id) = self.resolver.module() {
-                        *expander =
-                            Some(Expander::new(self.db.upcast(), macro_call.file_id, module_id));
-                        (Some(expander), true)
                     } else {
-                        (None, false)
+                        *expander = Some(Expander::new(
+                            self.db.upcast(),
+                            macro_call.file_id,
+                            self.resolver.module(),
+                        ));
+                        (Some(expander), true)
                     }
                 };
                 let ty = if let Some(mut expander) = expander {
@@ -676,12 +680,13 @@ impl<'a> TyLoweringContext<'a> {
             parent_params + self_params + type_params + const_params + impl_trait_params;
 
         let ty_error = GenericArgData::Ty(TyKind::Error.intern(Interner)).intern(Interner);
-        let const_error = GenericArgData::Const(consteval::usize_const(None)).intern(Interner);
 
-        for (_, data) in def_generics.iter().take(parent_params) {
-            match data {
-                TypeOrConstParamData::TypeParamData(_) => substs.push(ty_error.clone()),
-                TypeOrConstParamData::ConstParamData(_) => substs.push(const_error.clone()),
+        for eid in def_generics.iter_id().take(parent_params) {
+            match eid {
+                Either::Left(_) => substs.push(ty_error.clone()),
+                Either::Right(x) => {
+                    substs.push(unknown_const_as_generic(self.db.const_param_ty(x)))
+                }
             }
         }
 
@@ -721,14 +726,15 @@ impl<'a> TyLoweringContext<'a> {
                     arg,
                     &mut (),
                     |_, type_ref| self.lower_ty(type_ref),
-                    |_, c| {
+                    |_, c, ty| {
                         const_or_path_to_chalk(
                             self.db,
                             &self.resolver,
+                            ty,
                             c,
                             self.type_param_mode,
                             || self.generics(),
-                            DebruijnIndex::INNERMOST,
+                            self.in_binders,
                         )
                     },
                 ) {
@@ -758,10 +764,12 @@ impl<'a> TyLoweringContext<'a> {
 
         // add placeholders for args that were not provided
         // FIXME: emit diagnostics in contexts where this is not allowed
-        for (_, data) in def_generics.iter().skip(substs.len()) {
-            match data {
-                TypeOrConstParamData::TypeParamData(_) => substs.push(ty_error.clone()),
-                TypeOrConstParamData::ConstParamData(_) => substs.push(const_error.clone()),
+        for eid in def_generics.iter_id().skip(substs.len()) {
+            match eid {
+                Either::Left(_) => substs.push(ty_error.clone()),
+                Either::Right(x) => {
+                    substs.push(unknown_const_as_generic(self.db.const_param_ty(x)))
+                }
             }
         }
         assert_eq!(substs.len(), total_len);
@@ -856,13 +864,28 @@ impl<'a> TyLoweringContext<'a> {
         let trait_ref = match bound {
             TypeBound::Path(path, TraitBoundModifier::None) => {
                 bindings = self.lower_trait_ref_from_path(path, Some(self_ty));
-                bindings.clone().map(WhereClause::Implemented).map(crate::wrap_empty_binders)
+                bindings
+                    .clone()
+                    .filter(|tr| {
+                        // ignore `T: Drop` or `T: Destruct` bounds.
+                        // - `T: ~const Drop` has a special meaning in Rust 1.61 that we don't implement.
+                        //   (So ideally, we'd only ignore `~const Drop` here)
+                        // - `Destruct` impls are built-in in 1.62 (current nightlies as of 08-04-2022), so until
+                        //   the builtin impls are supported by Chalk, we ignore them here.
+                        if let Some(lang) = lang_attr(self.db.upcast(), tr.hir_trait_id()) {
+                            if lang == "drop" || lang == "destruct" {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .map(WhereClause::Implemented)
+                    .map(crate::wrap_empty_binders)
             }
             TypeBound::Path(path, TraitBoundModifier::Maybe) => {
                 let sized_trait = self
-                    .resolver
-                    .krate()
-                    .and_then(|krate| self.db.lang_item(krate, SmolStr::new_inline("sized")))
+                    .db
+                    .lang_item(self.resolver.krate(), SmolStr::new_inline("sized"))
                     .and_then(|lang_item| lang_item.as_trait());
                 // Don't lower associated type bindings as the only possible relaxed trait bound
                 // `?Sized` has no of them.
@@ -1046,7 +1069,7 @@ fn named_associated_type_shorthand_candidates<R>(
                 ),
                 _ => None,
             });
-            if let res @ Some(_) = res {
+            if let Some(_) = res {
                 return res;
             }
             // Handle `Self::Type` referring to own associated type in trait definitions
@@ -1268,9 +1291,8 @@ fn implicitly_sized_clauses<'a>(
 ) -> impl Iterator<Item = WhereClause> + 'a {
     let is_trait_def = matches!(def, GenericDefId::TraitId(..));
     let generic_args = &substitution.as_slice(Interner)[is_trait_def as usize..];
-    let sized_trait = resolver
-        .krate()
-        .and_then(|krate| db.lang_item(krate, SmolStr::new_inline("sized")))
+    let sized_trait = db
+        .lang_item(resolver.krate(), SmolStr::new_inline("sized"))
         .and_then(|lang_item| lang_item.as_trait().map(to_chalk_trait_id));
 
     sized_trait.into_iter().flat_map(move |sized_trait| {
@@ -1364,10 +1386,7 @@ fn fn_sig_for_fn(db: &dyn HirDatabase, def: FunctionId) -> PolyFnSig {
         .with_type_param_mode(ParamLoweringMode::Variable);
     let ret = ctx_ret.lower_ty(&data.ret_type);
     let generics = generics(db.upcast(), def.into());
-    let mut sig = CallableSig::from_params_and_return(params, ret, data.is_varargs());
-    if !data.legacy_const_generics_indices.is_empty() {
-        sig.set_legacy_const_generics_indices(&data.legacy_const_generics_indices);
-    }
+    let sig = CallableSig::from_params_and_return(params, ret, data.is_varargs());
     make_binders(db, &generics, sig)
 }
 
@@ -1646,7 +1665,7 @@ pub(crate) fn generic_arg_to_chalk<'a, T>(
     arg: &'a GenericArg,
     this: &mut T,
     for_type: impl FnOnce(&mut T, &TypeRef) -> Ty + 'a,
-    for_const: impl FnOnce(&mut T, &ConstScalarOrPath) -> Const + 'a,
+    for_const: impl FnOnce(&mut T, &ConstScalarOrPath, Ty) -> Const + 'a,
 ) -> Option<crate::GenericArg> {
     let kind = match kind_id {
         Either::Left(_) => ParamKind::Type,
@@ -1660,13 +1679,13 @@ pub(crate) fn generic_arg_to_chalk<'a, T>(
             let ty = for_type(this, type_ref);
             GenericArgData::Ty(ty).intern(Interner)
         }
-        (GenericArg::Const(c), ParamKind::Const(_)) => {
-            GenericArgData::Const(for_const(this, c)).intern(Interner)
+        (GenericArg::Const(c), ParamKind::Const(c_ty)) => {
+            GenericArgData::Const(for_const(this, c, c_ty)).intern(Interner)
         }
         (GenericArg::Const(_), ParamKind::Type) => {
             GenericArgData::Ty(TyKind::Error.intern(Interner)).intern(Interner)
         }
-        (GenericArg::Type(t), ParamKind::Const(ty)) => {
+        (GenericArg::Type(t), ParamKind::Const(c_ty)) => {
             // We want to recover simple idents, which parser detects them
             // as types. Maybe here is not the best place to do it, but
             // it works.
@@ -1675,11 +1694,13 @@ pub(crate) fn generic_arg_to_chalk<'a, T>(
                 if p.kind == PathKind::Plain {
                     if let [n] = p.segments() {
                         let c = ConstScalarOrPath::Path(n.clone());
-                        return Some(GenericArgData::Const(for_const(this, &c)).intern(Interner));
+                        return Some(
+                            GenericArgData::Const(for_const(this, &c, c_ty)).intern(Interner),
+                        );
                     }
                 }
             }
-            unknown_const_as_generic(ty)
+            unknown_const_as_generic(c_ty)
         }
         (GenericArg::Lifetime(_), _) => return None,
     })
@@ -1688,17 +1709,18 @@ pub(crate) fn generic_arg_to_chalk<'a, T>(
 pub(crate) fn const_or_path_to_chalk(
     db: &dyn HirDatabase,
     resolver: &Resolver,
+    expected_ty: Ty,
     value: &ConstScalarOrPath,
     mode: ParamLoweringMode,
     args: impl FnOnce() -> Generics,
     debruijn: DebruijnIndex,
 ) -> Const {
     match value {
-        ConstScalarOrPath::Scalar(s) => usize_const(s.as_usize()),
+        ConstScalarOrPath::Scalar(s) => intern_scalar_const(s.clone(), expected_ty),
         ConstScalarOrPath::Path(n) => {
             let path = ModPath::from_segments(PathKind::Plain, Some(n.clone()));
             path_to_const(db, resolver, &path, mode, args, debruijn)
-                .unwrap_or_else(|| unknown_const_usize())
+                .unwrap_or_else(|| unknown_const(expected_ty))
         }
     }
 }
@@ -1720,7 +1742,7 @@ fn fallback_bound_vars<T: Fold<Interner> + HasInterner<Interner = Interner>>(
         },
         |ty, bound, binders| {
             if bound.index >= num_vars_to_keep && bound.debruijn == DebruijnIndex::INNERMOST {
-                consteval::unknown_const(ty.clone())
+                unknown_const(ty.clone())
             } else {
                 bound.shifted_in_from(binders).to_const(Interner, ty)
             }

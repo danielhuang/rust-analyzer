@@ -81,7 +81,7 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
 
     let anchor = if self_param.is_some() { Anchor::Method } else { Anchor::Freestanding };
     let insert_after = node_to_insert_after(&body, anchor)?;
-    let module = ctx.sema.scope(&insert_after).module()?;
+    let module = ctx.sema.scope(&insert_after)?.module();
 
     let ret_ty = body.return_ty(ctx)?;
     let control_flow = body.external_control_flow(ctx, &container_info)?;
@@ -132,7 +132,7 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
                 };
 
                 let control_flow_enum =
-                    FamousDefs(&ctx.sema, Some(module.krate())).core_ops_ControlFlow();
+                    FamousDefs(&ctx.sema, module.krate()).core_ops_ControlFlow();
 
                 if let Some(control_flow_enum) = control_flow_enum {
                     let mod_path = module.find_use_path_prefixed(
@@ -649,8 +649,8 @@ impl FunctionBody {
             ast::Expr::PathExpr(path_expr) => {
                 cb(path_expr.path().and_then(|it| it.as_single_name_ref()))
             }
-            ast::Expr::MacroCall(call) => {
-                if let Some(tt) = call.token_tree() {
+            ast::Expr::MacroExpr(expr) => {
+                if let Some(tt) = expr.macro_call().and_then(|call| call.token_tree()) {
                     tt.syntax()
                         .children_with_tokens()
                         .flat_map(SyntaxElement::into_token)
@@ -692,7 +692,14 @@ impl FunctionBody {
                         (constness, expr.clone(), infer_expr_opt(expr))
                     },
                     ast::Fn(fn_) => {
-                        (fn_.const_token().is_some(), fn_.body().map(ast::Expr::BlockExpr), Some(sema.to_def(&fn_)?.ret_type(sema.db)))
+                        let func = sema.to_def(&fn_)?;
+                        let mut ret_ty = func.ret_type(sema.db);
+                        if func.is_async(sema.db) {
+                            if let Some(async_ret) = func.async_ret_type(sema.db) {
+                                ret_ty = async_ret;
+                            }
+                        }
+                        (fn_.const_token().is_some(), fn_.body().map(ast::Expr::BlockExpr), Some(ret_ty))
                     },
                     ast::Static(statik) => {
                         (true, statik.body(), Some(sema.to_def(&statik)?.ty(sema.db)))
@@ -923,7 +930,7 @@ fn reference_is_exclusive(
 
 /// checks if this expr requires `&mut` access, recurses on field access
 fn expr_require_exclusive_access(ctx: &AssistContext, expr: &ast::Expr) -> Option<bool> {
-    if let ast::Expr::MacroCall(_) = expr {
+    if let ast::Expr::MacroExpr(_) = expr {
         // FIXME: expand macro and check output for mutable usages of the variable?
         return None;
     }
@@ -1015,7 +1022,7 @@ fn path_element_of_reference(
         None
     })?;
     stdx::always!(
-        matches!(path, ast::Expr::PathExpr(_) | ast::Expr::MacroCall(_)),
+        matches!(path, ast::Expr::PathExpr(_) | ast::Expr::MacroExpr(_)),
         "unexpected expression type for variable usage: {:?}",
         path
     );
@@ -4026,6 +4033,7 @@ fn $0fun_name(n: i32) -> i32 {
         check_assist(
             extract_function,
             r#"
+//- minicore: future
 fn main() {
     $0some_function().await;$0
 }
@@ -4055,6 +4063,7 @@ async fn some_function() {
         check_assist(
             extract_function,
             r#"
+//- minicore: future, result
 async fn foo() -> Result<(), ()> {
     $0async {}.await;
     Err(())?$0
@@ -4065,7 +4074,7 @@ async fn foo() -> Result<(), ()> {
     fun_name().await?
 }
 
-async fn $0fun_name() -> _ {
+async fn $0fun_name() -> Result<(), ()> {
     async {}.await;
     Err(())?
 }
@@ -4078,6 +4087,7 @@ async fn $0fun_name() -> _ {
         check_assist(
             extract_function,
             r#"
+//- minicore: future
 async fn foo() -> i32 {
     loop {
         let n = 1;$0
@@ -4119,6 +4129,7 @@ async fn $0fun_name() -> Result<i32, i32> {
         check_assist(
             extract_function,
             r#"
+//- minicore: future
 fn main() {
     $0function_call("a", some_function().await);$0
 }
@@ -4162,7 +4173,7 @@ fn main() {
     match 6 {
         100 => $0{ 100 }$0
         _ => 0,
-    }
+    };
 }
 "#,
             r#"
@@ -4170,7 +4181,7 @@ fn main() {
     match 6 {
         100 => fun_name(),
         _ => 0,
-    }
+    };
 }
 
 fn $0fun_name() -> i32 {
@@ -4185,7 +4196,7 @@ fn main() {
     match 6 {
         100 => $0{ 100 }$0,
         _ => 0,
-    }
+    };
 }
 "#,
             r#"
@@ -4193,7 +4204,7 @@ fn main() {
     match 6 {
         100 => fun_name(),
         _ => 0,
-    }
+    };
 }
 
 fn $0fun_name() -> i32 {

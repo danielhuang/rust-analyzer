@@ -28,7 +28,9 @@ use crate::{completions::Completions, context::CompletionContext};
 
 pub use crate::{
     config::CompletionConfig,
-    item::{CompletionItem, CompletionItemKind, CompletionRelevance, ImportEdit},
+    item::{
+        CompletionItem, CompletionItemKind, CompletionRelevance, CompletionRelevancePostfixMatch,
+    },
     snippet::{Snippet, SnippetScope},
 };
 
@@ -153,6 +155,7 @@ pub fn completions(
     completions::flyimport::import_on_the_fly(&mut acc, &ctx);
     completions::fn_param::complete_fn_param(&mut acc, &ctx);
     completions::format_string::format_string(&mut acc, &ctx);
+    completions::inferred_type(&mut acc, &ctx);
     completions::keyword::complete_expr_keyword(&mut acc, &ctx);
     completions::lifetime::complete_label(&mut acc, &ctx);
     completions::lifetime::complete_lifetime(&mut acc, &ctx);
@@ -185,12 +188,11 @@ pub fn resolve_completion_edits(
     let position_for_import = &position_for_import(&ctx, None)?;
     let scope = ImportScope::find_insert_use_container(position_for_import, &ctx.sema)?;
 
-    let current_module = ctx.sema.scope(position_for_import).module()?;
+    let current_module = ctx.sema.scope(position_for_import)?.module();
     let current_crate = current_module.krate();
     let new_ast = scope.clone_for_update();
     let mut import_insert = TextEdit::builder();
 
-    // FIXME: lift out and make some tests here, this is ImportEdit::to_text_edit but changed to work with multiple edits
     imports.into_iter().for_each(|(full_import_path, imported_name)| {
         let items_with_name = items_locator::items_with_name(
             &ctx.sema,

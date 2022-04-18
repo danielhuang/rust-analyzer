@@ -7,7 +7,7 @@
 //! configure the server itself, feature flags are passed into analysis, and
 //! tweak things like automatic insertion of `()` in completions.
 
-use std::{ffi::OsString, iter, path::PathBuf};
+use std::{ffi::OsString, fmt, iter, path::PathBuf};
 
 use flycheck::FlycheckConfig;
 use ide::{
@@ -19,6 +19,7 @@ use ide_db::{
     imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
     SnippetCap,
 };
+use itertools::Itertools;
 use lsp_types::{ClientCapabilities, MarkupKind};
 use project_model::{
     CargoConfig, ProjectJson, ProjectJsonData, ProjectManifest, RustcSource, UnsetTestCrates,
@@ -31,9 +32,7 @@ use crate::{
     caps::completion_item_edit_resolve,
     diagnostics::DiagnosticsMapConfig,
     line_index::OffsetEncoding,
-    lsp_ext::supports_utf8,
-    lsp_ext::WorkspaceSymbolSearchScope,
-    lsp_ext::{self, WorkspaceSymbolSearchKind},
+    lsp_ext::{self, supports_utf8, WorkspaceSymbolSearchKind, WorkspaceSymbolSearchScope},
 };
 
 // Defines the server-side configuration of the rust-analyzer. We generate
@@ -79,6 +78,10 @@ config_data! {
         /// Run build scripts (`build.rs`) for more precise code analysis.
         cargo_runBuildScripts |
         cargo_loadOutDirsFromCheck: bool = "true",
+        /// Advanced option, fully override the command rust-analyzer uses to
+        /// run build scripts and build procedural macros. The command should
+        /// include `--message-format=json` or a similar option.
+        cargo_runBuildScriptsCommand: Option<Vec<String>> = "null",
         /// Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to
         /// avoid compiling unnecessary things.
         cargo_useRustcWrapperForBuildScripts: bool = "true",
@@ -354,6 +357,10 @@ config_data! {
         workspace_symbol_search_scope: WorkspaceSymbolSearchScopeDef = "\"workspace\"",
         /// Workspace symbol search kind.
         workspace_symbol_search_kind: WorkspaceSymbolSearchKindDef = "\"only_types\"",
+        /// Limits the number of items returned from a workspace symbol search (Defaults to 128).
+        /// Some clients like vs-code issue new searches on result filtering and don't require all results to be returned in the initial search.
+        /// Other clients requires all results upfront and might require a higher limit.
+        workspace_symbol_search_limit: usize = "128",
     }
 }
 
@@ -365,13 +372,15 @@ impl Default for ConfigData {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub caps: lsp_types::ClientCapabilities,
+    pub discovered_projects: Option<Vec<ProjectManifest>>,
+    caps: lsp_types::ClientCapabilities,
+    root_path: AbsPathBuf,
     data: ConfigData,
     detached_files: Vec<AbsPathBuf>,
-    pub discovered_projects: Option<Vec<ProjectManifest>>,
-    pub root_path: AbsPathBuf,
     snippets: Vec<Snippet>,
 }
+
+type ParallelPrimeCachesNumThreads = u8;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum LinkedProject {
@@ -393,9 +402,14 @@ impl From<ProjectJson> for LinkedProject {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LensConfig {
+    // runnables
     pub run: bool,
     pub debug: bool,
+
+    // implementations
     pub implementations: bool,
+
+    // references
     pub method_refs: bool,
     pub refs: bool, // for Struct, Enum, Union and Trait
     pub enum_variant_refs: bool,
@@ -403,7 +417,12 @@ pub struct LensConfig {
 
 impl LensConfig {
     pub fn any(&self) -> bool {
-        self.implementations || self.runnable() || self.references()
+        self.run
+            || self.debug
+            || self.implementations
+            || self.method_refs
+            || self.refs
+            || self.enum_variant_refs
     }
 
     pub fn none(&self) -> bool {
@@ -487,8 +506,10 @@ pub struct RunnablesConfig {
 pub struct WorkspaceSymbolConfig {
     /// In what scope should the symbol be searched in.
     pub search_scope: WorkspaceSymbolSearchScope,
-    /// What kind of symbol is being search for.
+    /// What kind of symbol is being searched for.
     pub search_kind: WorkspaceSymbolSearchKind,
+    /// How many items are returned at most.
+    pub search_limit: usize,
 }
 
 pub struct ClientCommandsConfig {
@@ -497,6 +518,27 @@ pub struct ClientCommandsConfig {
     pub show_reference: bool,
     pub goto_location: bool,
     pub trigger_parameter_hints: bool,
+}
+
+pub struct ConfigUpdateError {
+    errors: Vec<(String, serde_json::Error)>,
+}
+
+impl fmt::Display for ConfigUpdateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let errors = self.errors.iter().format_with("\n", |(key, e), f| {
+            f(key)?;
+            f(&": ")?;
+            f(e)
+        });
+        write!(
+            f,
+            "rust-analyzer found {} invalid config value{}:\n{}",
+            self.errors.len(),
+            if self.errors.len() == 1 { "" } else { "s" },
+            errors
+        )
+    }
 }
 
 impl Config {
@@ -510,10 +552,8 @@ impl Config {
             snippets: Default::default(),
         }
     }
-    pub fn update(
-        &mut self,
-        mut json: serde_json::Value,
-    ) -> Result<(), Vec<(String, serde_json::Error)>> {
+
+    pub fn update(&mut self, mut json: serde_json::Value) -> Result<(), ConfigUpdateError> {
         tracing::info!("updating config from JSON: {:#}", json);
         if json.is_null() || json.as_object().map_or(false, |it| it.is_empty()) {
             return Ok(());
@@ -547,15 +587,40 @@ impl Config {
                 None => tracing::info!("Invalid snippet {}", name),
             }
         }
+
+        self.validate(&mut errors);
+
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(errors)
+            Err(ConfigUpdateError { errors })
+        }
+    }
+
+    fn validate(&self, error_sink: &mut Vec<(String, serde_json::Error)>) {
+        use serde::de::Error;
+        if self.data.checkOnSave_command.is_empty() {
+            error_sink.push((
+                "/checkOnSave/command".to_string(),
+                serde_json::Error::custom("expected a non-empty string"),
+            ));
         }
     }
 
     pub fn json_schema() -> serde_json::Value {
         ConfigData::json_schema()
+    }
+
+    pub fn root_path(&self) -> &AbsPathBuf {
+        &self.root_path
+    }
+
+    pub fn caps(&self) -> &lsp_types::ClientCapabilities {
+        &self.caps
+    }
+
+    pub fn detached_files(&self) -> &[AbsPathBuf] {
+        &self.detached_files
     }
 }
 
@@ -570,54 +635,47 @@ macro_rules! try_or {
     };
 }
 
+macro_rules! try_or_def {
+    ($expr:expr) => {
+        try_!($expr).unwrap_or_default()
+    };
+}
+
 impl Config {
     pub fn linked_projects(&self) -> Vec<LinkedProject> {
-        if self.data.linkedProjects.is_empty() {
-            self.discovered_projects
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .cloned()
-                .map(LinkedProject::from)
-                .collect()
-        } else {
-            self.data
-                .linkedProjects
+        match self.data.linkedProjects.as_slice() {
+            [] => match self.discovered_projects.as_ref() {
+                Some(discovered_projects) => {
+                    discovered_projects.iter().cloned().map(LinkedProject::from).collect()
+                }
+                None => Vec::new(),
+            },
+            linked_projects => linked_projects
                 .iter()
-                .filter_map(|linked_project| {
-                    let res = match linked_project {
-                        ManifestOrProjectJson::Manifest(it) => {
-                            let path = self.root_path.join(it);
-                            ProjectManifest::from_manifest_file(path)
-                                .map_err(|e| {
-                                    tracing::error!("failed to load linked project: {}", e)
-                                })
-                                .ok()?
-                                .into()
-                        }
-                        ManifestOrProjectJson::ProjectJson(it) => {
-                            ProjectJson::new(&self.root_path, it.clone()).into()
-                        }
-                    };
-                    Some(res)
+                .filter_map(|linked_project| match linked_project {
+                    ManifestOrProjectJson::Manifest(it) => {
+                        let path = self.root_path.join(it);
+                        ProjectManifest::from_manifest_file(path)
+                            .map_err(|e| tracing::error!("failed to load linked project: {}", e))
+                            .ok()
+                            .map(Into::into)
+                    }
+                    ManifestOrProjectJson::ProjectJson(it) => {
+                        Some(ProjectJson::new(&self.root_path, it.clone()).into())
+                    }
                 })
-                .collect()
+                .collect(),
         }
     }
 
-    pub fn detached_files(&self) -> &[AbsPathBuf] {
-        &self.detached_files
-    }
-
     pub fn did_save_text_document_dynamic_registration(&self) -> bool {
-        let caps =
-            try_or!(self.caps.text_document.as_ref()?.synchronization.clone()?, Default::default());
+        let caps = try_or_def!(self.caps.text_document.as_ref()?.synchronization.clone()?);
         caps.did_save == Some(true) && caps.dynamic_registration == Some(true)
     }
+
     pub fn did_change_watched_files_dynamic_registration(&self) -> bool {
-        try_or!(
-            self.caps.workspace.as_ref()?.did_change_watched_files.as_ref()?.dynamic_registration?,
-            false
+        try_or_def!(
+            self.caps.workspace.as_ref()?.did_change_watched_files.as_ref()?.dynamic_registration?
         )
     }
 
@@ -626,22 +684,24 @@ impl Config {
     }
 
     pub fn location_link(&self) -> bool {
-        try_or!(self.caps.text_document.as_ref()?.definition?.link_support?, false)
+        try_or_def!(self.caps.text_document.as_ref()?.definition?.link_support?)
     }
+
     pub fn line_folding_only(&self) -> bool {
-        try_or!(self.caps.text_document.as_ref()?.folding_range.as_ref()?.line_folding_only?, false)
+        try_or_def!(self.caps.text_document.as_ref()?.folding_range.as_ref()?.line_folding_only?)
     }
+
     pub fn hierarchical_symbols(&self) -> bool {
-        try_or!(
+        try_or_def!(
             self.caps
                 .text_document
                 .as_ref()?
                 .document_symbol
                 .as_ref()?
-                .hierarchical_document_symbol_support?,
-            false
+                .hierarchical_document_symbol_support?
         )
     }
+
     pub fn code_action_literals(&self) -> bool {
         try_!(self
             .caps
@@ -653,12 +713,15 @@ impl Config {
             .as_ref()?)
         .is_some()
     }
+
     pub fn work_done_progress(&self) -> bool {
-        try_or!(self.caps.window.as_ref()?.work_done_progress?, false)
+        try_or_def!(self.caps.window.as_ref()?.work_done_progress?)
     }
+
     pub fn will_rename(&self) -> bool {
-        try_or!(self.caps.workspace.as_ref()?.file_operations.as_ref()?.will_rename?, false)
+        try_or_def!(self.caps.workspace.as_ref()?.file_operations.as_ref()?.will_rename?)
     }
+
     pub fn change_annotation_support(&self) -> bool {
         try_!(self
             .caps
@@ -670,24 +733,24 @@ impl Config {
             .as_ref()?)
         .is_some()
     }
+
     pub fn code_action_resolve(&self) -> bool {
-        try_or!(
-            self.caps
-                .text_document
-                .as_ref()?
-                .code_action
-                .as_ref()?
-                .resolve_support
-                .as_ref()?
-                .properties
-                .as_slice(),
-            &[]
-        )
+        try_or_def!(self
+            .caps
+            .text_document
+            .as_ref()?
+            .code_action
+            .as_ref()?
+            .resolve_support
+            .as_ref()?
+            .properties
+            .as_slice())
         .iter()
         .any(|it| it == "edit")
     }
+
     pub fn signature_help_label_offsets(&self) -> bool {
-        try_or!(
+        try_or_def!(
             self.caps
                 .text_document
                 .as_ref()?
@@ -697,10 +760,10 @@ impl Config {
                 .as_ref()?
                 .parameter_information
                 .as_ref()?
-                .label_offset_support?,
-            false
+                .label_offset_support?
         )
     }
+
     pub fn offset_encoding(&self) -> OffsetEncoding {
         if supports_utf8(&self.caps) {
             OffsetEncoding::Utf8
@@ -710,11 +773,13 @@ impl Config {
     }
 
     fn experimental(&self, index: &'static str) -> bool {
-        try_or!(self.caps.experimental.as_ref()?.get(index)?.as_bool()?, false)
+        try_or_def!(self.caps.experimental.as_ref()?.get(index)?.as_bool()?)
     }
+
     pub fn code_action_group(&self) -> bool {
         self.experimental("codeActionGroup")
     }
+
     pub fn server_status_notification(&self) -> bool {
         self.experimental("serverStatusNotification")
     }
@@ -722,6 +787,7 @@ impl Config {
     pub fn publish_diagnostics(&self) -> bool {
         self.data.diagnostics_enable
     }
+
     pub fn diagnostics(&self) -> DiagnosticsConfig {
         DiagnosticsConfig {
             disable_experimental: !self.data.diagnostics_enableExperimental,
@@ -732,6 +798,7 @@ impl Config {
             },
         }
     }
+
     pub fn diagnostics_map(&self) -> DiagnosticsMapConfig {
         DiagnosticsMapConfig {
             remap_prefix: self.data.diagnostics_remapPrefix.clone(),
@@ -739,9 +806,11 @@ impl Config {
             warnings_as_hint: self.data.diagnostics_warningsAsHint.clone(),
         }
     }
+
     pub fn lru_capacity(&self) -> Option<usize> {
         self.data.lruCapacity
     }
+
     pub fn proc_macro_srv(&self) -> Option<(AbsPathBuf, Vec<OsString>)> {
         if !self.data.procMacro_enable {
             return None;
@@ -752,12 +821,15 @@ impl Config {
         };
         Some((path, vec!["proc-macro".into()]))
     }
+
     pub fn dummy_replacements(&self) -> &FxHashMap<Box<str>, Box<[Box<str>]>> {
         &self.data.procMacro_ignored
     }
+
     pub fn expand_proc_attr_macros(&self) -> bool {
         self.data.experimental_procAttrMacros
     }
+
     pub fn files(&self) -> FilesConfig {
         FilesConfig {
             watcher: match self.data.files_watcher.as_str() {
@@ -770,15 +842,19 @@ impl Config {
             exclude: self.data.files_excludeDirs.iter().map(|it| self.root_path.join(it)).collect(),
         }
     }
+
     pub fn notifications(&self) -> NotificationsConfig {
         NotificationsConfig { cargo_toml_not_found: self.data.notifications_cargoTomlNotFound }
     }
+
     pub fn cargo_autoreload(&self) -> bool {
         self.data.cargo_autoreload
     }
+
     pub fn run_build_scripts(&self) -> bool {
         self.data.cargo_runBuildScripts || self.data.procMacro_enable
     }
+
     pub fn cargo(&self) -> CargoConfig {
         let rustc_source = self.data.rustcSource.as_ref().map(|rustc_src| {
             if rustc_src == "discover" {
@@ -797,6 +873,7 @@ impl Config {
             rustc_source,
             unset_test_crates: UnsetTestCrates::Only(self.data.cargo_unsetTest.clone()),
             wrap_rustc_in_build_scripts: self.data.cargo_useRustcWrapperForBuildScripts,
+            run_build_script_command: self.data.cargo_runBuildScriptsCommand.clone(),
         }
     }
 
@@ -813,6 +890,7 @@ impl Config {
             },
         }
     }
+
     pub fn flycheck(&self) -> Option<FlycheckConfig> {
         if !self.data.checkOnSave_enable {
             return None;
@@ -849,12 +927,14 @@ impl Config {
         };
         Some(flycheck_config)
     }
+
     pub fn runnables(&self) -> RunnablesConfig {
         RunnablesConfig {
             override_cargo: self.data.runnables_overrideCargo.clone(),
             cargo_extra_args: self.data.runnables_cargoExtraArgs.clone(),
         }
     }
+
     pub fn inlay_hints(&self) -> InlayHintsConfig {
         InlayHintsConfig {
             render_colons: self.data.inlayHints_renderColons,
@@ -875,6 +955,7 @@ impl Config {
             max_length: self.data.inlayHints_maxLength,
         }
     }
+
     fn insert_use_config(&self) -> InsertUseConfig {
         InsertUseConfig {
             granularity: match self.data.assist_importGranularity {
@@ -893,6 +974,7 @@ impl Config {
             skip_glob_imports: !self.data.assist_allowMergingIntoGlobImports,
         }
     }
+
     pub fn completion(&self) -> CompletionConfig {
         CompletionConfig {
             enable_postfix_completions: self.data.completion_postfix_enable,
@@ -903,7 +985,7 @@ impl Config {
             add_call_parenthesis: self.data.completion_addCallParenthesis,
             add_call_argument_snippets: self.data.completion_addCallArgumentSnippets,
             insert_use: self.insert_use_config(),
-            snippet_cap: SnippetCap::new(try_or!(
+            snippet_cap: SnippetCap::new(try_or_def!(
                 self.caps
                     .text_document
                     .as_ref()?
@@ -911,12 +993,12 @@ impl Config {
                     .as_ref()?
                     .completion_item
                     .as_ref()?
-                    .snippet_support?,
-                false
+                    .snippet_support?
             )),
             snippets: self.snippets.clone(),
         }
     }
+
     pub fn assist(&self) -> AssistConfig {
         AssistConfig {
             snippet_cap: SnippetCap::new(self.experimental("snippetTextEdit")),
@@ -924,6 +1006,7 @@ impl Config {
             insert_use: self.insert_use_config(),
         }
     }
+
     pub fn join_lines(&self) -> JoinLinesConfig {
         JoinLinesConfig {
             join_else_if: self.data.joinLines_joinElseIf,
@@ -932,9 +1015,11 @@ impl Config {
             join_assignments: self.data.joinLines_joinAssignments,
         }
     }
+
     pub fn call_info_full(&self) -> bool {
         self.data.callInfo_full
     }
+
     pub fn lens(&self) -> LensConfig {
         LensConfig {
             run: self.data.lens_enable && self.data.lens_run,
@@ -945,6 +1030,7 @@ impl Config {
             enum_variant_refs: self.data.lens_enable && self.data.lens_enumVariantReferences,
         }
     }
+
     pub fn hover_actions(&self) -> HoverActionsConfig {
         let enable = self.experimental("hoverActions") && self.data.hoverActions_enable;
         HoverActionsConfig {
@@ -955,24 +1041,24 @@ impl Config {
             goto_type_def: enable && self.data.hoverActions_gotoTypeDef,
         }
     }
+
     pub fn highlighting_strings(&self) -> bool {
         self.data.highlighting_strings
     }
+
     pub fn hover(&self) -> HoverConfig {
         HoverConfig {
             links_in_hover: self.data.hover_linksInHover,
             documentation: self.data.hover_documentation.then(|| {
-                let is_markdown = try_or!(
-                    self.caps
-                        .text_document
-                        .as_ref()?
-                        .hover
-                        .as_ref()?
-                        .content_format
-                        .as_ref()?
-                        .as_slice(),
-                    &[]
-                )
+                let is_markdown = try_or_def!(self
+                    .caps
+                    .text_document
+                    .as_ref()?
+                    .hover
+                    .as_ref()?
+                    .content_format
+                    .as_ref()?
+                    .as_slice())
                 .contains(&MarkupKind::Markdown);
                 if is_markdown {
                     HoverDocFormat::Markdown
@@ -995,17 +1081,20 @@ impl Config {
                 WorkspaceSymbolSearchKindDef::OnlyTypes => WorkspaceSymbolSearchKind::OnlyTypes,
                 WorkspaceSymbolSearchKindDef::AllSymbols => WorkspaceSymbolSearchKind::AllSymbols,
             },
+            search_limit: self.data.workspace_symbol_search_limit,
         }
     }
 
     pub fn semantic_tokens_refresh(&self) -> bool {
-        try_or!(self.caps.workspace.as_ref()?.semantic_tokens.as_ref()?.refresh_support?, false)
+        try_or_def!(self.caps.workspace.as_ref()?.semantic_tokens.as_ref()?.refresh_support?)
     }
+
     pub fn code_lens_refresh(&self) -> bool {
-        try_or!(self.caps.workspace.as_ref()?.code_lens.as_ref()?.refresh_support?, false)
+        try_or_def!(self.caps.workspace.as_ref()?.code_lens.as_ref()?.refresh_support?)
     }
+
     pub fn insert_replace_support(&self) -> bool {
-        try_or!(
+        try_or_def!(
             self.caps
                 .text_document
                 .as_ref()?
@@ -1013,10 +1102,10 @@ impl Config {
                 .as_ref()?
                 .completion_item
                 .as_ref()?
-                .insert_replace_support?,
-            false
+                .insert_replace_support?
         )
     }
+
     pub fn client_commands(&self) -> ClientCommandsConfig {
         let commands =
             try_or!(self.caps.experimental.as_ref()?.get("commands")?, &serde_json::Value::Null);
@@ -1052,6 +1141,8 @@ impl Config {
         }
     }
 }
+
+// Deserialization definitions
 
 #[derive(Deserialize, Debug, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
@@ -1175,8 +1266,6 @@ enum WorkspaceSymbolSearchKindDef {
     AllSymbols,
 }
 
-type ParallelPrimeCachesNumThreads = u8;
-
 macro_rules! _config_data {
     (struct $name:ident {
         $(
@@ -1298,6 +1387,7 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
 
     match ty {
         "bool" => set!("type": "boolean"),
+        "usize" => set!("type": "integer", "minimum": 0),
         "String" => set!("type": "string"),
         "Vec<String>" => set! {
             "type": "array",

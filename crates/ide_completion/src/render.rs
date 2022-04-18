@@ -11,12 +11,14 @@ pub(crate) mod union_literal;
 pub(crate) mod literal;
 
 use hir::{AsAssocItem, HasAttrs, HirDisplay, ScopeDef};
-use ide_db::{helpers::item_name, RootDatabase, SnippetCap, SymbolKind};
+use ide_db::{
+    helpers::item_name, imports::import_assets::LocatedImport, RootDatabase, SnippetCap, SymbolKind,
+};
 use syntax::{SmolStr, SyntaxKind, TextRange};
 
 use crate::{
     context::{PathCompletionCtx, PathKind},
-    item::{CompletionRelevanceTypeMatch, ImportEdit},
+    item::{Builder, CompletionRelevanceTypeMatch},
     render::{function::render_fn, literal::render_variant_lit, macro_::render_macro},
     CompletionContext, CompletionItem, CompletionItemKind, CompletionRelevance,
 };
@@ -25,7 +27,7 @@ use crate::{
 pub(crate) struct RenderContext<'a> {
     completion: &'a CompletionContext<'a>,
     is_private_editable: bool,
-    import_to_add: Option<ImportEdit>,
+    import_to_add: Option<LocatedImport>,
 }
 
 impl<'a> RenderContext<'a> {
@@ -38,7 +40,7 @@ impl<'a> RenderContext<'a> {
         self
     }
 
-    pub(crate) fn import_to_add(mut self, import_to_add: Option<ImportEdit>) -> Self {
+    pub(crate) fn import_to_add(mut self, import_to_add: Option<LocatedImport>) -> Self {
         self.import_to_add = import_to_add;
         self
     }
@@ -142,7 +144,7 @@ pub(crate) fn render_resolution(
     ctx: RenderContext<'_>,
     local_name: hir::Name,
     resolution: ScopeDef,
-) -> CompletionItem {
+) -> Builder {
     render_resolution_(ctx, local_name, None, resolution)
 }
 
@@ -150,30 +152,37 @@ pub(crate) fn render_resolution_simple(
     ctx: RenderContext<'_>,
     local_name: hir::Name,
     resolution: ScopeDef,
-) -> CompletionItem {
+) -> Builder {
     render_resolution_simple_(ctx, local_name, None, resolution)
 }
 
 pub(crate) fn render_resolution_with_import(
     ctx: RenderContext<'_>,
-    import_edit: ImportEdit,
-) -> Option<CompletionItem> {
-    let resolution = ScopeDef::from(import_edit.import.original_item);
+    import_edit: LocatedImport,
+) -> Option<Builder> {
+    let resolution = ScopeDef::from(import_edit.original_item);
     let local_name = match resolution {
         ScopeDef::ModuleDef(hir::ModuleDef::Function(f)) => f.name(ctx.completion.db),
         ScopeDef::ModuleDef(hir::ModuleDef::Const(c)) => c.name(ctx.completion.db)?,
         ScopeDef::ModuleDef(hir::ModuleDef::TypeAlias(t)) => t.name(ctx.completion.db),
-        _ => item_name(ctx.db(), import_edit.import.original_item)?,
+        _ => item_name(ctx.db(), import_edit.original_item)?,
     };
     Some(render_resolution_(ctx, local_name, Some(import_edit), resolution))
+}
+
+pub(crate) fn render_type_inference(ty_string: String, ctx: &CompletionContext) -> CompletionItem {
+    let mut builder =
+        CompletionItem::new(CompletionItemKind::InferredType, ctx.source_range(), ty_string);
+    builder.set_relevance(CompletionRelevance { is_definite: true, ..Default::default() });
+    builder.build()
 }
 
 fn render_resolution_(
     ctx: RenderContext<'_>,
     local_name: hir::Name,
-    import_to_add: Option<ImportEdit>,
+    import_to_add: Option<LocatedImport>,
     resolution: ScopeDef,
-) -> CompletionItem {
+) -> Builder {
     let _p = profile::span("render_resolution");
     use hir::ModuleDef::*;
 
@@ -200,9 +209,9 @@ fn render_resolution_(
 fn render_resolution_simple_(
     ctx: RenderContext<'_>,
     local_name: hir::Name,
-    import_to_add: Option<ImportEdit>,
+    import_to_add: Option<LocatedImport>,
     resolution: ScopeDef,
-) -> CompletionItem {
+) -> Builder {
     let _p = profile::span("render_resolution");
     use hir::ModuleDef::*;
 
@@ -283,7 +292,7 @@ fn render_resolution_simple_(
     if let Some(import_to_add) = ctx.import_to_add {
         item.add_import(import_to_add);
     }
-    item.build()
+    item
 }
 
 fn scope_def_docs(db: &RootDatabase, resolution: ScopeDef) -> Option<hir::Documentation> {
@@ -365,7 +374,7 @@ mod tests {
     use crate::{
         item::CompletionRelevanceTypeMatch,
         tests::{check_edit, do_completion, get_all_items, TEST_CONFIG},
-        CompletionItem, CompletionItemKind, CompletionRelevance,
+        CompletionItem, CompletionItemKind, CompletionRelevance, CompletionRelevancePostfixMatch,
     };
 
     #[track_caller]
@@ -432,7 +441,10 @@ mod tests {
                 ),
                 (relevance.exact_name_match, "name"),
                 (relevance.is_local, "local"),
-                (relevance.exact_postfix_snippet_match, "snippet"),
+                (
+                    relevance.postfix_match == Some(CompletionRelevancePostfixMatch::Exact),
+                    "snippet",
+                ),
                 (relevance.is_op_method, "op_method"),
             ]
             .into_iter()
@@ -612,9 +624,12 @@ fn main() { let _: m::Spam = S$0 }
                                 Exact,
                             ),
                             is_local: false,
+                            is_item_from_trait: false,
+                            is_name_already_imported: false,
                             is_op_method: false,
                             is_private_editable: false,
-                            exact_postfix_snippet_match: false,
+                            postfix_match: None,
+                            is_definite: false,
                         },
                     },
                     CompletionItem {
@@ -633,9 +648,12 @@ fn main() { let _: m::Spam = S$0 }
                                 Exact,
                             ),
                             is_local: false,
+                            is_item_from_trait: false,
+                            is_name_already_imported: false,
                             is_op_method: false,
                             is_private_editable: false,
-                            exact_postfix_snippet_match: false,
+                            postfix_match: None,
+                            is_definite: false,
                         },
                     },
                 ]
@@ -720,9 +738,12 @@ fn foo() { A { the$0 } }
                                 CouldUnify,
                             ),
                             is_local: false,
+                            is_item_from_trait: false,
+                            is_name_already_imported: false,
                             is_op_method: false,
                             is_private_editable: false,
-                            exact_postfix_snippet_match: false,
+                            postfix_match: None,
+                            is_definite: false,
                         },
                     },
                 ]
@@ -1468,6 +1489,43 @@ fn foo(f: Foo) { let _: &u32 = f.b$0 }
     }
 
     #[test]
+    fn qualified_path_ref() {
+        // disabled right now because it doesn't render correctly, #8058
+        check_kinds(
+            r#"
+struct S;
+
+struct T;
+impl T {
+    fn foo() -> S {}
+}
+
+fn bar(s: &S) {}
+
+fn main() {
+    bar(T::$0);
+}
+"#,
+            &[CompletionItemKind::SymbolKind(SymbolKind::Function)],
+            expect![[r#"
+                [
+                    CompletionItem {
+                        label: "foo()",
+                        source_range: 95..95,
+                        delete: 95..95,
+                        insert: "foo()$0",
+                        kind: SymbolKind(
+                            Function,
+                        ),
+                        lookup: "foo",
+                        detail: "fn() -> S",
+                    },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
     fn generic_enum() {
         check_relevance(
             r#"
@@ -1498,7 +1556,8 @@ fn foo() {
     }
 
     #[test]
-    fn postfix_completion_relevance() {
+    fn postfix_exact_match_is_high_priority() {
+        cov_mark::check!(postfix_exact_match_is_high_priority);
         check_relevance_for_kinds(
             r#"
 mod ops {
@@ -1530,6 +1589,35 @@ fn main() {
                 sn dbg []
                 sn dbgr []
                 sn call []
+            "#]],
+        );
+    }
+
+    #[test]
+    fn postfix_inexact_match_is_low_priority() {
+        cov_mark::check!(postfix_inexact_match_is_low_priority);
+        check_relevance_for_kinds(
+            r#"
+struct S;
+impl S {
+    fn f(&self) {}
+}
+fn main() {
+    S.$0
+}
+    "#,
+            &[CompletionItemKind::Snippet, CompletionItemKind::Method],
+            expect![[r#"
+                me f() []
+                sn ref []
+                sn refm []
+                sn match []
+                sn box []
+                sn dbg []
+                sn dbgr []
+                sn call []
+                sn let []
+                sn letm []
             "#]],
         );
     }

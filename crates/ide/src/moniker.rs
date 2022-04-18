@@ -3,7 +3,7 @@
 
 use hir::{db::DefDatabase, AsAssocItem, AssocItemContainer, Crate, Name, Semantics};
 use ide_db::{
-    base_db::{CrateOrigin, FileId, FileLoader, FilePosition},
+    base_db::{CrateOrigin, FileId, FileLoader, FilePosition, LangCrateOrigin},
     defs::{Definition, IdentClass},
     helpers::pick_best_token,
     RootDatabase,
@@ -151,11 +151,15 @@ pub(crate) fn def_to_moniker(
             let name = krate.display_name(db)?.to_string();
             let (repo, version) = match krate.origin(db) {
                 CrateOrigin::CratesIo { repo } => (repo?, krate.version(db)?),
-                CrateOrigin::Lang => (
+                CrateOrigin::Lang(lang) => (
                     "https://github.com/rust-lang/rust/".to_string(),
-                    "compiler_version".to_string(),
+                    match lang {
+                        LangCrateOrigin::Other => {
+                            "https://github.com/rust-lang/rust/library/".into()
+                        }
+                        lang => format!("https://github.com/rust-lang/rust/library/{lang}",),
+                    },
                 ),
-                CrateOrigin::Unknown => return None,
             };
             PackageInformation { name, repo, version }
         },

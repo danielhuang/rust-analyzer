@@ -5,7 +5,7 @@ use crate::{utils::generate_trait_impl_text, AssistContext, AssistId, AssistKind
 
 // Assist: generate_from_impl_for_enum
 //
-// Adds a From impl for an enum variant with one tuple field.
+// Adds a From impl for this enum variant with one tuple field.
 //
 // ```
 // enum A { $0One(u32) }
@@ -86,7 +86,7 @@ fn existing_from_impl(
     let enum_ = variant.parent_enum(sema.db);
     let krate = enum_.module(sema.db).krate();
 
-    let from_trait = FamousDefs(sema, Some(krate)).core_convert_From()?;
+    let from_trait = FamousDefs(sema, krate).core_convert_From()?;
 
     let enum_type = enum_.ty(sema.db);
 

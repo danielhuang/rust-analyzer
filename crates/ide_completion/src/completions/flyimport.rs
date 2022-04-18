@@ -1,5 +1,5 @@
 //! See [`import_on_the_fly`].
-use hir::ItemInNs;
+use hir::{ItemInNs, ModuleDef};
 use ide_db::imports::{
     import_assets::{ImportAssets, ImportCandidate, LocatedImport},
     insert_use::ImportScope,
@@ -9,8 +9,8 @@ use syntax::{AstNode, SyntaxNode, T};
 
 use crate::{
     context::{CompletionContext, PathKind},
+    patterns::ImmediateLocation,
     render::{render_resolution_with_import, RenderContext},
-    ImportEdit,
 };
 
 use super::Completions;
@@ -136,10 +136,10 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
 
     let user_input_lowercased = potential_import_name.to_lowercase();
     let import_assets = import_assets(ctx, potential_import_name)?;
-    let import_scope = ImportScope::find_insert_use_container(
-        &position_for_import(ctx, Some(import_assets.import_candidate()))?,
-        &ctx.sema,
-    )?;
+    let position = position_for_import(ctx, Some(import_assets.import_candidate()))?;
+    if ImportScope::find_insert_use_container(&position, &ctx.sema).is_none() {
+        return None;
+    }
 
     let path_kind = match ctx.path_kind() {
         Some(kind) => Some(kind),
@@ -171,7 +171,13 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
             (PathKind::Pat, ItemInNs::Types(_)) => true,
             (PathKind::Pat, ItemInNs::Values(def)) => matches!(def, hir::ModuleDef::Const(_)),
 
-            (PathKind::Type, ItemInNs::Types(_)) => true,
+            (PathKind::Type, ItemInNs::Types(ty)) => {
+                if matches!(ctx.completion_location, Some(ImmediateLocation::TypeBound)) {
+                    matches!(ty, ModuleDef::Trait(_))
+                } else {
+                    true
+                }
+            }
             (PathKind::Type, ItemInNs::Values(_)) => false,
 
             (PathKind::Attr { .. }, ItemInNs::Macros(mac)) => mac.is_attr(ctx.db),
@@ -199,12 +205,8 @@ pub(crate) fn import_on_the_fly(acc: &mut Completions, ctx: &CompletionContext) 
                     &user_input_lowercased,
                 )
             })
-            .filter_map(|import| {
-                render_resolution_with_import(
-                    RenderContext::new(ctx),
-                    ImportEdit { import, scope: import_scope.clone() },
-                )
-            }),
+            .filter_map(|import| render_resolution_with_import(RenderContext::new(ctx), import))
+            .map(|builder| builder.build()),
     );
     Some(())
 }
@@ -225,7 +227,7 @@ pub(crate) fn position_for_import(
 }
 
 fn import_assets(ctx: &CompletionContext, fuzzy_name: String) -> Option<ImportAssets> {
-    let current_module = ctx.module?;
+    let current_module = ctx.module;
     if let Some(dot_receiver) = ctx.dot_receiver() {
         ImportAssets::for_fuzzy_method_call(
             current_module,

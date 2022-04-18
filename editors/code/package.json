@@ -21,13 +21,13 @@
         "Programming Languages"
     ],
     "engines": {
-        "vscode": "^1.65.0"
+        "vscode": "^1.66.0"
     },
     "enabledApiProposals": [],
     "scripts": {
         "vscode:prepublish": "npm run build-base -- --minify",
         "package": "vsce package -o rust-analyzer.vsix",
-        "build-base": "esbuild ./src/main.ts --bundle --outfile=out/main.js --external:vscode --format=cjs --platform=node --target=node14",
+        "build-base": "esbuild ./src/main.ts --bundle --outfile=out/main.js --external:vscode --format=cjs --platform=node --target=node16",
         "build": "npm run build-base -- --sourcemap",
         "watch": "npm run build-base -- --sourcemap --watch",
         "lint": "tsfmt --verify && eslint -c .eslintrc.js --ext ts ./src ./tests",
@@ -36,22 +36,22 @@
         "test": "node ./out/tests/runTests.js"
     },
     "dependencies": {
-        "vscode-languageclient": "8.0.0-next.12",
+        "vscode-languageclient": "8.0.0-next.14",
         "d3": "^7.3.0",
-        "d3-graphviz": "^4.0.0"
+        "d3-graphviz": "^4.1.0"
     },
     "devDependencies": {
         "@types/node": "~14.17.5",
-        "@types/vscode": "~1.65.0",
-        "@typescript-eslint/eslint-plugin": "^5.10.0",
-        "@typescript-eslint/parser": "^5.10.0",
-        "@vscode/test-electron": "^2.1.1",
-        "esbuild": "^0.14.12",
-        "eslint": "^8.10.0",
+        "@types/vscode": "~1.66.0",
+        "@typescript-eslint/eslint-plugin": "^5.16.0",
+        "@typescript-eslint/parser": "^5.16.0",
+        "@vscode/test-electron": "^2.1.3",
+        "esbuild": "^0.14.27",
+        "eslint": "^8.11.0",
         "tslib": "^2.3.0",
-        "typescript": "^4.5.5",
+        "typescript": "^4.6.3",
         "typescript-formatter": "^7.2.2",
-        "vsce": "^2.6.7"
+        "vsce": "^2.7.0"
     },
     "activationEvents": [
         "onLanguage:rust",
@@ -102,6 +102,11 @@
             {
                 "command": "rust-analyzer.viewHir",
                 "title": "View Hir",
+                "category": "Rust Analyzer"
+            },
+            {
+                "command": "rust-analyzer.viewFileText",
+                "title": "View File Text (as seen by the server)",
                 "category": "Rust Analyzer"
             },
             {
@@ -470,6 +475,17 @@
                     "markdownDescription": "Run build scripts (`build.rs`) for more precise code analysis.",
                     "default": true,
                     "type": "boolean"
+                },
+                "rust-analyzer.cargo.runBuildScriptsCommand": {
+                    "markdownDescription": "Advanced option, fully override the command rust-analyzer uses to\nrun build scripts and build procedural macros. The command should\ninclude `--message-format=json` or a similar option.",
+                    "default": null,
+                    "type": [
+                        "null",
+                        "array"
+                    ],
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "rust-analyzer.cargo.useRustcWrapperForBuildScripts": {
                     "markdownDescription": "Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to\navoid compiling unnecessary things.",
@@ -1009,6 +1025,12 @@
                         "Search for all symbols kinds"
                     ]
                 },
+                "rust-analyzer.workspace.symbol.search.limit": {
+                    "markdownDescription": "Limits the number of items returned from a workspace symbol search (Defaults to 128).\nSome clients like vs-code issue new searches on result filtering and don't require all results to be returned in the initial search.\nOther clients requires all results upfront and might require a higher limit.",
+                    "default": 128,
+                    "type": "integer",
+                    "minimum": 0
+                },
                 "$generated-end": {}
             }
         },
@@ -1406,6 +1428,10 @@
                 },
                 {
                     "command": "rust-analyzer.viewHir",
+                    "when": "inRustProject"
+                },
+                {
+                    "command": "rust-analyzer.viewFileText",
                     "when": "inRustProject"
                 },
                 {

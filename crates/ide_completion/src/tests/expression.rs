@@ -137,6 +137,9 @@ impl Unit {
             kw trait
             kw static
             kw mod
+            kw enum
+            kw struct
+            kw union
             kw match
             kw while
             kw while let
@@ -227,6 +230,9 @@ fn complete_in_block() {
             kw trait
             kw static
             kw mod
+            kw enum
+            kw struct
+            kw union
             kw match
             kw while
             kw while let
@@ -269,6 +275,9 @@ fn complete_after_if_expr() {
             kw trait
             kw static
             kw mod
+            kw enum
+            kw struct
+            kw union
             kw match
             kw while
             kw while let
@@ -339,6 +348,9 @@ fn completes_in_loop_ctx() {
             kw trait
             kw static
             kw mod
+            kw enum
+            kw struct
+            kw union
             kw match
             kw while
             kw while let
@@ -554,6 +566,23 @@ fn func() {
 }
 
 #[test]
+fn ty_qualified_no_drop() {
+    check_empty(
+        r#"
+//- minicore: drop
+struct Foo;
+impl Drop for Foo {
+    fn drop(&mut self) {}
+}
+fn func() {
+    Foo::$0
+}
+"#,
+        expect![[r#""#]],
+    );
+}
+
+#[test]
 fn with_parens() {
     check_empty(
         r#"
@@ -571,5 +600,65 @@ fn func() {
             ev Variant(…) Variant
             fn variant    fn() -> Enum
         "#]],
+    );
+}
+
+#[test]
+fn detail_impl_trait_in_return_position() {
+    check_empty(
+        r"
+//- minicore: sized
+trait Trait<T> {}
+fn foo<U>() -> impl Trait<U> {}
+fn main() {
+    self::$0
+}
+",
+        expect![[r"
+            tt Trait
+            fn main() fn()
+            fn foo()  fn() -> impl Trait<U>
+        "]],
+    );
+}
+
+#[test]
+fn detail_async_fn() {
+    check_empty(
+        r#"
+//- minicore: future, sized
+trait Trait<T> {}
+async fn foo() -> u8 {}
+async fn bar<U>() -> impl Trait<U> {}
+fn main() {
+    self::$0
+}
+"#,
+        expect![[r"
+            tt Trait
+            fn main() fn()
+            fn bar()  async fn() -> impl Trait<U>
+            fn foo()  async fn() -> u8
+        "]],
+    );
+}
+
+#[test]
+fn detail_impl_trait_in_argument_position() {
+    check_empty(
+        r"
+//- minicore: sized
+trait Trait<T> {}
+struct Foo;
+impl Foo {
+    fn bar<U>(_: impl Trait<U>) {}
+}
+fn main() {
+    Foo::$0
+}
+",
+        expect![[r"
+            fn bar(…) fn(impl Trait<U>)
+        "]],
     );
 }

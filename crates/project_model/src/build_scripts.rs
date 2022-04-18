@@ -7,11 +7,11 @@
 //! here, but it covers procedural macros as well.
 
 use std::{
+    io,
     path::PathBuf,
     process::{Command, Stdio},
 };
 
-use anyhow::Result;
 use cargo_metadata::{camino::Utf8Path, Message};
 use la_arena::ArenaMap;
 use paths::AbsPathBuf;
@@ -42,22 +42,15 @@ pub(crate) struct BuildScriptOutput {
 }
 
 impl WorkspaceBuildScripts {
-    pub(crate) fn run(
-        config: &CargoConfig,
-        workspace: &CargoWorkspace,
-        progress: &dyn Fn(String),
-    ) -> Result<WorkspaceBuildScripts> {
+    fn build_command(config: &CargoConfig) -> Command {
+        if let Some([program, args @ ..]) = config.run_build_script_command.as_deref() {
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            return cmd;
+        }
+
         let mut cmd = Command::new(toolchain::cargo());
 
-        if config.wrap_rustc_in_build_scripts {
-            // Setup RUSTC_WRAPPER to point to `rust-analyzer` binary itself. We use
-            // that to compile only proc macros and build scripts during the initial
-            // `cargo check`.
-            let myself = std::env::current_exe()?;
-            cmd.env("RUSTC_WRAPPER", myself);
-            cmd.env("RA_RUSTC_WRAPPER", "1");
-        }
-        cmd.current_dir(workspace.workspace_root());
         cmd.args(&["check", "--quiet", "--workspace", "--message-format=json"]);
 
         // --all-targets includes tests, benches and examples in addition to the
@@ -81,6 +74,26 @@ impl WorkspaceBuildScripts {
             }
         }
 
+        cmd
+    }
+    pub(crate) fn run(
+        config: &CargoConfig,
+        workspace: &CargoWorkspace,
+        progress: &dyn Fn(String),
+    ) -> io::Result<WorkspaceBuildScripts> {
+        let mut cmd = Self::build_command(config);
+
+        if config.wrap_rustc_in_build_scripts {
+            // Setup RUSTC_WRAPPER to point to `rust-analyzer` binary itself. We use
+            // that to compile only proc macros and build scripts during the initial
+            // `cargo check`.
+            let myself = std::env::current_exe()?;
+            cmd.env("RUSTC_WRAPPER", myself);
+            cmd.env("RA_RUSTC_WRAPPER", "1");
+        }
+
+        cmd.current_dir(workspace.workspace_root());
+
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
 
         let mut res = WorkspaceBuildScripts::default();
@@ -94,17 +107,17 @@ impl WorkspaceBuildScripts {
             by_id.insert(workspace[package].id.clone(), package);
         }
 
-        let mut callback_err = None;
+        let mut cfg_err = None;
         let mut stderr = String::new();
         let output = stdx::process::streaming_output(
             cmd,
             &mut |line| {
-                if callback_err.is_some() {
+                if cfg_err.is_some() {
                     return;
                 }
 
                 // Copy-pasted from existing cargo_metadata. It seems like we
-                // should be using sered_stacker here?
+                // should be using serde_stacker here?
                 let mut deserializer = serde_json::Deserializer::from_str(line);
                 deserializer.disable_recursion_limit();
                 let message = Message::deserialize(&mut deserializer)
@@ -113,7 +126,7 @@ impl WorkspaceBuildScripts {
                 match message {
                     Message::BuildScriptExecuted(message) => {
                         let package = match by_id.get(&message.package_id.repr) {
-                            Some(it) => *it,
+                            Some(&it) => it,
                             None => return,
                         };
                         let cfgs = {
@@ -122,7 +135,7 @@ impl WorkspaceBuildScripts {
                                 match cfg.parse::<CfgFlag>() {
                                     Ok(it) => acc.push(it),
                                     Err(err) => {
-                                        callback_err = Some(anyhow::format_err!(
+                                        cfg_err = Some(format!(
                                             "invalid cfg from cargo-metadata: {}",
                                             err
                                         ));
@@ -178,6 +191,11 @@ impl WorkspaceBuildScripts {
 
         for package in workspace.packages() {
             let package_build_data = &mut res.outputs[package];
+            tracing::info!(
+                "{} BuildScriptOutput: {:?}",
+                workspace[package].manifest.parent().display(),
+                package_build_data,
+            );
             // inject_cargo_env(package, package_build_data);
             if let Some(out_dir) = &package_build_data.out_dir {
                 // NOTE: cargo and rustc seem to hide non-UTF-8 strings from env! and option_env!()
@@ -185,6 +203,11 @@ impl WorkspaceBuildScripts {
                     package_build_data.envs.push(("OUT_DIR".to_string(), out_dir));
                 }
             }
+        }
+
+        if let Some(cfg_err) = cfg_err {
+            stderr.push_str(&cfg_err);
+            stderr.push('\n');
         }
 
         if !output.status.success() {

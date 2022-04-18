@@ -1,8 +1,5 @@
-use hir::{db::AstDatabase, HirDisplay, Type, TypeInfo};
-use ide_db::{
-    famous_defs::FamousDefs, source_change::SourceChange,
-    syntax_helpers::node_ext::for_each_tail_expr,
-};
+use hir::{db::AstDatabase, HirDisplay, Type};
+use ide_db::{famous_defs::FamousDefs, source_change::SourceChange};
 use syntax::{
     ast::{BlockExpr, ExprStmt},
     AstNode,
@@ -77,9 +74,9 @@ fn add_missing_ok_or_some(
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
     let root = ctx.sema.db.parse_or_expand(d.expr.file_id)?;
-    let tail_expr = d.expr.value.to_node(&root);
-    let tail_expr_range = tail_expr.syntax().text_range();
-    let scope = ctx.sema.scope(tail_expr.syntax());
+    let expr = d.expr.value.to_node(&root);
+    let expr_range = expr.syntax().text_range();
+    let scope = ctx.sema.scope(expr.syntax())?;
 
     let expected_adt = d.expected.as_adt()?;
     let expected_enum = expected_adt.as_enum()?;
@@ -101,16 +98,12 @@ fn add_missing_ok_or_some(
     }
 
     let mut builder = TextEdit::builder();
-    for_each_tail_expr(&tail_expr, &mut |expr| {
-        if ctx.sema.type_of_expr(expr).map(TypeInfo::adjusted).as_ref() != Some(&d.expected) {
-            builder.insert(expr.syntax().text_range().start(), format!("{}(", variant_name));
-            builder.insert(expr.syntax().text_range().end(), ")".to_string());
-        }
-    });
+    builder.insert(expr.syntax().text_range().start(), format!("{}(", variant_name));
+    builder.insert(expr.syntax().text_range().end(), ")".to_string());
     let source_change =
         SourceChange::from_text_edit(d.expr.file_id.original_file(ctx.sema.db), builder.finish());
     let name = format!("Wrap in {}", variant_name);
-    acc.push(fix("wrap_tail_expr", &name, source_change, tail_expr_range));
+    acc.push(fix("wrap_in_constructor", &name, source_change, expr_range));
     Some(())
 }
 
@@ -324,18 +317,50 @@ fn div(x: i32, y: i32) -> Option<i32> {
     }
 
     #[test]
+    fn const_generic_type_mismatch() {
+        check_diagnostics(
+            r#"
+            pub struct Rate<const N: u32>;
+            fn f<const N: u64>() -> Rate<N> { // FIXME: add some error
+                loop {}
+            }
+            fn run(t: Rate<5>) {
+            }
+            fn main() {
+                run(f()) // FIXME: remove this error
+                  //^^^ error: expected Rate<5>, found Rate<_>
+            }
+"#,
+        );
+    }
+
+    #[test]
+    fn const_generic_unknown() {
+        check_diagnostics(
+            r#"
+            pub struct Rate<T, const NOM: u32, const DENOM: u32>(T);
+            fn run(t: Rate<u32, 1, 1>) {
+            }
+            fn main() {
+                run(Rate::<_, _, _>(5));
+            }
+"#,
+        );
+    }
+
+    #[test]
     fn test_wrap_return_type_option_tails() {
         check_fix(
             r#"
 //- minicore: option, result
 fn div(x: i32, y: i32) -> Option<i32> {
     if y == 0 {
-        0
+        Some(0)
     } else if true {
-        100
+        100$0
     } else {
         None
-    }$0
+    }
 }
 "#,
             r#"

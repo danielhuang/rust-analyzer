@@ -144,6 +144,37 @@ impl ItemTree {
         Arc::new(item_tree)
     }
 
+    /// Returns an iterator over all items located at the top level of the `HirFileId` this
+    /// `ItemTree` was created from.
+    pub fn top_level_items(&self) -> &[ModItem] {
+        &self.top_level
+    }
+
+    /// Returns the inner attributes of the source file.
+    pub fn top_level_attrs(&self, db: &dyn DefDatabase, krate: CrateId) -> Attrs {
+        self.attrs.get(&AttrOwner::TopLevel).unwrap_or(&RawAttrs::EMPTY).clone().filter(db, krate)
+    }
+
+    pub(crate) fn raw_attrs(&self, of: AttrOwner) -> &RawAttrs {
+        self.attrs.get(&of).unwrap_or(&RawAttrs::EMPTY)
+    }
+
+    pub(crate) fn attrs(&self, db: &dyn DefDatabase, krate: CrateId, of: AttrOwner) -> Attrs {
+        self.raw_attrs(of).clone().filter(db, krate)
+    }
+
+    pub fn pretty_print(&self) -> String {
+        pretty::print_item_tree(self)
+    }
+
+    fn data(&self) -> &ItemTreeData {
+        self.data.as_ref().expect("attempted to access data of empty ItemTree")
+    }
+
+    fn data_mut(&mut self) -> &mut ItemTreeData {
+        self.data.get_or_insert_with(Box::default)
+    }
+
     fn block_item_tree(db: &dyn DefDatabase, block: BlockId) -> Arc<ItemTree> {
         let loc = db.lookup_intern_block(block);
         let block = loc.ast_id.to_node(db.upcast());
@@ -198,37 +229,6 @@ impl ItemTree {
 
             vis.arena.shrink_to_fit();
         }
-    }
-
-    /// Returns an iterator over all items located at the top level of the `HirFileId` this
-    /// `ItemTree` was created from.
-    pub fn top_level_items(&self) -> &[ModItem] {
-        &self.top_level
-    }
-
-    /// Returns the inner attributes of the source file.
-    pub fn top_level_attrs(&self, db: &dyn DefDatabase, krate: CrateId) -> Attrs {
-        self.attrs.get(&AttrOwner::TopLevel).unwrap_or(&RawAttrs::EMPTY).clone().filter(db, krate)
-    }
-
-    pub(crate) fn raw_attrs(&self, of: AttrOwner) -> &RawAttrs {
-        self.attrs.get(&of).unwrap_or(&RawAttrs::EMPTY)
-    }
-
-    pub(crate) fn attrs(&self, db: &dyn DefDatabase, krate: CrateId, of: AttrOwner) -> Attrs {
-        self.raw_attrs(of).clone().filter(db, krate)
-    }
-
-    pub fn pretty_print(&self) -> String {
-        pretty::print_item_tree(self)
-    }
-
-    fn data(&self) -> &ItemTreeData {
-        self.data.as_ref().expect("attempted to access data of empty ItemTree")
-    }
-
-    fn data_mut(&mut self) -> &mut ItemTreeData {
-        self.data.get_or_insert_with(Box::default)
     }
 }
 
@@ -601,21 +601,17 @@ pub enum Param {
     Varargs,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
-pub(crate) struct FnFlags {
-    pub(crate) bits: u8,
-}
-impl FnFlags {
-    pub(crate) const HAS_SELF_PARAM: u8 = 1 << 0;
-    pub(crate) const HAS_BODY: u8 = 1 << 1;
-    pub(crate) const IS_DEFAULT: u8 = 1 << 2;
-    pub(crate) const IS_CONST: u8 = 1 << 3;
-    pub(crate) const IS_ASYNC: u8 = 1 << 4;
-    pub(crate) const IS_UNSAFE: u8 = 1 << 5;
-    /// Whether the function is located in an `extern` block (*not* whether it is an
-    /// `extern "abi" fn`).
-    pub(crate) const IS_IN_EXTERN_BLOCK: u8 = 1 << 6;
-    pub(crate) const IS_VARARGS: u8 = 1 << 7;
+bitflags::bitflags! {
+    #[derive(Default)]
+    pub(crate) struct FnFlags: u8 {
+        const HAS_SELF_PARAM = 1 << 0;
+        const HAS_BODY = 1 << 1;
+        const HAS_DEFAULT_KW = 1 << 2;
+        const HAS_CONST_KW = 1 << 3;
+        const HAS_ASYNC_KW = 1 << 4;
+        const HAS_UNSAFE_KW = 1 << 5;
+        const IS_VARARGS = 1 << 6;
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

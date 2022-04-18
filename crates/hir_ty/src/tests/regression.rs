@@ -367,7 +367,7 @@ fn bug_1030() {
         }
         "#,
         expect![[r#"
-            143..145 '{}': ()
+            143..145 '{}': HashSet<T, H>
             168..197 '{     ...t(); }': ()
             174..192 'FxHash...efault': fn default<{unknown}, FxHasher>() -> HashSet<{unknown}, FxHasher>
             174..194 'FxHash...ault()': HashSet<{unknown}, FxHasher>
@@ -441,34 +441,6 @@ fn test() {
     (chars.next(), chars.nth(1));
 } //^^^^^^^^^^^^^^^^^^^^^^^^^^^^ (Option<char>, Option<char>)
 "#,
-    );
-}
-
-#[test]
-fn issue_3642_bad_macro_stackover() {
-    check_no_mismatches(
-        r#"
-#[macro_export]
-macro_rules! match_ast {
-    (match $node:ident { $($tt:tt)* }) => { match_ast!(match ($node) { $($tt)* }) };
-
-    (match ($node:expr) {
-        $( ast::$ast:ident($it:ident) => $res:expr, )*
-        _ => $catch_all:expr $(,)?
-    }) => {{
-        $( if let Some($it) = ast::$ast::cast($node.clone()) { $res } else )*
-        { $catch_all }
-    }};
-}
-
-fn main() {
-    let anchor = match_ast! {
-        match parent {
-            as => {},
-            _ => return None
-        }
-    };
-}"#,
     );
 }
 
@@ -831,7 +803,7 @@ fn issue_4966() {
         "#,
         expect![[r#"
             225..229 'iter': T
-            244..246 '{}': ()
+            244..246 '{}': Vec<A>
             258..402 '{     ...r(); }': ()
             268..273 'inner': Map<|&f64| -> f64>
             276..300 'Map { ... 0.0 }': Map<|&f64| -> f64>
@@ -914,7 +886,7 @@ fn flush(&self) {
 "#,
         expect![[r#"
             123..127 'self': &Mutex<T>
-            150..152 '{}': ()
+            150..152 '{}': MutexGuard<T>
             234..238 'self': &{unknown}
             240..290 '{     ...()); }': ()
             250..251 'w': &Mutex<BufWriter>
@@ -1039,18 +1011,18 @@ fn cfg_tail() {
         }
         "#,
         expect![[r#"
-            14..53 '{     ...)] 9 }': &str
-            20..31 '{ "first" }': &str
+            14..53 '{     ...)] 9 }': ()
+            20..31 '{ "first" }': ()
             22..29 '"first"': &str
-            72..190 '{     ...] 13 }': &str
+            72..190 '{     ...] 13 }': ()
             78..88 '{ "fake" }': &str
             80..86 '"fake"': &str
             93..103 '{ "fake" }': &str
             95..101 '"fake"': &str
-            108..120 '{ "second" }': &str
+            108..120 '{ "second" }': ()
             110..118 '"second"': &str
-            210..273 '{     ... 15; }': &str
-            216..227 '{ "third" }': &str
+            210..273 '{     ... 15; }': ()
+            216..227 '{ "third" }': ()
             218..225 '"third"': &str
             293..357 '{     ...] 15 }': ()
             299..311 '{ "fourth" }': &str
@@ -1475,5 +1447,160 @@ fn regression_11688_2() {
               //^ [MaybeUninit<i32>; 1]
         }
         "#,
+    );
+}
+
+#[test]
+fn regression_11688_3() {
+    check_types(
+        r#"
+        //- minicore: iterator
+        struct Ar<T, const N: u8>(T);
+        fn f<const LEN: usize, T, const BASE: u8>(
+            num_zeros: usize,
+        ) -> dyn Iterator<Item = [Ar<T, BASE>; LEN]> {
+            loop {}
+        }
+        fn dynamic_programming() {
+            for board in f::<9, u8, 7>(1) {
+              //^^^^^ [Ar<u8, 7>; 9]
+            }
+        }
+        "#,
+    );
+}
+
+#[test]
+fn gat_crash_1() {
+    cov_mark::check!(ignore_gats);
+    check_no_mismatches(
+        r#"
+trait ATrait {}
+
+trait Crash {
+    type Member<const N: usize>: ATrait;
+    fn new<const N: usize>() -> Self::Member<N>;
+}
+
+fn test<T: Crash>() {
+    T::new();
+}
+"#,
+    );
+}
+
+#[test]
+fn gat_crash_2() {
+    check_no_mismatches(
+        r#"
+pub struct InlineStorage {}
+
+pub struct InlineStorageHandle<T: ?Sized> {}
+
+pub unsafe trait Storage {
+    type Handle<T: ?Sized>;
+    fn create<T: ?Sized>() -> Self::Handle<T>;
+}
+
+unsafe impl Storage for InlineStorage {
+    type Handle<T: ?Sized> = InlineStorageHandle<T>;
+}
+"#,
+    );
+}
+
+#[test]
+fn cfgd_out_self_param() {
+    cov_mark::check!(cfgd_out_self_param);
+    check_no_mismatches(
+        r#"
+struct S;
+impl S {
+    fn f(#[cfg(never)] &self) {}
+}
+
+fn f(s: S) {
+    s.f();
+}
+"#,
+    );
+}
+
+#[test]
+fn rust_161_option_clone() {
+    check_types(
+        r#"
+//- minicore: option, drop
+
+fn test(o: &Option<i32>) {
+    o.my_clone();
+  //^^^^^^^^^^^^ Option<i32>
+}
+
+pub trait MyClone: Sized {
+    fn my_clone(&self) -> Self;
+}
+
+impl<T> const MyClone for Option<T>
+where
+    T: ~const MyClone + ~const Drop + ~const Destruct,
+{
+    fn my_clone(&self) -> Self {
+        match self {
+            Some(x) => Some(x.my_clone()),
+            None => None,
+        }
+    }
+}
+
+impl const MyClone for i32 {
+    fn my_clone(&self) -> Self {
+        *self
+    }
+}
+
+pub trait Destruct {}
+
+impl<T: ?Sized> const Destruct for T {}
+"#,
+    );
+}
+
+#[test]
+fn rust_162_option_clone() {
+    check_types(
+        r#"
+//- minicore: option, drop
+
+fn test(o: &Option<i32>) {
+    o.my_clone();
+  //^^^^^^^^^^^^ Option<i32>
+}
+
+pub trait MyClone: Sized {
+    fn my_clone(&self) -> Self;
+}
+
+impl<T> const MyClone for Option<T>
+where
+    T: ~const MyClone + ~const Destruct,
+{
+    fn my_clone(&self) -> Self {
+        match self {
+            Some(x) => Some(x.my_clone()),
+            None => None,
+        }
+    }
+}
+
+impl const MyClone for i32 {
+    fn my_clone(&self) -> Self {
+        *self
+    }
+}
+
+#[lang = "destruct"]
+pub trait Destruct {}
+"#,
     );
 }

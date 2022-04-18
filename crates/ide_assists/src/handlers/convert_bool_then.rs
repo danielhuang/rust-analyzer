@@ -111,7 +111,7 @@ pub(crate) fn convert_if_to_bool_then(acc: &mut Assists, ctx: &AssistContext) ->
                     | ast::Expr::ForExpr(_)
                     | ast::Expr::IfExpr(_)
                     | ast::Expr::LoopExpr(_)
-                    | ast::Expr::MacroCall(_)
+                    | ast::Expr::MacroExpr(_)
                     | ast::Expr::MatchExpr(_)
                     | ast::Expr::PrefixExpr(_)
                     | ast::Expr::RangeExpr(_)
@@ -222,7 +222,7 @@ fn option_variants(
     sema: &Semantics<RootDatabase>,
     expr: &SyntaxNode,
 ) -> Option<(hir::Variant, hir::Variant)> {
-    let fam = FamousDefs(sema, sema.scope(expr).krate());
+    let fam = FamousDefs(sema, sema.scope(expr)?.krate());
     let option_variants = fam.core_option_Option()?.variants(sema.db);
     match &*option_variants {
         &[variant0, variant1] => Some(if variant0.name(sema.db) == known::None {

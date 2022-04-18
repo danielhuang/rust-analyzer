@@ -9,7 +9,6 @@ use std::{
 use always_assert::always;
 use crossbeam_channel::{select, Receiver};
 use ide_db::base_db::{SourceDatabaseExt, VfsPath};
-use itertools::Itertools;
 use lsp_server::{Connection, Notification, Request};
 use lsp_types::notification::Notification as _;
 use vfs::{ChangeKind, FileId};
@@ -112,10 +111,7 @@ impl GlobalState {
             && self.config.detached_files().is_empty()
             && self.config.notifications().cargo_toml_not_found
         {
-            self.show_message(
-                lsp_types::MessageType::ERROR,
-                "rust-analyzer failed to discover workspace".to_string(),
-            );
+            self.show_and_log_error("rust-analyzer failed to discover workspace".to_string(), None);
         };
 
         if self.config.did_save_text_document_dynamic_registration() {
@@ -153,9 +149,9 @@ impl GlobalState {
             );
         }
 
-        self.fetch_workspaces_queue.request_op();
-        if self.fetch_workspaces_queue.should_start_op() {
-            self.fetch_workspaces();
+        self.fetch_workspaces_queue.request_op("startup".to_string());
+        if let Some(cause) = self.fetch_workspaces_queue.should_start_op() {
+            self.fetch_workspaces(cause);
         }
 
         while let Some(event) = self.next_event(&inbox) {
@@ -191,7 +187,7 @@ impl GlobalState {
         // NOTE: don't count blocking select! call as a loop-turn time
         let _p = profile::span("GlobalState::handle_event");
 
-        tracing::info!("handle_event({:?})", event);
+        tracing::debug!("handle_event({:?})", event);
         let task_queue_len = self.task_pool.handle.len();
         if task_queue_len > 0 {
             tracing::info!("task queue len: {}", task_queue_len);
@@ -240,11 +236,12 @@ impl GlobalState {
                                     self.fetch_workspaces_queue.op_completed(workspaces);
 
                                     let old = Arc::clone(&self.workspaces);
-                                    self.switch_workspaces();
+                                    self.switch_workspaces("fetched workspace".to_string());
                                     let workspaces_updated = !Arc::ptr_eq(&old, &self.workspaces);
 
                                     if self.config.run_build_scripts() && workspaces_updated {
-                                        self.fetch_build_data_queue.request_op()
+                                        self.fetch_build_data_queue
+                                            .request_op(format!("workspace updated"));
                                     }
 
                                     (Progress::End, None)
@@ -262,7 +259,7 @@ impl GlobalState {
                                 BuildDataProgress::End(build_data_result) => {
                                     self.fetch_build_data_queue.op_completed(build_data_result);
 
-                                    self.switch_workspaces();
+                                    self.switch_workspaces("fetched build data".to_string());
 
                                     (Some(Progress::End), None)
                                 }
@@ -316,7 +313,8 @@ impl GlobalState {
 
                             self.prime_caches_queue.op_completed(());
                             if cancelled {
-                                self.prime_caches_queue.request_op();
+                                self.prime_caches_queue
+                                    .request_op("restart after cancelation".to_string());
                             }
                         }
                     };
@@ -407,9 +405,9 @@ impl GlobalState {
                                 flycheck::Progress::DidCancel => (Progress::End, None),
                                 flycheck::Progress::DidFinish(result) => {
                                     if let Err(err) = result {
-                                        self.show_message(
-                                            lsp_types::MessageType::ERROR,
-                                            format!("cargo check failed: {}", err),
+                                        self.show_and_log_error(
+                                            "cargo check failed".to_string(),
+                                            Some(err.to_string()),
                                         );
                                     }
                                     (Progress::End, None)
@@ -447,7 +445,7 @@ impl GlobalState {
                     flycheck.update();
                 }
                 if self.config.prefill_caches() {
-                    self.prime_caches_queue.request_op();
+                    self.prime_caches_queue.request_op("became quiescent".to_string());
                 }
             }
 
@@ -497,14 +495,15 @@ impl GlobalState {
         }
 
         if self.config.cargo_autoreload() {
-            if self.fetch_workspaces_queue.should_start_op() {
-                self.fetch_workspaces();
+            if let Some(cause) = self.fetch_workspaces_queue.should_start_op() {
+                self.fetch_workspaces(cause);
             }
         }
-        if self.fetch_build_data_queue.should_start_op() {
-            self.fetch_build_data();
+        if let Some(cause) = self.fetch_build_data_queue.should_start_op() {
+            self.fetch_build_data(cause);
         }
-        if self.prime_caches_queue.should_start_op() {
+        if let Some(cause) = self.prime_caches_queue.should_start_op() {
+            tracing::debug!(%cause, "will prime caches");
             let num_worker_threads = self.config.prime_caches_num_threads();
 
             self.task_pool.handle.spawn_with_sender({
@@ -565,7 +564,6 @@ impl GlobalState {
         if self.workspaces.is_empty() && !self.is_quiescent() {
             self.respond(lsp_server::Response::new_err(
                 req.id,
-                // FIXME: i32 should impl From<ErrorCode> (from() guarantees lossless conversion)
                 lsp_server::ErrorCode::ContentModified as i32,
                 "waiting for cargo metadata or cargo check".to_owned(),
             ));
@@ -574,7 +572,7 @@ impl GlobalState {
 
         RequestDispatcher { req: Some(req), global_state: self }
             .on_sync_mut::<lsp_ext::ReloadWorkspace>(|s, ()| {
-                s.fetch_workspaces_queue.request_op();
+                s.fetch_workspaces_queue.request_op("reload workspace request".to_string());
                 Ok(())
             })?
             .on_sync_mut::<lsp_types::request::Shutdown>(|s, ()| {
@@ -590,13 +588,13 @@ impl GlobalState {
             .on::<lsp_ext::AnalyzerStatus>(handlers::handle_analyzer_status)
             .on::<lsp_ext::SyntaxTree>(handlers::handle_syntax_tree)
             .on::<lsp_ext::ViewHir>(handlers::handle_view_hir)
+            .on::<lsp_ext::ViewFileText>(handlers::handle_view_file_text)
             .on::<lsp_ext::ViewCrateGraph>(handlers::handle_view_crate_graph)
             .on::<lsp_ext::ViewItemTree>(handlers::handle_view_item_tree)
             .on::<lsp_ext::ExpandMacro>(handlers::handle_expand_macro)
             .on::<lsp_ext::ParentModule>(handlers::handle_parent_module)
             .on::<lsp_ext::Runnables>(handlers::handle_runnables)
             .on::<lsp_ext::RelatedTests>(handlers::handle_related_tests)
-            .on::<lsp_ext::InlayHints>(handlers::handle_inlay_hints)
             .on::<lsp_ext::CodeActionRequest>(handlers::handle_code_action)
             .on::<lsp_ext::CodeActionResolveRequest>(handlers::handle_code_action_resolve)
             .on::<lsp_ext::HoverRequest>(handlers::handle_hover)
@@ -610,6 +608,7 @@ impl GlobalState {
             .on::<lsp_types::request::GotoDeclaration>(handlers::handle_goto_declaration)
             .on::<lsp_types::request::GotoImplementation>(handlers::handle_goto_implementation)
             .on::<lsp_types::request::GotoTypeDefinition>(handlers::handle_goto_type_definition)
+            .on::<lsp_types::request::InlayHintRequest>(handlers::handle_inlay_hints)
             .on::<lsp_types::request::Completion>(handlers::handle_completion)
             .on::<lsp_types::request::ResolveCompletionItem>(handlers::handle_completion_resolve)
             .on::<lsp_types::request::CodeLensRequest>(handlers::handle_code_lens)
@@ -718,7 +717,7 @@ impl GlobalState {
                 }
                 if let Ok(abs_path) = from_proto::abs_path(&params.text_document.uri) {
                     if reload::should_refresh_for_change(&abs_path, ChangeKind::Modify) {
-                        this.fetch_workspaces_queue.request_op();
+                        this.fetch_workspaces_queue.request_op(format!("DidSaveTextDocument {}", abs_path.display()));
                     }
                 }
                 Ok(())
@@ -746,16 +745,8 @@ impl GlobalState {
                                     // Note that json can be null according to the spec if the client can't
                                     // provide a configuration. This is handled in Config::update below.
                                     let mut config = Config::clone(&*this.config);
-                                    if let Err(errors) = config.update(json.take()) {
-                                        let errors = errors
-                                            .iter()
-                                            .format_with("\n", |(key, e),f| {
-                                                f(key)?;
-                                                f(&": ")?;
-                                                f(e)
-                                            });
-                                        let msg= format!("Failed to deserialize config key(s):\n{}", errors);
-                                        this.show_message(lsp_types::MessageType::WARNING, msg);
+                                    if let Err(error) = config.update(json.take()) {
+                                        this.show_message(lsp_types::MessageType::WARNING, error.to_string());
                                     }
                                     this.update_configuration(config);
                                 }

@@ -2,7 +2,7 @@
 
 use std::{collections::hash_map::Entry, mem, sync::Arc};
 
-use hir_expand::{ast_id_map::AstIdMap, hygiene::Hygiene, name::known, HirFileId};
+use hir_expand::{ast_id_map::AstIdMap, hygiene::Hygiene, HirFileId};
 use syntax::ast::{self, HasModuleItem};
 
 use crate::{
@@ -48,21 +48,32 @@ impl<'a> Ctx<'a> {
     pub(super) fn lower_macro_stmts(mut self, stmts: ast::MacroStmts) -> ItemTree {
         self.tree.top_level = stmts
             .statements()
-            .filter_map(|stmt| match stmt {
-                ast::Stmt::Item(item) => Some(item),
-                // Macro calls can be both items and expressions. The syntax library always treats
-                // them as expressions here, so we undo that.
-                ast::Stmt::ExprStmt(es) => match es.expr()? {
-                    ast::Expr::MacroCall(call) => {
-                        cov_mark::hit!(macro_call_in_macro_stmts_is_added_to_item_tree);
-                        Some(call.into())
-                    }
+            .filter_map(|stmt| {
+                match stmt {
+                    ast::Stmt::Item(item) => Some(item),
+                    // Macro calls can be both items and expressions. The syntax library always treats
+                    // them as expressions here, so we undo that.
+                    ast::Stmt::ExprStmt(es) => match es.expr()? {
+                        ast::Expr::MacroExpr(expr) => {
+                            cov_mark::hit!(macro_call_in_macro_stmts_is_added_to_item_tree);
+                            Some(expr.macro_call()?.into())
+                        }
+                        _ => None,
+                    },
                     _ => None,
-                },
-                _ => None,
+                }
             })
             .flat_map(|item| self.lower_mod_item(&item))
             .collect();
+
+        if let Some(ast::Expr::MacroExpr(tail_macro)) = stmts.expr() {
+            if let Some(call) = tail_macro.macro_call() {
+                cov_mark::hit!(macro_stmt_with_trailing_macro_expr);
+                if let Some(mod_item) = self.lower_mod_item(&call.into()) {
+                    self.tree.top_level.push(mod_item);
+                }
+            }
+        }
 
         self.tree
     }
@@ -75,7 +86,7 @@ impl<'a> Ctx<'a> {
                 // Macro calls can be both items and expressions. The syntax library always treats
                 // them as expressions here, so we undo that.
                 ast::Stmt::ExprStmt(es) => match es.expr()? {
-                    ast::Expr::MacroCall(call) => self.lower_mod_item(&call.into()),
+                    ast::Expr::MacroExpr(expr) => self.lower_mod_item(&expr.macro_call()?.into()),
                     _ => None,
                 },
                 _ => None,
@@ -284,13 +295,13 @@ impl<'a> Ctx<'a> {
                         let mut pat = param.pat();
                         // FIXME: This really shouldn't be here, in fact FunctionData/ItemTree's function shouldn't know about
                         // pattern names at all
-                        let name = loop {
+                        let name = 'name: loop {
                             match pat {
                                 Some(ast::Pat::RefPat(ref_pat)) => pat = ref_pat.pat(),
                                 Some(ast::Pat::IdentPat(ident)) => {
-                                    break ident.name().map(|it| it.as_name())
+                                    break 'name ident.name().map(|it| it.as_name())
                                 }
-                                _ => break None,
+                                _ => break 'name None,
                             }
                         };
                         self.data().params.alloc(Param::Normal(name, ty))
@@ -302,9 +313,13 @@ impl<'a> Ctx<'a> {
         let end_param = self.next_param_idx();
         let params = IdxRange::new(start_param..end_param);
 
-        let ret_type = match func.ret_type().and_then(|rt| rt.ty()) {
-            Some(type_ref) => TypeRef::from_ast(&self.body_ctx, type_ref),
-            _ => TypeRef::unit(),
+        let ret_type = match func.ret_type() {
+            Some(rt) => match rt.ty() {
+                Some(type_ref) => TypeRef::from_ast(&self.body_ctx, type_ref),
+                None if rt.thin_arrow_token().is_some() => TypeRef::Error,
+                None => TypeRef::unit(),
+            },
+            None => TypeRef::unit(),
         };
 
         let (ret_type, async_ret_type) = if func.async_token().is_some() {
@@ -322,22 +337,22 @@ impl<'a> Ctx<'a> {
 
         let mut flags = FnFlags::default();
         if func.body().is_some() {
-            flags.bits |= FnFlags::HAS_BODY;
+            flags |= FnFlags::HAS_BODY;
         }
         if has_self_param {
-            flags.bits |= FnFlags::HAS_SELF_PARAM;
+            flags |= FnFlags::HAS_SELF_PARAM;
         }
         if func.default_token().is_some() {
-            flags.bits |= FnFlags::IS_DEFAULT;
+            flags |= FnFlags::HAS_DEFAULT_KW;
         }
         if func.const_token().is_some() {
-            flags.bits |= FnFlags::IS_CONST;
+            flags |= FnFlags::HAS_CONST_KW;
         }
         if func.async_token().is_some() {
-            flags.bits |= FnFlags::IS_ASYNC;
+            flags |= FnFlags::HAS_ASYNC_KW;
         }
         if func.unsafe_token().is_some() {
-            flags.bits |= FnFlags::IS_UNSAFE;
+            flags |= FnFlags::HAS_UNSAFE_KW;
         }
 
         let mut res = Function {
@@ -539,22 +554,10 @@ impl<'a> Ctx<'a> {
                     // should be considered to be in an extern block too.
                     let attrs = RawAttrs::new(self.db, &item, self.hygiene());
                     let id: ModItem = match item {
-                        ast::ExternItem::Fn(ast) => {
-                            let func_id = self.lower_function(&ast)?;
-                            let func = &mut self.data().functions[func_id.index];
-                            if is_intrinsic_fn_unsafe(&func.name) {
-                                // FIXME: this breaks in macros
-                                func.flags.bits |= FnFlags::IS_UNSAFE;
-                            }
-                            func_id.into()
-                        }
+                        ast::ExternItem::Fn(ast) => self.lower_function(&ast)?.into(),
                         ast::ExternItem::Static(ast) => self.lower_static(&ast)?.into(),
                         ast::ExternItem::TypeAlias(ty) => self.lower_type_alias(&ty)?.into(),
-                        ast::ExternItem::MacroCall(call) => {
-                            // FIXME: we need some way of tracking that the macro call is in an
-                            // extern block
-                            self.lower_macro_call(&call)?.into()
-                        }
+                        ast::ExternItem::MacroCall(call) => self.lower_macro_call(&call)?.into(),
                     };
                     self.add_attrs(id.into(), attrs);
                     Some(id)
@@ -699,49 +702,6 @@ enum GenericsOwner<'a> {
     Trait(&'a ast::Trait),
     TypeAlias,
     Impl,
-}
-
-/// Returns `true` if the given intrinsic is unsafe to call, or false otherwise.
-fn is_intrinsic_fn_unsafe(name: &Name) -> bool {
-    // Should be kept in sync with https://github.com/rust-lang/rust/blob/532d2b14c05f9bc20b2d27cbb5f4550d28343a36/compiler/rustc_typeck/src/check/intrinsic.rs#L72-L106
-    ![
-        known::abort,
-        known::add_with_overflow,
-        known::bitreverse,
-        known::black_box,
-        known::bswap,
-        known::caller_location,
-        known::ctlz,
-        known::ctpop,
-        known::cttz,
-        known::discriminant_value,
-        known::forget,
-        known::likely,
-        known::maxnumf32,
-        known::maxnumf64,
-        known::min_align_of,
-        known::minnumf32,
-        known::minnumf64,
-        known::mul_with_overflow,
-        known::needs_drop,
-        known::ptr_guaranteed_eq,
-        known::ptr_guaranteed_ne,
-        known::rotate_left,
-        known::rotate_right,
-        known::rustc_peek,
-        known::saturating_add,
-        known::saturating_sub,
-        known::size_of,
-        known::sub_with_overflow,
-        known::type_id,
-        known::type_name,
-        known::unlikely,
-        known::variant_count,
-        known::wrapping_add,
-        known::wrapping_mul,
-        known::wrapping_sub,
-    ]
-    .contains(name)
 }
 
 fn lower_abi(abi: ast::Abi) -> Interned<str> {
