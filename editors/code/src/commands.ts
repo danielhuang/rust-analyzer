@@ -300,10 +300,9 @@ export function serverVersion(ctx: Ctx): Cmd {
 
 export function toggleInlayHints(_ctx: Ctx): Cmd {
     return async () => {
-        const scope = vscode.ConfigurationTarget.Global;
-        const config = vscode.workspace.getConfiguration("editor.inlayHints");
+        const config = vscode.workspace.getConfiguration("editor.inlayHints", { languageId: "rust" });
         const value = !config.get("enabled");
-        await config.update('enabled', value, scope);
+        await config.update('enabled', value, vscode.ConfigurationTarget.Global);
     };
 }
 
@@ -735,6 +734,9 @@ export function resolveCodeAction(ctx: Ctx): Cmd {
         const fileSystemEdit = await client.protocol2CodeConverter.asWorkspaceEdit(lcFileSystemEdit);
         await vscode.workspace.applyEdit(fileSystemEdit);
         await applySnippetWorkspaceEdit(edit);
+        if (item.command != null) {
+            await vscode.commands.executeCommand(item.command.command, item.command.arguments);
+        }
     };
 }
 
