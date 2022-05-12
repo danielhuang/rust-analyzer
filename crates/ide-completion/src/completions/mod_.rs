@@ -3,25 +3,26 @@
 use std::iter;
 
 use hir::{Module, ModuleSource};
-use ide_db::FxHashSet;
 use ide_db::{
     base_db::{SourceDatabaseExt, VfsPath},
-    RootDatabase, SymbolKind,
+    FxHashSet, RootDatabase, SymbolKind,
 };
 use syntax::{ast, AstNode, SyntaxKind};
 
-use crate::{context::NameContext, CompletionItem};
-
-use crate::{context::CompletionContext, Completions};
+use crate::{
+    context::{CompletionContext, NameContext, NameKind},
+    CompletionItem, Completions,
+};
 
 /// Complete mod declaration, i.e. `mod $0;`
 pub(crate) fn complete_mod(acc: &mut Completions, ctx: &CompletionContext) -> Option<()> {
-    let mod_under_caret = match &ctx.name_ctx {
-        Some(NameContext::Module(mod_under_caret)) if mod_under_caret.item_list().is_none() => {
-            mod_under_caret
-        }
+    let mod_under_caret = match ctx.name_ctx() {
+        Some(NameContext { kind: NameKind::Module(mod_under_caret), .. }) => mod_under_caret,
         _ => return None,
     };
+    if mod_under_caret.item_list().is_some() {
+        return None;
+    }
 
     let _p = profile::span("completion::complete_mod");
 
@@ -30,8 +31,8 @@ pub(crate) fn complete_mod(acc: &mut Completions, ctx: &CompletionContext) -> Op
     // interested in its parent.
     if ctx.original_token.kind() == SyntaxKind::IDENT {
         if let Some(module) = ctx.original_token.ancestors().nth(1).and_then(ast::Module::cast) {
-            match current_module.definition_source(ctx.db).value {
-                ModuleSource::Module(src) if src == module => {
+            match ctx.sema.to_def(&module) {
+                Some(module) if module == current_module => {
                     if let Some(parent) = current_module.parent(ctx.db) {
                         current_module = parent;
                     }
@@ -182,8 +183,8 @@ fn bar() {}
 fn ignored_bar() {}
 "#,
             expect![[r#"
-                md foo;
                 md bar;
+                md foo;
             "#]],
         );
     }
@@ -219,8 +220,8 @@ fn bar() {}
 fn ignored_bar() {}
 "#,
             expect![[r#"
-                md foo;
                 md bar;
+                md foo;
             "#]],
         );
     }
@@ -346,8 +347,8 @@ fn bar() {}
 fn ignored_bar() {}
 "#,
             expect![[r#"
-                md foo;
                 md bar;
+                md foo;
             "#]],
         );
     }

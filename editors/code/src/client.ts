@@ -5,6 +5,8 @@ import * as Is from 'vscode-languageclient/lib/common/utils/is';
 import { assert } from './util';
 import { WorkspaceEdit } from 'vscode';
 import { Workspace } from './ctx';
+import { updateConfig } from './config';
+import { substituteVariablesInEnv } from './config';
 
 export interface Env {
     [name: string]: string;
@@ -24,14 +26,14 @@ function renderHoverActions(actions: ra.CommandLinkGroup[]): vscode.MarkdownStri
     return result;
 }
 
-export function createClient(serverPath: string, workspace: Workspace, extraEnv: Env): lc.LanguageClient {
+export async function createClient(serverPath: string, workspace: Workspace, extraEnv: Env): Promise<lc.LanguageClient> {
     // '.' Is the fallback if no folder is open
     // TODO?: Workspace folders support Uri's (eg: file://test.txt).
     // It might be a good idea to test if the uri points to a file.
 
-    const newEnv = Object.assign({}, process.env);
-    Object.assign(newEnv, extraEnv);
-
+    const newEnv = substituteVariablesInEnv(Object.assign(
+        {}, process.env, extraEnv
+    ));
     const run: lc.Executable = {
         command: serverPath,
         options: { env: newEnv },
@@ -45,6 +47,10 @@ export function createClient(serverPath: string, workspace: Workspace, extraEnv:
     );
 
     let initializationOptions = vscode.workspace.getConfiguration("rust-analyzer");
+
+    // Update outdated user configs
+    await updateConfig(initializationOptions);
+
     if (workspace.kind === "Detached Files") {
         initializationOptions = { "detachedFiles": workspace.files.map(file => file.uri.fsPath), ...initializationOptions };
     }

@@ -3510,6 +3510,94 @@ const FOO$0: &str = "bar";
             This is a doc
         "#]],
     );
+    // show char literal
+    check(
+        r#"
+/// This is a doc
+const FOO$0: char = 'a';
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: char = 'a'
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
+    // show escaped char literal
+    check(
+        r#"
+/// This is a doc
+const FOO$0: char = '\x61';
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: char = 'a'
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
+    // show byte literal
+    check(
+        r#"
+/// This is a doc
+const FOO$0: u8 = b'a';
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: u8 = 97 (0x61)
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
+    // show escaped byte literal
+    check(
+        r#"
+/// This is a doc
+const FOO$0: u8 = b'\x61';
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: u8 = 97 (0x61)
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
 }
 
 #[test]
@@ -3638,6 +3726,40 @@ mod return_keyword {}
 
                 Docs for return_keyword
             "#]],
+    );
+}
+
+#[test]
+fn hover_keyword_doc() {
+    check(
+        r#"
+//- /main.rs crate:main deps:std
+fn foo() {
+    let bar = mov$0e || {};
+}
+//- /libstd.rs crate:std
+#[doc(keyword = "move")]
+/// [closure]
+/// [closures][closure]
+/// [threads]
+///
+/// [closure]: ../book/ch13-01-closures.html
+/// [threads]: ../book/ch16-01-threads.html#using-move-closures-with-threads
+mod move_keyword {}
+"#,
+        expect![[r##"
+            *move*
+
+            ```rust
+            move
+            ```
+
+            ---
+
+            [closure](https://doc.rust-lang.org/nightly/book/ch13-01-closures.html)
+            [closures](https://doc.rust-lang.org/nightly/book/ch13-01-closures.html)
+            [threads](https://doc.rust-lang.org/nightly/book/ch16-01-threads.html#using-move-closures-with-threads)
+        "##]],
     );
 }
 
@@ -4672,6 +4794,28 @@ pub struct Type;
 
             ```rust
             const KONST: dep::Type = $crate::Type
+            ```
+        "#]],
+    );
+}
+
+#[test]
+fn hover_record_variant() {
+    check(
+        r#"
+enum Enum {
+    RecordV$0 { field: u32 }
+}
+"#,
+        expect![[r#"
+            *RecordV*
+
+            ```rust
+            test::Enum
+            ```
+
+            ```rust
+            RecordV { field: u32 }
             ```
         "#]],
     );

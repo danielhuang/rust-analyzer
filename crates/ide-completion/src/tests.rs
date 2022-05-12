@@ -10,6 +10,7 @@
 
 mod attribute;
 mod expression;
+mod flyimport;
 mod fn_param;
 mod item_list;
 mod item;
@@ -17,10 +18,10 @@ mod pattern;
 mod predicate;
 mod proc_macros;
 mod record;
+mod special;
 mod type_pos;
 mod use_tree;
 mod visibility;
-mod flyimport;
 
 use std::mem;
 
@@ -98,6 +99,7 @@ fn completion_list_with_config(
         })
         .filter(|it| include_keywords || it.kind() != CompletionItemKind::Keyword)
         .filter(|it| include_keywords || it.kind() != CompletionItemKind::Snippet)
+        .sorted_by_key(|it| (it.kind(), it.label().to_owned(), it.detail().map(ToOwned::to_owned)))
         .collect();
     render_completion_list(items)
 }
@@ -212,7 +214,17 @@ pub(crate) fn check_pattern_is_applicable(code: &str, check: impl FnOnce(SyntaxE
 
 pub(crate) fn get_all_items(config: CompletionConfig, code: &str) -> Vec<CompletionItem> {
     let (db, position) = position(code);
-    crate::completions(&db, &config, position).map_or_else(Vec::default, Into::into)
+    let res = crate::completions(&db, &config, position).map_or_else(Vec::default, Into::into);
+    // validate
+    res.iter().for_each(|it| {
+        let sr = it.source_range();
+        assert!(
+            sr.contains_inclusive(position.offset),
+            "source range {sr:?} does not contain the offset {:?} of the completion request: {it:?}",
+            position.offset
+        );
+    });
+    res
 }
 
 #[test]
@@ -245,7 +257,6 @@ fn foo() {
 
 #[test]
 fn no_completions_in_comments() {
-    cov_mark::check!(no_keyword_completion_in_comments);
     assert_eq!(
         completion_list(
             r#"

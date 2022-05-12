@@ -17,7 +17,7 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
     };
     let refutable = patctx.refutability == PatternRefutability::Refutable;
 
-    if let Some(path_ctx) = &ctx.path_context {
+    if let Some(path_ctx) = ctx.path_context() {
         pattern_path_completion(acc, ctx, path_ctx);
         return;
     }
@@ -163,12 +163,11 @@ fn pattern_path_completion(
                         _ => return,
                     };
 
-                    let traits_in_scope = ctx.scope.visible_traits();
                     let mut seen = FxHashSet::default();
                     ty.iterate_path_candidates(
                         ctx.db,
                         &ctx.scope,
-                        &traits_in_scope,
+                        &ctx.scope.visible_traits().0,
                         Some(ctx.module),
                         None,
                         |item| {
@@ -196,12 +195,13 @@ fn pattern_path_completion(
         // qualifier can only be none here if we are in a TuplePat or RecordPat in which case special characters have to follow the path
         None if *is_absolute_path => acc.add_crate_roots(ctx),
         None => {
-            cov_mark::hit!(unqualified_path_only_modules_in_import);
             ctx.process_all_names(&mut |name, res| {
-                if let ScopeDef::ModuleDef(hir::ModuleDef::Module(_)) = res {
+                // FIXME: properly filter here
+                if let ScopeDef::ModuleDef(_) = res {
                     acc.add_resolution(ctx, name, res);
                 }
             });
+
             acc.add_nameref_keywords_with_colon(ctx);
         }
     }

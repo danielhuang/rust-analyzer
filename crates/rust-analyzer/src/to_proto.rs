@@ -18,7 +18,7 @@ use vfs::AbsPath;
 
 use crate::{
     cargo_target_spec::CargoTargetSpec,
-    config::Config,
+    config::{CallInfoConfig, Config},
     global_state::GlobalStateSnapshot,
     line_index::{LineEndings, LineIndex, OffsetEncoding},
     lsp_ext,
@@ -338,11 +338,11 @@ fn completion_item(
 
 pub(crate) fn signature_help(
     call_info: SignatureHelp,
-    concise: bool,
+    config: CallInfoConfig,
     label_offsets: bool,
 ) -> lsp_types::SignatureHelp {
-    let (label, parameters) = match (concise, label_offsets) {
-        (_, false) => {
+    let (label, parameters) = match (config.params_only, label_offsets) {
+        (concise, false) => {
             let params = call_info
                 .parameter_labels()
                 .map(|label| lsp_types::ParameterInformation {
@@ -388,16 +388,12 @@ pub(crate) fn signature_help(
         }
     };
 
-    let documentation = if concise {
-        None
-    } else {
-        call_info.doc.map(|doc| {
-            lsp_types::Documentation::MarkupContent(lsp_types::MarkupContent {
-                kind: lsp_types::MarkupKind::Markdown,
-                value: doc,
-            })
+    let documentation = call_info.doc.filter(|_| config.docs).map(|doc| {
+        lsp_types::Documentation::MarkupContent(lsp_types::MarkupContent {
+            kind: lsp_types::MarkupKind::Markdown,
+            value: doc,
         })
-    };
+    });
 
     let active_parameter = call_info.active_parameter.map(|it| it as u32);
 
@@ -1107,19 +1103,17 @@ pub(crate) fn code_lens(
                 })
             }
         }
-        AnnotationKind::HasImpls { position: file_position, data } => {
+        AnnotationKind::HasImpls { file_id, data } => {
             if !client_commands_config.show_reference {
                 return Ok(());
             }
-            let line_index = snap.file_line_index(file_position.file_id)?;
+            let line_index = snap.file_line_index(file_id)?;
             let annotation_range = range(&line_index, annotation.range);
-            let url = url(snap, file_position.file_id);
-
-            let position = position(&line_index, file_position.offset);
+            let url = url(snap, file_id);
 
             let id = lsp_types::TextDocumentIdentifier { uri: url.clone() };
 
-            let doc_pos = lsp_types::TextDocumentPositionParams::new(id, position);
+            let doc_pos = lsp_types::TextDocumentPositionParams::new(id, annotation_range.start);
 
             let goto_params = lsp_types::request::GotoImplementationParams {
                 text_document_position_params: doc_pos,
@@ -1142,7 +1136,7 @@ pub(crate) fn code_lens(
                 command::show_references(
                     implementation_title(locations.len()),
                     &url,
-                    position,
+                    annotation_range.start,
                     locations,
                 )
             });
@@ -1153,19 +1147,17 @@ pub(crate) fn code_lens(
                 data: Some(to_value(lsp_ext::CodeLensResolveData::Impls(goto_params)).unwrap()),
             })
         }
-        AnnotationKind::HasReferences { position: file_position, data } => {
+        AnnotationKind::HasReferences { file_id, data } => {
             if !client_commands_config.show_reference {
                 return Ok(());
             }
-            let line_index = snap.file_line_index(file_position.file_id)?;
+            let line_index = snap.file_line_index(file_id)?;
             let annotation_range = range(&line_index, annotation.range);
-            let url = url(snap, file_position.file_id);
-
-            let position = position(&line_index, file_position.offset);
+            let url = url(snap, file_id);
 
             let id = lsp_types::TextDocumentIdentifier { uri: url.clone() };
 
-            let doc_pos = lsp_types::TextDocumentPositionParams::new(id, position);
+            let doc_pos = lsp_types::TextDocumentPositionParams::new(id, annotation_range.start);
 
             let command = data.map(|ranges| {
                 let locations: Vec<lsp_types::Location> =
@@ -1174,7 +1166,7 @@ pub(crate) fn code_lens(
                 command::show_references(
                     reference_title(locations.len()),
                     &url,
-                    position,
+                    annotation_range.start,
                     locations,
                 )
             });

@@ -55,10 +55,13 @@ impl GlobalState {
             self.reload_flycheck();
         }
 
-        // Apply experimental feature flags.
-        self.analysis_host
-            .raw_database_mut()
-            .set_enable_proc_attr_macros(self.config.expand_proc_attr_macros());
+        if self.analysis_host.raw_database().enable_proc_attr_macros()
+            != self.config.expand_proc_attr_macros()
+        {
+            self.analysis_host
+                .raw_database_mut()
+                .set_enable_proc_attr_macros(self.config.expand_proc_attr_macros());
+        }
     }
 
     pub(crate) fn current_status(&self) -> lsp_ext::ServerStatusParams {
@@ -617,6 +620,11 @@ pub(crate) fn should_refresh_for_change(path: &AbsPath, change_kind: ChangeKind)
         return false;
     }
     if path.extension().unwrap_or_default() != "rs" {
+        if (file_name == "config.toml" || file_name == "config")
+            && path.parent().map(|parent| parent.as_ref().ends_with(".cargo")) == Some(true)
+        {
+            return true;
+        }
         return false;
     }
     if IMPLICIT_TARGET_FILES.iter().any(|it| path.as_ref().ends_with(it)) {

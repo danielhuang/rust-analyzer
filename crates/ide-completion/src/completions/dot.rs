@@ -2,12 +2,22 @@
 
 use ide_db::FxHashSet;
 
-use crate::{context::CompletionContext, patterns::ImmediateLocation, Completions};
+use crate::{
+    context::{CompletionContext, DotAccess, NameRefContext, PathCompletionCtx, PathKind},
+    Completions,
+};
 
 /// Complete dot accesses, i.e. fields or methods.
 pub(crate) fn complete_dot(acc: &mut Completions, ctx: &CompletionContext) {
-    let dot_receiver = match ctx.dot_receiver() {
-        Some(expr) => expr,
+    let (dot_access, dot_receiver) = match ctx.nameref_ctx() {
+        Some(NameRefContext {
+            dot_access:
+                Some(
+                    access @ (DotAccess::Method { receiver: Some(receiver), .. }
+                    | DotAccess::Field { receiver: Some(receiver), .. }),
+                ),
+            ..
+        }) => (access, receiver),
         _ => return complete_undotted_self(acc, ctx),
     };
 
@@ -16,7 +26,7 @@ pub(crate) fn complete_dot(acc: &mut Completions, ctx: &CompletionContext) {
         _ => return,
     };
 
-    if matches!(ctx.completion_location, Some(ImmediateLocation::MethodCall { .. })) {
+    if let DotAccess::Method { .. } = dot_access {
         cov_mark::hit!(test_no_struct_field_completion_for_method_call);
     } else {
         complete_fields(
@@ -34,9 +44,16 @@ fn complete_undotted_self(acc: &mut Completions, ctx: &CompletionContext) {
     if !ctx.config.enable_self_on_the_fly {
         return;
     }
-    if ctx.is_non_trivial_path() || ctx.is_path_disallowed() || !ctx.expects_expression() {
-        return;
+    match ctx.path_context() {
+        Some(PathCompletionCtx {
+            is_absolute_path: false,
+            qualifier: None,
+            kind: PathKind::Expr { .. },
+            ..
+        }) if !ctx.is_path_disallowed() => {}
+        _ => return,
     }
+
     if let Some(func) = ctx.function_def.as_ref().and_then(|fn_| ctx.sema.to_def(fn_)) {
         if let Some(self_) = func.self_param(ctx.db) {
             let ty = self_.ty(ctx.db);
@@ -78,18 +95,10 @@ fn complete_methods(
     mut f: impl FnMut(hir::Function),
 ) {
     let mut seen_methods = FxHashSet::default();
-    let mut traits_in_scope = ctx.scope.visible_traits();
-
-    // Remove drop from the environment as calling `Drop::drop` is not allowed
-    if let Some(drop_trait) = ctx.famous_defs().core_ops_Drop() {
-        cov_mark::hit!(dot_remove_drop_trait);
-        traits_in_scope.remove(&drop_trait.into());
-    }
-
     receiver.iterate_method_candidates(
         ctx.db,
         &ctx.scope,
-        &traits_in_scope,
+        &ctx.traits_in_scope().0,
         Some(ctx.module),
         None,
         |func| {
@@ -190,9 +199,9 @@ pub mod m {
 fn foo(a: lib::m::A) { a.$0 }
 "#,
             expect![[r#"
+                fd crate_field   u32
                 fd private_field u32
                 fd pub_field     u32
-                fd crate_field   u32
                 fd super_field   u32
             "#]],
         );
@@ -248,8 +257,8 @@ mod m {
 fn foo(a: lib::A) { a.$0 }
 "#,
             expect![[r#"
-                me private_method() fn(&self)
                 me crate_method()   fn(&self)
+                me private_method() fn(&self)
                 me pub_method()     fn(&self)
             "#]],
         );
@@ -686,11 +695,11 @@ struct Foo { field: i32 }
 impl Foo { fn foo(&self) { $0 } }"#,
             expect![[r#"
                 fd self.field i32
-                me self.foo() fn(&self)
                 lc self       &Foo
                 sp Self
                 st Foo
                 bt u32
+                me self.foo() fn(&self)
             "#]],
         );
         check(
@@ -700,11 +709,11 @@ struct Foo(i32);
 impl Foo { fn foo(&mut self) { $0 } }"#,
             expect![[r#"
                 fd self.0     i32
-                me self.foo() fn(&mut self)
                 lc self       &mut Foo
                 sp Self
                 st Foo
                 bt u32
+                me self.foo() fn(&mut self)
             "#]],
         );
     }
@@ -758,7 +767,6 @@ fn main() {
 
     #[test]
     fn postfix_drop_completion() {
-        cov_mark::check!(dot_remove_drop_trait);
         cov_mark::check!(postfix_drop_completion);
         check_edit(
             "drop",
@@ -784,5 +792,25 @@ fn main() {
 }
 ",
         )
+    }
+
+    #[test]
+    fn tuple_index_completion() {
+        check(
+            r#"
+struct I;
+impl I {
+    fn i_method(&self) {}
+}
+struct S((), I);
+
+fn f(s: S) {
+    s.1.$0
+}
+"#,
+            expect![[r#"
+                me i_method() fn(&self)
+            "#]],
+        );
     }
 }

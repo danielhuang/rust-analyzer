@@ -8,7 +8,7 @@ use crate::{
         operators::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp},
         support, AstChildren, AstNode,
     },
-    AstToken,
+    AstToken, SyntaxElement,
     SyntaxKind::*,
     SyntaxNode, SyntaxToken, T,
 };
@@ -282,29 +282,31 @@ pub enum LiteralKind {
     String(ast::String),
     ByteString(ast::ByteString),
     IntNumber(ast::IntNumber),
-    FloatNumber(ast::FloatNumber),
-    Char,
-    Byte,
+    FloatNumber(ast::FloatLiteral),
+    Char(ast::Char),
+    Byte(ast::Byte),
     Bool(bool),
 }
 
 impl ast::Literal {
-    pub fn token(&self) -> SyntaxToken {
+    pub fn value(&self) -> SyntaxElement {
         self.syntax()
             .children_with_tokens()
             .find(|e| e.kind() != ATTR && !e.kind().is_trivia())
-            .and_then(|e| e.into_token())
             .unwrap()
     }
-
     pub fn kind(&self) -> LiteralKind {
-        let token = self.token();
+        let token = match self.value() {
+            rowan::NodeOrToken::Node(node) => {
+                return LiteralKind::FloatNumber(
+                    ast::FloatLiteral::cast(node).expect("unreachable"),
+                );
+            }
+            rowan::NodeOrToken::Token(token) => token,
+        };
 
         if let Some(t) = ast::IntNumber::cast(token.clone()) {
             return LiteralKind::IntNumber(t);
-        }
-        if let Some(t) = ast::FloatNumber::cast(token.clone()) {
-            return LiteralKind::FloatNumber(t);
         }
         if let Some(t) = ast::String::cast(token.clone()) {
             return LiteralKind::String(t);
@@ -312,14 +314,38 @@ impl ast::Literal {
         if let Some(t) = ast::ByteString::cast(token.clone()) {
             return LiteralKind::ByteString(t);
         }
+        if let Some(t) = ast::Char::cast(token.clone()) {
+            return LiteralKind::Char(t);
+        }
+        if let Some(t) = ast::Byte::cast(token.clone()) {
+            return LiteralKind::Byte(t);
+        }
 
         match token.kind() {
             T![true] => LiteralKind::Bool(true),
             T![false] => LiteralKind::Bool(false),
-            CHAR => LiteralKind::Char,
-            BYTE => LiteralKind::Byte,
             _ => unreachable!(),
         }
+    }
+
+    pub fn as_string(&self) -> Option<ast::String> {
+        match self.kind() {
+            LiteralKind::String(it) => Some(it),
+            _ => None,
+        }
+    }
+
+    pub fn as_byte_string(&self) -> Option<ast::ByteString> {
+        match self.kind() {
+            LiteralKind::ByteString(it) => Some(it),
+            _ => None,
+        }
+    }
+}
+
+impl ast::FloatLiteral {
+    pub fn suffix(&self) -> Option<String> {
+        ast::FloatNumberPart::cast(self.syntax().last_token()?)?.suffix().map(|s| s.to_string())
     }
 }
 
@@ -360,7 +386,7 @@ impl ast::BlockExpr {
 fn test_literal_with_attr() {
     let parse = ast::SourceFile::parse(r#"const _: &str = { #[attr] "Hello" };"#);
     let lit = parse.tree().syntax().descendants().find_map(ast::Literal::cast).unwrap();
-    assert_eq!(lit.token().text(), r#""Hello""#);
+    assert_eq!(lit.value().to_string(), r#""Hello""#);
 }
 
 impl ast::RecordExprField {

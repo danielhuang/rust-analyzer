@@ -65,9 +65,22 @@ impl<'a> RenderContext<'a> {
         }
     }
 
+    fn is_immediately_after_macro_bang(&self) -> bool {
+        self.completion.token.kind() == SyntaxKind::BANG
+            && self
+                .completion
+                .token
+                .parent()
+                .map_or(false, |it| it.kind() == SyntaxKind::MACRO_CALL)
+    }
+
+    pub(crate) fn path_is_call(&self) -> bool {
+        self.completion.path_context().map_or(false, |it| it.has_call_parens)
+    }
+
     fn is_deprecated(&self, def: impl HasAttrs) -> bool {
         let attrs = def.attrs(self.db());
-        attrs.by_key("deprecated").exists() || attrs.by_key("rustc_deprecated").exists()
+        attrs.by_key("deprecated").exists()
     }
 
     fn is_deprecated_assoc_item(&self, as_assoc_item: impl AsAssocItem) -> bool {
@@ -272,8 +285,8 @@ fn render_resolution_simple_(
 
     // Add `<>` for generic types
     let type_path_no_ty_args = matches!(
-        ctx.completion.path_context,
-        Some(PathCompletionCtx { kind: Some(PathKind::Type), has_type_args: false, .. })
+        ctx.completion.path_context(),
+        Some(PathCompletionCtx { kind: PathKind::Type, has_type_args: false, .. })
     ) && ctx.completion.config.add_call_parenthesis;
     if type_path_no_ty_args {
         if let Some(cap) = ctx.snippet_cap() {
@@ -675,8 +688,6 @@ fn main() { let _: m::Spam = S$0 }
             r#"
 #[deprecated]
 fn something_deprecated() {}
-#[rustc_deprecated(since = "1.0.0")]
-fn something_else_deprecated() {}
 
 fn main() { som$0 }
 "#,
@@ -685,8 +696,8 @@ fn main() { som$0 }
                 [
                     CompletionItem {
                         label: "main()",
-                        source_range: 127..130,
-                        delete: 127..130,
+                        source_range: 56..59,
+                        delete: 56..59,
                         insert: "main()$0",
                         kind: SymbolKind(
                             Function,
@@ -696,25 +707,13 @@ fn main() { som$0 }
                     },
                     CompletionItem {
                         label: "something_deprecated()",
-                        source_range: 127..130,
-                        delete: 127..130,
+                        source_range: 56..59,
+                        delete: 56..59,
                         insert: "something_deprecated()$0",
                         kind: SymbolKind(
                             Function,
                         ),
                         lookup: "something_deprecated",
-                        detail: "fn()",
-                        deprecated: true,
-                    },
-                    CompletionItem {
-                        label: "something_else_deprecated()",
-                        source_range: 127..130,
-                        delete: 127..130,
-                        insert: "something_else_deprecated()$0",
-                        kind: SymbolKind(
-                            Function,
-                        ),
-                        lookup: "something_else_deprecated",
                         detail: "fn()",
                         deprecated: true,
                     },

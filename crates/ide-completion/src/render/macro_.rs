@@ -5,7 +5,7 @@ use ide_db::SymbolKind;
 use syntax::SmolStr;
 
 use crate::{
-    context::PathKind,
+    context::{PathCompletionCtx, PathKind},
     item::{Builder, CompletionItem},
     render::RenderContext,
 };
@@ -20,7 +20,7 @@ fn render(
     name: hir::Name,
     macro_: hir::Macro,
 ) -> Builder {
-    let source_range = if completion.is_immediately_after_macro_bang() {
+    let source_range = if ctx.is_immediately_after_macro_bang() {
         cov_mark::hit!(completes_macro_call_if_cursor_at_bang_token);
         completion.token.parent().map_or_else(|| ctx.source_range(), |it| it.text_range())
     } else {
@@ -33,8 +33,12 @@ fn render(
     let is_fn_like = macro_.is_fn_like(completion.db);
     let (bra, ket) = if is_fn_like { guess_macro_braces(&name, docs_str) } else { ("", "") };
 
-    let needs_bang =
-        is_fn_like && !matches!(completion.path_kind(), Some(PathKind::Mac | PathKind::Use));
+    let needs_bang = match completion.path_context() {
+        Some(&PathCompletionCtx { kind, has_macro_bang, .. }) => {
+            is_fn_like && kind != PathKind::Use && !has_macro_bang
+        }
+        _ => is_fn_like,
+    };
 
     let mut item = CompletionItem::new(
         SymbolKind::from(macro_.kind(completion.db)),
@@ -48,7 +52,7 @@ fn render(
 
     let name = &*name;
     match ctx.snippet_cap() {
-        Some(cap) if needs_bang && !completion.path_is_call() => {
+        Some(cap) if needs_bang && !ctx.path_is_call() => {
             let snippet = format!("{}!{}$0{}", name, bra, ket);
             let lookup = banged_name(name);
             item.insert_snippet(cap, snippet).lookup_by(lookup);

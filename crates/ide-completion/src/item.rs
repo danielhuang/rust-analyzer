@@ -26,7 +26,7 @@ pub struct CompletionItem {
     /// It should be used primarily for UI, but we also use this to convert
     /// generic TextEdit into LSP's completion edit (see conv.rs).
     ///
-    /// `source_range` must contain the completion offset. `insert_text` should
+    /// `source_range` must contain the completion offset. `text_edit` should
     /// start with what `source_range` points to, or VSCode will filter out the
     /// completion silently.
     source_range: TextRange,
@@ -149,7 +149,7 @@ pub struct CompletionRelevance {
     pub is_private_editable: bool,
     /// Set for postfix snippet item completions
     pub postfix_match: Option<CompletionRelevancePostfixMatch>,
-    /// This is setted for type inference results
+    /// This is set for type inference results
     pub is_definite: bool,
 }
 
@@ -268,7 +268,7 @@ impl CompletionRelevance {
 }
 
 /// The type of the completion item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CompletionItemKind {
     SymbolKind(SymbolKind),
     Binding,

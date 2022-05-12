@@ -5,7 +5,7 @@ mod format_like;
 use hir::{Documentation, HasAttrs};
 use ide_db::{imports::insert_use::ImportScope, ty_filter::TryEnum, SnippetCap};
 use syntax::{
-    ast::{self, AstNode, AstToken},
+    ast::{self, AstNode, LiteralKind},
     SyntaxKind::{EXPR_STMT, STMT_LIST},
     TextRange, TextSize,
 };
@@ -13,9 +13,8 @@ use text_edit::TextEdit;
 
 use crate::{
     completions::postfix::format_like::add_format_like_completions,
-    context::CompletionContext,
+    context::{CompletionContext, DotAccess, NameRefContext},
     item::{Builder, CompletionRelevancePostfixMatch},
-    patterns::ImmediateLocation,
     CompletionItem, CompletionItemKind, CompletionRelevance, Completions, SnippetScope,
 };
 
@@ -24,11 +23,15 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
         return;
     }
 
-    let (dot_receiver, receiver_is_ambiguous_float_literal) = match &ctx.completion_location {
-        Some(ImmediateLocation::MethodCall { receiver: Some(it), .. }) => (it, false),
-        Some(ImmediateLocation::FieldAccess {
-            receiver: Some(it),
-            receiver_is_ambiguous_float_literal,
+    let (dot_receiver, receiver_is_ambiguous_float_literal) = match ctx.nameref_ctx() {
+        Some(NameRefContext {
+            dot_access: Some(DotAccess::Method { receiver: Some(it), .. }),
+            ..
+        }) => (it, false),
+        Some(NameRefContext {
+            dot_access:
+                Some(DotAccess::Field { receiver: Some(it), receiver_is_ambiguous_float_literal }),
+            ..
         }) => (it, *receiver_is_ambiguous_float_literal),
         _ => return,
     };
@@ -191,7 +194,7 @@ pub(crate) fn complete_postfix(acc: &mut Completions, ctx: &CompletionContext) {
     }
 
     if let ast::Expr::Literal(literal) = dot_receiver.clone() {
-        if let Some(literal_text) = ast::String::cast(literal.token()) {
+        if let LiteralKind::String(literal_text) = literal.kind() {
             add_format_like_completions(acc, ctx, &dot_receiver, cap, &literal_text);
         }
     }
@@ -309,18 +312,18 @@ fn main() {
 }
 "#,
             expect![[r#"
+                sn box   Box::new(expr)
+                sn call  function(expr)
+                sn dbg   dbg!(expr)
+                sn dbgr  dbg!(&expr)
                 sn if    if expr {}
-                sn while while expr {}
+                sn let   let
+                sn letm  let mut
+                sn match match expr {}
                 sn not   !expr
                 sn ref   &expr
                 sn refm  &mut expr
-                sn match match expr {}
-                sn box   Box::new(expr)
-                sn dbg   dbg!(expr)
-                sn dbgr  dbg!(&expr)
-                sn call  function(expr)
-                sn let   let
-                sn letm  let mut
+                sn while while expr {}
             "#]],
         );
     }
@@ -339,16 +342,16 @@ fn main() {
 }
 "#,
             expect![[r#"
+                sn box   Box::new(expr)
+                sn call  function(expr)
+                sn dbg   dbg!(expr)
+                sn dbgr  dbg!(&expr)
                 sn if    if expr {}
-                sn while while expr {}
+                sn match match expr {}
                 sn not   !expr
                 sn ref   &expr
                 sn refm  &mut expr
-                sn match match expr {}
-                sn box   Box::new(expr)
-                sn dbg   dbg!(expr)
-                sn dbgr  dbg!(&expr)
-                sn call  function(expr)
+                sn while while expr {}
             "#]],
         );
     }
@@ -363,15 +366,15 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn ref   &expr
-                sn refm  &mut expr
-                sn match match expr {}
                 sn box   Box::new(expr)
+                sn call  function(expr)
                 sn dbg   dbg!(expr)
                 sn dbgr  dbg!(&expr)
-                sn call  function(expr)
                 sn let   let
                 sn letm  let mut
+                sn match match expr {}
+                sn ref   &expr
+                sn refm  &mut expr
             "#]],
         )
     }
@@ -386,18 +389,18 @@ fn main() {
 }
 "#,
             expect![[r#"
+                sn box   Box::new(expr)
+                sn call  function(expr)
+                sn dbg   dbg!(expr)
+                sn dbgr  dbg!(&expr)
                 sn if    if expr {}
-                sn while while expr {}
+                sn let   let
+                sn letm  let mut
+                sn match match expr {}
                 sn not   !expr
                 sn ref   &expr
                 sn refm  &mut expr
-                sn match match expr {}
-                sn box   Box::new(expr)
-                sn dbg   dbg!(expr)
-                sn dbgr  dbg!(&expr)
-                sn call  function(expr)
-                sn let   let
-                sn letm  let mut
+                sn while while expr {}
             "#]],
         );
     }

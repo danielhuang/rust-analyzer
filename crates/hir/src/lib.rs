@@ -54,7 +54,7 @@ use hir_def::{
 };
 use hir_expand::{name::name, MacroCallKind};
 use hir_ty::{
-    autoderef,
+    all_super_traits, autoderef,
     consteval::{unknown_const_as_generic, ComputedExpr, ConstEvalError, ConstExt},
     diagnostics::BodyValidationDiagnostic,
     method_resolution::{self, TyFingerprint},
@@ -75,7 +75,6 @@ use syntax::{
     ast::{self, HasAttrs as _, HasDocComments, HasName},
     AstNode, AstPtr, SmolStr, SyntaxNodePtr, T,
 };
-use tt::{Ident, Leaf, Literal, TokenTree};
 
 use crate::db::{DefDatabase, HirDatabase};
 
@@ -89,7 +88,7 @@ pub use crate::{
         UnresolvedModule, UnresolvedProcMacro,
     },
     has_source::HasSource,
-    semantics::{PathResolution, Semantics, SemanticsScope, TypeInfo},
+    semantics::{PathResolution, Semantics, SemanticsScope, TypeInfo, VisibleTraits},
 };
 
 // Be careful with these re-exports.
@@ -230,23 +229,7 @@ impl Crate {
     pub fn get_html_root_url(self: &Crate, db: &dyn HirDatabase) -> Option<String> {
         // Look for #![doc(html_root_url = "...")]
         let attrs = db.attrs(AttrDefId::ModuleId(self.root_module(db).into()));
-        let doc_attr_q = attrs.by_key("doc");
-
-        if !doc_attr_q.exists() {
-            return None;
-        }
-
-        let doc_url = doc_attr_q.tt_values().filter_map(|tt| {
-            let name = tt.token_trees.iter()
-                .skip_while(|tt| !matches!(tt, TokenTree::Leaf(Leaf::Ident(Ident { text, ..} )) if text == "html_root_url"))
-                .nth(2);
-
-            match name {
-                Some(TokenTree::Leaf(Leaf::Literal(Literal{ref text, ..}))) => Some(text),
-                _ => None
-            }
-        }).next();
-
+        let doc_url = attrs.by_key("doc").find_string_value_in_tt("html_root_url");
         doc_url.map(|s| s.trim_matches('"').trim_end_matches('/').to_owned() + "/")
     }
 
@@ -1387,11 +1370,12 @@ impl Function {
         None
     }
 
+    pub fn has_self_param(self, db: &dyn HirDatabase) -> bool {
+        db.function_data(self.id).has_self_param()
+    }
+
     pub fn self_param(self, db: &dyn HirDatabase) -> Option<SelfParam> {
-        if !db.function_data(self.id).has_self_param() {
-            return None;
-        }
-        Some(SelfParam { func: self.id })
+        self.has_self_param(db).then(|| SelfParam { func: self.id })
     }
 
     pub fn assoc_fn_params(self, db: &dyn HirDatabase) -> Vec<Param> {
@@ -1692,6 +1676,11 @@ impl Trait {
         db.trait_data(self.id).items.iter().map(|(_name, it)| (*it).into()).collect()
     }
 
+    pub fn items_with_supertraits(self, db: &dyn HirDatabase) -> Vec<AssocItem> {
+        let traits = all_super_traits(db.upcast(), self.into());
+        traits.iter().flat_map(|tr| Trait::from(*tr).items(db)).collect()
+    }
+
     pub fn is_auto(self, db: &dyn HirDatabase) -> bool {
         db.trait_data(self.id).is_auto
     }
@@ -1778,6 +1767,10 @@ impl BuiltinType {
 
     pub fn is_char(&self) -> bool {
         matches!(self.inner, hir_def::builtin_type::BuiltinType::Char)
+    }
+
+    pub fn is_bool(&self) -> bool {
+        matches!(self.inner, hir_def::builtin_type::BuiltinType::Bool)
     }
 
     pub fn is_str(&self) -> bool {
