@@ -1466,6 +1466,7 @@ impl Function {
 }
 
 // Note: logically, this belongs to `hir_ty`, but we are not using it there yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Access {
     Shared,
     Exclusive,
@@ -3330,6 +3331,12 @@ impl Callable {
     pub fn return_type(&self) -> Type {
         self.ty.derived(self.sig.ret().clone())
     }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum BindingMode {
+    Move,
+    Ref(Mutability),
 }
 
 /// For IDE only

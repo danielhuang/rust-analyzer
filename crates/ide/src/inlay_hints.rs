@@ -1,5 +1,5 @@
 use either::Either;
-use hir::{known, Callable, HasVisibility, HirDisplay, Semantics, TypeInfo};
+use hir::{known, Callable, HasVisibility, HirDisplay, Mutability, Semantics, TypeInfo};
 use ide_db::{
     base_db::FileRange, famous_defs::FamousDefs, syntax_helpers::node_ext::walk_ty, FxHashMap,
     RootDatabase,
@@ -8,7 +8,8 @@ use itertools::Itertools;
 use stdx::to_lower_snake_case;
 use syntax::{
     ast::{self, AstNode, HasArgList, HasGenericParams, HasName, UnaryOp},
-    match_ast, Direction, NodeOrToken, SmolStr, SyntaxKind, SyntaxNode, TextRange, T,
+    match_ast, Direction, NodeOrToken, SmolStr, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,
+    TextSize, T,
 };
 
 use crate::FileId;
@@ -21,10 +22,12 @@ pub struct InlayHintsConfig {
     pub chaining_hints: bool,
     pub reborrow_hints: ReborrowHints,
     pub closure_return_type_hints: bool,
+    pub binding_mode_hints: bool,
     pub lifetime_elision_hints: LifetimeElisionHints,
     pub param_names_for_lifetime_elision_hints: bool,
     pub hide_named_constructor_hints: bool,
     pub max_length: Option<usize>,
+    pub closing_brace_hints_min_lines: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,20 +46,30 @@ pub enum ReborrowHints {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InlayKind {
+    BindingModeHint,
     ChainingHint,
+    ClosingBraceHint,
     ClosureReturnTypeHint,
     GenericParamListHint,
-    ImplicitReborrow,
+    ImplicitReborrowHint,
     LifetimeHint,
     ParameterHint,
     TypeHint,
+}
+
+// FIXME: This should live somewhere more general
+#[derive(Debug)]
+pub enum RangeOrOffset {
+    Range(TextRange),
+    Offset(TextSize),
 }
 
 #[derive(Debug)]
 pub struct InlayHint {
     pub range: TextRange,
     pub kind: InlayKind,
-    pub label: SmolStr,
+    pub label: String,
+    pub hover_trigger: Option<RangeOrOffset>,
 }
 
 // Feature: Inlay Hints
@@ -102,7 +115,7 @@ pub(crate) fn inlay_hints(
             NodeOrToken::Token(_) => return acc,
             NodeOrToken::Node(n) => n
                 .descendants()
-                .filter(|descendant| range.contains_range(descendant.text_range()))
+                .filter(|descendant| range.intersect(descendant.text_range()).is_some())
                 .for_each(hints),
         },
         None => file.descendants().for_each(hints),
@@ -122,27 +135,141 @@ fn hints(
         None => return,
     };
 
-    if let Some(expr) = ast::Expr::cast(node.clone()) {
-        chaining_hints(hints, sema, &famous_defs, config, &expr);
-        match expr {
-            ast::Expr::CallExpr(it) => param_name_hints(hints, sema, config, ast::Expr::from(it)),
-            ast::Expr::MethodCallExpr(it) => {
-                param_name_hints(hints, sema, config, ast::Expr::from(it))
-            }
-            ast::Expr::ClosureExpr(it) => closure_ret_hints(hints, sema, &famous_defs, config, it),
-            // We could show reborrows for all expressions, but usually that is just noise to the user
-            // and the main point here is to show why "moving" a mutable reference doesn't necessarily move it
-            ast::Expr::PathExpr(_) => reborrow_hints(hints, sema, config, &expr),
-            _ => None,
-        };
-    } else if let Some(it) = ast::IdentPat::cast(node.clone()) {
-        bind_pat_hints(hints, sema, config, &it);
-    } else if let Some(it) = ast::Fn::cast(node) {
-        lifetime_hints(hints, config, it);
-    }
+    closing_brace_hints(hints, sema, config, node.clone());
+    match_ast! {
+        match node {
+            ast::Expr(expr) => {
+                chaining_hints(hints, sema, &famous_defs, config, &expr);
+                match expr {
+                    ast::Expr::CallExpr(it) => param_name_hints(hints, sema, config, ast::Expr::from(it)),
+                    ast::Expr::MethodCallExpr(it) => {
+                        param_name_hints(hints, sema, config, ast::Expr::from(it))
+                    }
+                    ast::Expr::ClosureExpr(it) => closure_ret_hints(hints, sema, &famous_defs, config, it),
+                    // We could show reborrows for all expressions, but usually that is just noise to the user
+                    // and the main point here is to show why "moving" a mutable reference doesn't necessarily move it
+                    ast::Expr::PathExpr(_) => reborrow_hints(hints, sema, config, &expr),
+                    _ => None,
+                }
+            },
+            ast::Pat(it) => {
+                binding_mode_hints(hints, sema, config, &it);
+                if let ast::Pat::IdentPat(it) = it {
+                    bind_pat_hints(hints, sema, config, &it);
+                }
+                Some(())
+            },
+            ast::Fn(it) => lifetime_fn_hints(hints, config, it),
+            _ => Some(()),
+        }
+    };
 }
 
-fn lifetime_hints(
+fn closing_brace_hints(
+    acc: &mut Vec<InlayHint>,
+    sema: &Semantics<RootDatabase>,
+    config: &InlayHintsConfig,
+    node: SyntaxNode,
+) -> Option<()> {
+    let min_lines = config.closing_brace_hints_min_lines?;
+
+    let name = |it: ast::Name| it.syntax().text_range().start();
+
+    let mut closing_token;
+    let (label, name_offset) = if let Some(item_list) = ast::AssocItemList::cast(node.clone()) {
+        closing_token = item_list.r_curly_token()?;
+
+        let parent = item_list.syntax().parent()?;
+        match_ast! {
+            match parent {
+                ast::Impl(imp) => {
+                    let imp = sema.to_def(&imp)?;
+                    let ty = imp.self_ty(sema.db);
+                    let trait_ = imp.trait_(sema.db);
+
+                    (match trait_ {
+                        Some(tr) => format!("impl {} for {}", tr.name(sema.db), ty.display_truncated(sema.db, config.max_length)),
+                        None => format!("impl {}", ty.display_truncated(sema.db, config.max_length)),
+                    }, None)
+                },
+                ast::Trait(tr) => {
+                    (format!("trait {}", tr.name()?), tr.name().map(name))
+                },
+                _ => return None,
+            }
+        }
+    } else if let Some(list) = ast::ItemList::cast(node.clone()) {
+        closing_token = list.r_curly_token()?;
+
+        let module = ast::Module::cast(list.syntax().parent()?)?;
+        (format!("mod {}", module.name()?), module.name().map(name))
+    } else if let Some(block) = ast::BlockExpr::cast(node.clone()) {
+        closing_token = block.stmt_list()?.r_curly_token()?;
+
+        let parent = block.syntax().parent()?;
+        match_ast! {
+            match parent {
+                ast::Fn(it) => {
+                    // FIXME: this could include parameters, but `HirDisplay` prints too much info
+                    // and doesn't respect the max length either, so the hints end up way too long
+                    (format!("fn {}", it.name()?), it.name().map(name))
+                },
+                ast::Static(it) => (format!("static {}", it.name()?), it.name().map(name)),
+                ast::Const(it) => {
+                    if it.underscore_token().is_some() {
+                        ("const _".into(), None)
+                    } else {
+                        (format!("const {}", it.name()?), it.name().map(name))
+                    }
+                },
+                _ => return None,
+            }
+        }
+    } else if let Some(mac) = ast::MacroCall::cast(node.clone()) {
+        let last_token = mac.syntax().last_token()?;
+        if last_token.kind() != T![;] && last_token.kind() != SyntaxKind::R_CURLY {
+            return None;
+        }
+        closing_token = last_token;
+
+        (
+            format!("{}!", mac.path()?),
+            mac.path().and_then(|it| it.segment()).map(|it| it.syntax().text_range().start()),
+        )
+    } else {
+        return None;
+    };
+
+    if let Some(mut next) = closing_token.next_token() {
+        if next.kind() == T![;] {
+            if let Some(tok) = next.next_token() {
+                closing_token = next;
+                next = tok;
+            }
+        }
+        if !(next.kind() == SyntaxKind::WHITESPACE && next.text().contains('\n')) {
+            // Only display the hint if the `}` is the last token on the line
+            return None;
+        }
+    }
+
+    let mut lines = 1;
+    node.text().for_each_chunk(|s| lines += s.matches('\n').count());
+    if lines < min_lines {
+        return None;
+    }
+
+    acc.push(InlayHint {
+        range: closing_token.text_range(),
+        kind: InlayKind::ClosingBraceHint,
+        label,
+        hover_trigger: name_offset.map(RangeOrOffset::Offset),
+    });
+
+    None
+}
+
+fn lifetime_fn_hints(
     acc: &mut Vec<InlayHint>,
     config: &InlayHintsConfig,
     func: ast::Fn,
@@ -150,20 +277,54 @@ fn lifetime_hints(
     if config.lifetime_elision_hints == LifetimeElisionHints::Never {
         return None;
     }
+
+    let mk_lt_hint = |t: SyntaxToken, label| InlayHint {
+        range: t.text_range(),
+        kind: InlayKind::LifetimeHint,
+        label,
+        hover_trigger: None,
+    };
+
     let param_list = func.param_list()?;
     let generic_param_list = func.generic_param_list();
     let ret_type = func.ret_type();
     let self_param = param_list.self_param().filter(|it| it.amp_token().is_some());
 
-    let mut used_names: FxHashMap<SmolStr, usize> = generic_param_list
-        .iter()
-        .filter(|_| config.param_names_for_lifetime_elision_hints)
-        .flat_map(|gpl| gpl.lifetime_params())
-        .filter_map(|param| param.lifetime())
-        .filter_map(|lt| Some((SmolStr::from(lt.text().as_str().get(1..)?), 0)))
-        .collect();
+    let is_elided = |lt: &Option<ast::Lifetime>| match lt {
+        Some(lt) => matches!(lt.text().as_str(), "'_"),
+        None => true,
+    };
 
-    let mut allocated_lifetimes = vec![];
+    let potential_lt_refs = {
+        let mut acc: Vec<_> = vec![];
+        if let Some(self_param) = &self_param {
+            let lifetime = self_param.lifetime();
+            let is_elided = is_elided(&lifetime);
+            acc.push((None, self_param.amp_token(), lifetime, is_elided));
+        }
+        param_list.params().filter_map(|it| Some((it.pat(), it.ty()?))).for_each(|(pat, ty)| {
+            // FIXME: check path types
+            walk_ty(&ty, &mut |ty| match ty {
+                ast::Type::RefType(r) => {
+                    let lifetime = r.lifetime();
+                    let is_elided = is_elided(&lifetime);
+                    acc.push((
+                        pat.as_ref().and_then(|it| match it {
+                            ast::Pat::IdentPat(p) => p.name(),
+                            _ => None,
+                        }),
+                        r.amp_token(),
+                        lifetime,
+                        is_elided,
+                    ))
+                }
+                _ => (),
+            })
+        });
+        acc
+    };
+
+    // allocate names
     let mut gen_idx_name = {
         let mut gen = (0u8..).map(|idx| match idx {
             idx if idx < 10 => SmolStr::from_iter(['\'', (idx + 48) as char]),
@@ -171,64 +332,33 @@ fn lifetime_hints(
         });
         move || gen.next().unwrap_or_default()
     };
+    let mut allocated_lifetimes = vec![];
 
-    let mut potential_lt_refs: Vec<_> = vec![];
-    param_list
-        .params()
-        .filter_map(|it| {
-            Some((
-                config.param_names_for_lifetime_elision_hints.then(|| it.pat()).flatten(),
-                it.ty()?,
-            ))
-        })
-        .for_each(|(pat, ty)| {
-            // FIXME: check path types
-            walk_ty(&ty, &mut |ty| match ty {
-                ast::Type::RefType(r) => potential_lt_refs.push((
-                    pat.as_ref().and_then(|it| match it {
-                        ast::Pat::IdentPat(p) => p.name(),
-                        _ => None,
-                    }),
-                    r,
-                )),
-                _ => (),
-            })
-        });
-
-    enum LifetimeKind {
-        Elided,
-        Named(SmolStr),
-        Static,
-    }
-
-    let fetch_lt_text = |lt: Option<ast::Lifetime>| match lt {
-        Some(lt) => match lt.text().as_str() {
-            "'_" => LifetimeKind::Elided,
-            "'static" => LifetimeKind::Static,
-            name => LifetimeKind::Named(name.into()),
-        },
-        None => LifetimeKind::Elided,
-    };
-    let is_elided = |lt: Option<ast::Lifetime>| match lt {
-        Some(lt) => matches!(lt.text().as_str(), "'_"),
-        None => true,
-    };
-
-    // allocate names
-    if let Some(self_param) = &self_param {
-        if is_elided(self_param.lifetime()) {
-            allocated_lifetimes.push(if config.param_names_for_lifetime_elision_hints {
-                // self can't be used as a lifetime, so no need to check for collisions
-                "'self".into()
-            } else {
-                gen_idx_name()
-            });
+    let mut used_names: FxHashMap<SmolStr, usize> =
+        match config.param_names_for_lifetime_elision_hints {
+            true => generic_param_list
+                .iter()
+                .flat_map(|gpl| gpl.lifetime_params())
+                .filter_map(|param| param.lifetime())
+                .filter_map(|lt| Some((SmolStr::from(lt.text().as_str().get(1..)?), 0)))
+                .collect(),
+            false => Default::default(),
+        };
+    {
+        let mut potential_lt_refs = potential_lt_refs.iter().filter(|&&(.., is_elided)| is_elided);
+        if let Some(_) = &self_param {
+            if let Some(_) = potential_lt_refs.next() {
+                allocated_lifetimes.push(if config.param_names_for_lifetime_elision_hints {
+                    // self can't be used as a lifetime, so no need to check for collisions
+                    "'self".into()
+                } else {
+                    gen_idx_name()
+                });
+            }
         }
-    }
-    potential_lt_refs.iter().for_each(|(name, it)| {
-        if is_elided(it.lifetime()) {
+        potential_lt_refs.for_each(|(name, ..)| {
             let name = match name {
-                Some(it) => {
+                Some(it) if config.param_names_for_lifetime_elision_hints => {
                     if let Some(c) = used_names.get_mut(it.text().as_str()) {
                         *c += 1;
                         SmolStr::from(format!("'{text}{c}", text = it.text().as_str()))
@@ -240,26 +370,22 @@ fn lifetime_hints(
                 _ => gen_idx_name(),
             };
             allocated_lifetimes.push(name);
-        }
-    });
+        });
+    }
 
     // fetch output lifetime if elision rule applies
-
-    let output = if let Some(self_param) = &self_param {
-        match fetch_lt_text(self_param.lifetime()) {
-            LifetimeKind::Elided => allocated_lifetimes.get(0).cloned(),
-            LifetimeKind::Named(name) => Some(name),
-            LifetimeKind::Static => None,
+    let output = match potential_lt_refs.as_slice() {
+        [(_, _, lifetime, _), ..] if self_param.is_some() || potential_lt_refs.len() == 1 => {
+            match lifetime {
+                Some(lt) => match lt.text().as_str() {
+                    "'_" => allocated_lifetimes.get(0).cloned(),
+                    "'static" => None,
+                    name => Some(name.into()),
+                },
+                None => allocated_lifetimes.get(0).cloned(),
+            }
         }
-    } else {
-        match potential_lt_refs.as_slice() {
-            [(_, r)] => match fetch_lt_text(r.lifetime()) {
-                LifetimeKind::Elided => allocated_lifetimes.get(0).cloned(),
-                LifetimeKind::Named(name) => Some(name),
-                LifetimeKind::Static => None,
-            },
-            [..] => None,
-        }
+        [..] => None,
     };
 
     if allocated_lifetimes.is_empty() && output.is_none() {
@@ -275,11 +401,7 @@ fn lifetime_hints(
                 ast::Type::RefType(ty) if ty.lifetime().is_none() => {
                     if let Some(amp) = ty.amp_token() {
                         is_trivial = false;
-                        acc.push(InlayHint {
-                            range: amp.text_range(),
-                            kind: InlayKind::LifetimeHint,
-                            label: output_lt.clone(),
-                        });
+                        acc.push(mk_lt_hint(amp, output_lt.to_string()));
                     }
                 }
                 _ => (),
@@ -291,27 +413,12 @@ fn lifetime_hints(
         return None;
     }
 
-    let mut idx = match &self_param {
-        Some(self_param) if is_elided(self_param.lifetime()) => {
-            if let Some(amp) = self_param.amp_token() {
-                let lt = allocated_lifetimes[0].clone();
-                acc.push(InlayHint {
-                    range: amp.text_range(),
-                    kind: InlayKind::LifetimeHint,
-                    label: lt,
-                });
-            }
-            1
-        }
-        _ => 0,
-    };
-
-    for (_, p) in potential_lt_refs.iter() {
-        if is_elided(p.lifetime()) {
-            let t = p.amp_token()?;
-            let lt = allocated_lifetimes[idx].clone();
-            acc.push(InlayHint { range: t.text_range(), kind: InlayKind::LifetimeHint, label: lt });
-            idx += 1;
+    let mut a = allocated_lifetimes.iter();
+    for (_, amp_token, _, is_elided) in potential_lt_refs {
+        if is_elided {
+            let t = amp_token?;
+            let lt = a.next()?;
+            acc.push(mk_lt_hint(t, lt.to_string()));
         }
     }
 
@@ -321,21 +428,20 @@ fn lifetime_hints(
         (Some(gpl), allocated_lifetimes) => {
             let angle_tok = gpl.l_angle_token()?;
             let is_empty = gpl.generic_params().next().is_none();
-            acc.push(InlayHint {
-                range: angle_tok.text_range(),
-                kind: InlayKind::GenericParamListHint,
-                label: format!(
+            acc.push(mk_lt_hint(
+                angle_tok,
+                format!(
                     "{}{}",
                     allocated_lifetimes.iter().format(", "),
                     if is_empty { "" } else { ", " }
-                )
-                .into(),
-            });
+                ),
+            ));
         }
         (None, allocated_lifetimes) => acc.push(InlayHint {
             range: func.name()?.syntax().text_range(),
             kind: InlayKind::GenericParamListHint,
             label: format!("<{}>", allocated_lifetimes.iter().format(", "),).into(),
+            hover_trigger: None,
         }),
     }
     Some(())
@@ -368,7 +474,8 @@ fn closure_ret_hints(
         range: param_list.syntax().text_range(),
         kind: InlayKind::ClosureReturnTypeHint,
         label: hint_iterator(sema, &famous_defs, config, &ty)
-            .unwrap_or_else(|| ty.display_truncated(sema.db, config.max_length).to_string().into()),
+            .unwrap_or_else(|| ty.display_truncated(sema.db, config.max_length).to_string()),
+        hover_trigger: None,
     });
     Some(())
 }
@@ -383,7 +490,9 @@ fn reborrow_hints(
         return None;
     }
 
-    let mutability = sema.is_implicit_reborrow(expr)?;
+    let descended = sema.descend_node_into_attributes(expr.clone()).pop();
+    let desc_expr = descended.as_ref().unwrap_or(expr);
+    let mutability = sema.is_implicit_reborrow(desc_expr)?;
     let label = match mutability {
         hir::Mutability::Shared if config.reborrow_hints != ReborrowHints::MutableOnly => "&*",
         hir::Mutability::Mut => "&mut *",
@@ -391,8 +500,9 @@ fn reborrow_hints(
     };
     acc.push(InlayHint {
         range: expr.syntax().text_range(),
-        kind: InlayKind::ImplicitReborrow,
-        label: SmolStr::new_inline(label),
+        kind: InlayKind::ImplicitReborrowHint,
+        label: label.to_string(),
+        hover_trigger: None,
     });
     Some(())
 }
@@ -449,8 +559,9 @@ fn chaining_hints(
                 range: expr.syntax().text_range(),
                 kind: InlayKind::ChainingHint,
                 label: hint_iterator(sema, &famous_defs, config, &ty).unwrap_or_else(|| {
-                    ty.display_truncated(sema.db, config.max_length).to_string().into()
+                    ty.display_truncated(sema.db, config.max_length).to_string()
                 }),
+                hover_trigger: Some(RangeOrOffset::Range(expr.syntax().text_range())),
             });
         }
     }
@@ -491,9 +602,58 @@ fn param_name_hints(
             range,
             kind: InlayKind::ParameterHint,
             label: param_name.into(),
+            // FIXME: Show hover for parameter
+            hover_trigger: None,
         });
 
     acc.extend(hints);
+    Some(())
+}
+
+fn binding_mode_hints(
+    acc: &mut Vec<InlayHint>,
+    sema: &Semantics<RootDatabase>,
+    config: &InlayHintsConfig,
+    pat: &ast::Pat,
+) -> Option<()> {
+    if !config.binding_mode_hints {
+        return None;
+    }
+
+    let range = pat.syntax().text_range();
+    sema.pattern_adjustments(&pat).iter().for_each(|ty| {
+        let reference = ty.is_reference();
+        let mut_reference = ty.is_mutable_reference();
+        let r = match (reference, mut_reference) {
+            (true, true) => "&mut",
+            (true, false) => "&",
+            _ => return,
+        };
+        acc.push(InlayHint {
+            range,
+            kind: InlayKind::BindingModeHint,
+            label: r.to_string(),
+            hover_trigger: None,
+        });
+    });
+    match pat {
+        ast::Pat::IdentPat(pat) if pat.ref_token().is_none() && pat.mut_token().is_none() => {
+            let bm = sema.binding_mode_of_pat(pat)?;
+            let bm = match bm {
+                hir::BindingMode::Move => return None,
+                hir::BindingMode::Ref(Mutability::Mut) => "ref mut",
+                hir::BindingMode::Ref(Mutability::Shared) => "ref",
+            };
+            acc.push(InlayHint {
+                range,
+                kind: InlayKind::BindingModeHint,
+                label: bm.to_string(),
+                hover_trigger: None,
+            });
+        }
+        _ => (),
+    }
+
     Some(())
 }
 
@@ -528,7 +688,7 @@ fn bind_pat_hints(
             {
                 return None;
             }
-            ty_name.into()
+            ty_name
         }
     };
 
@@ -539,6 +699,7 @@ fn bind_pat_hints(
         },
         kind: InlayKind::TypeHint,
         label,
+        hover_trigger: pat.name().map(|it| it.syntax().text_range()).map(RangeOrOffset::Range),
     });
 
     Some(())
@@ -603,7 +764,7 @@ fn hint_iterator(
     famous_defs: &FamousDefs,
     config: &InlayHintsConfig,
     ty: &hir::Type,
-) -> Option<SmolStr> {
+) -> Option<String> {
     let db = sema.db;
     let strukt = ty.strip_references().as_adt()?;
     let krate = strukt.module(db).krate();
@@ -640,7 +801,7 @@ fn hint_iterator(
                     )
                     .to_string()
                 });
-            return Some(format!("{}{}{}", LABEL_START, ty_display, LABEL_END).into());
+            return Some(format!("{}{}{}", LABEL_START, ty_display, LABEL_END));
         }
     }
 
@@ -681,6 +842,7 @@ fn should_not_display_type_hint(
         match_ast! {
             match node {
                 ast::LetStmt(it) => return it.ty().is_some(),
+                // FIXME: We might wanna show type hints in parameters for non-top level patterns as well
                 ast::Param(it) => return it.ty().is_some(),
                 ast::MatchArm(_) => return pat_is_enum_variant(db, bind_pat, pat_ty),
                 ast::LetExpr(_) => return pat_is_enum_variant(db, bind_pat, pat_ty),
@@ -866,11 +1028,13 @@ mod tests {
         parameter_hints: false,
         chaining_hints: false,
         lifetime_elision_hints: LifetimeElisionHints::Never,
-        hide_named_constructor_hints: false,
         closure_return_type_hints: false,
         reborrow_hints: ReborrowHints::Always,
+        binding_mode_hints: false,
+        hide_named_constructor_hints: false,
         param_names_for_lifetime_elision_hints: false,
         max_length: None,
+        closing_brace_hints_min_lines: None,
     };
     const TEST_CONFIG: InlayHintsConfig = InlayHintsConfig {
         type_hints: true,
@@ -878,6 +1042,7 @@ mod tests {
         chaining_hints: true,
         reborrow_hints: ReborrowHints::Always,
         closure_return_type_hints: true,
+        binding_mode_hints: true,
         lifetime_elision_hints: LifetimeElisionHints::Always,
         ..DISABLED_CONFIG
     };
@@ -1367,10 +1532,10 @@ fn main() {
             let foo = foo();
             let foo = foo1();
             let foo = foo2();
+             // ^^^ impl Fn(f64, f64)
             let foo = foo3();
              // ^^^ impl Fn(f64, f64) -> u32
             let foo = foo4();
-             // ^^^ &dyn Fn(f64, f64) -> u32
             let foo = foo5();
             let foo = foo6();
             let foo = foo7();
@@ -1847,11 +2012,21 @@ fn main() {
                         range: 147..172,
                         kind: ChainingHint,
                         label: "B",
+                        hover_trigger: Some(
+                            Range(
+                                147..172,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 147..154,
                         kind: ChainingHint,
                         label: "A",
+                        hover_trigger: Some(
+                            Range(
+                                147..154,
+                            ),
+                        ),
                     },
                 ]
             "#]],
@@ -1902,11 +2077,21 @@ fn main() {
                         range: 143..190,
                         kind: ChainingHint,
                         label: "C",
+                        hover_trigger: Some(
+                            Range(
+                                143..190,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 143..179,
                         kind: ChainingHint,
                         label: "B",
+                        hover_trigger: Some(
+                            Range(
+                                143..179,
+                            ),
+                        ),
                     },
                 ]
             "#]],
@@ -1942,11 +2127,21 @@ fn main() {
                         range: 246..283,
                         kind: ChainingHint,
                         label: "B<X<i32, bool>>",
+                        hover_trigger: Some(
+                            Range(
+                                246..283,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 246..265,
                         kind: ChainingHint,
                         label: "A<X<i32, bool>>",
+                        hover_trigger: Some(
+                            Range(
+                                246..265,
+                            ),
+                        ),
                     },
                 ]
             "#]],
@@ -1984,21 +2179,41 @@ fn main() {
                         range: 174..241,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
+                        hover_trigger: Some(
+                            Range(
+                                174..241,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 174..224,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
+                        hover_trigger: Some(
+                            Range(
+                                174..224,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 174..206,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
+                        hover_trigger: Some(
+                            Range(
+                                174..206,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 174..189,
                         kind: ChainingHint,
                         label: "&mut MyIter",
+                        hover_trigger: Some(
+                            Range(
+                                174..189,
+                            ),
+                        ),
                     },
                 ]
             "#]],
@@ -2033,21 +2248,37 @@ fn main() {
                         range: 124..130,
                         kind: TypeHint,
                         label: "Struct",
+                        hover_trigger: Some(
+                            Range(
+                                124..130,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 145..185,
                         kind: ChainingHint,
                         label: "Struct",
+                        hover_trigger: Some(
+                            Range(
+                                145..185,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 145..168,
                         kind: ChainingHint,
                         label: "Struct",
+                        hover_trigger: Some(
+                            Range(
+                                145..168,
+                            ),
+                        ),
                     },
                     InlayHint {
                         range: 222..228,
                         kind: ParameterHint,
                         label: "self",
+                        hover_trigger: None,
                     },
                 ]
             "#]],
@@ -2191,6 +2422,114 @@ fn ref_mut_id(mut_ref: &mut ()) -> &mut () {
 fn ref_id(shared_ref: &()) -> &() {
     shared_ref
 }
+"#,
+        );
+    }
+
+    #[test]
+    fn hints_binding_modes() {
+        check_with_config(
+            InlayHintsConfig { binding_mode_hints: true, ..DISABLED_CONFIG },
+            r#"
+fn __(
+    (x,): (u32,),
+    (x,): &(u32,),
+  //^^^^&
+   //^ ref
+    (x,): &mut (u32,)
+  //^^^^&mut
+   //^ ref mut
+) {
+    let (x,) = (0,);
+    let (x,) = &(0,);
+      //^^^^ &
+       //^ ref
+    let (x,) = &mut (0,);
+      //^^^^ &mut
+       //^ ref mut
+    let &mut (x,) = &mut (0,);
+    let (ref mut x,) = &mut (0,);
+      //^^^^^^^^^^^^ &mut
+    let &mut (ref mut x,) = &mut (0,);
+    let (mut x,) = &mut (0,);
+      //^^^^^^^^ &mut
+    match (0,) {
+        (x,) => ()
+    }
+    match &(0,) {
+        (x,) => ()
+      //^^^^ &
+       //^ ref
+    }
+    match &mut (0,) {
+        (x,) => ()
+      //^^^^ &mut
+       //^ ref mut
+    }
+}"#,
+        );
+    }
+
+    #[test]
+    fn hints_closing_brace() {
+        check_with_config(
+            InlayHintsConfig { closing_brace_hints_min_lines: Some(2), ..DISABLED_CONFIG },
+            r#"
+fn a() {}
+
+fn f() {
+} // no hint unless `}` is the last token on the line
+
+fn g() {
+  }
+//^ fn g
+
+fn h<T>(with: T, arguments: u8, ...) {
+  }
+//^ fn h
+
+trait Tr {
+    fn f();
+    fn g() {
+    }
+  //^ fn g
+  }
+//^ trait Tr
+impl Tr for () {
+  }
+//^ impl Tr for ()
+impl dyn Tr {
+  }
+//^ impl dyn Tr
+
+static S0: () = 0;
+static S1: () = {};
+static S2: () = {
+ };
+//^ static S2
+const _: () = {
+ };
+//^ const _
+
+mod m {
+  }
+//^ mod m
+
+m! {}
+m!();
+m!(
+ );
+//^ m!
+
+m! {
+  }
+//^ m!
+
+fn f() {
+    let v = vec![
+    ];
+  }
+//^ fn f
 "#,
         );
     }

@@ -104,7 +104,8 @@ Set to `"all"` to pass `--all-features` to cargo.
 [[rust-analyzer.checkOnSave.noDefaultFeatures]]rust-analyzer.checkOnSave.noDefaultFeatures (default: `null`)::
 +
 --
-Do not activate the `default` feature.
+Whether to pass `--no-default-features` to cargo. Defaults to
+`#rust-analyzer.cargo.noDefaultFeatures#`.
 --
 [[rust-analyzer.checkOnSave.overrideCommand]]rust-analyzer.checkOnSave.overrideCommand (default: `null`)::
 +
@@ -278,7 +279,7 @@ Enables highlighting of all break points for a loop or block context while the c
 +
 --
 Whether to show `Debug` action. Only applies when
-`#rust-analyzer.hoverActions.enable#` is set.
+`#rust-analyzer.hover.actions.enable#` is set.
 --
 [[rust-analyzer.hover.actions.enable]]rust-analyzer.hover.actions.enable (default: `true`)::
 +
@@ -289,25 +290,25 @@ Whether to show HoverActions in Rust files.
 +
 --
 Whether to show `Go to Type Definition` action. Only applies when
-`#rust-analyzer.hoverActions.enable#` is set.
+`#rust-analyzer.hover.actions.enable#` is set.
 --
 [[rust-analyzer.hover.actions.implementations.enable]]rust-analyzer.hover.actions.implementations.enable (default: `true`)::
 +
 --
 Whether to show `Implementations` action. Only applies when
-`#rust-analyzer.hoverActions.enable#` is set.
+`#rust-analyzer.hover.actions.enable#` is set.
 --
 [[rust-analyzer.hover.actions.references.enable]]rust-analyzer.hover.actions.references.enable (default: `false`)::
 +
 --
 Whether to show `References` action. Only applies when
-`#rust-analyzer.hoverActions.enable#` is set.
+`#rust-analyzer.hover.actions.enable#` is set.
 --
 [[rust-analyzer.hover.actions.run.enable]]rust-analyzer.hover.actions.run.enable (default: `true`)::
 +
 --
 Whether to show `Run` action. Only applies when
-`#rust-analyzer.hoverActions.enable#` is set.
+`#rust-analyzer.hover.actions.enable#` is set.
 --
 [[rust-analyzer.hover.documentation.enable]]rust-analyzer.hover.documentation.enable (default: `true`)::
 +
@@ -344,10 +345,26 @@ Whether to allow import insertion to merge new imports into single path glob imp
 --
 The path structure for newly inserted paths to use.
 --
+[[rust-analyzer.inlayHints.bindingModeHints.enable]]rust-analyzer.inlayHints.bindingModeHints.enable (default: `false`)::
++
+--
+Whether to show inlay type hints for binding modes.
+--
 [[rust-analyzer.inlayHints.chainingHints.enable]]rust-analyzer.inlayHints.chainingHints.enable (default: `true`)::
 +
 --
 Whether to show inlay type hints for method chains.
+--
+[[rust-analyzer.inlayHints.closingBraceHints.enable]]rust-analyzer.inlayHints.closingBraceHints.enable (default: `true`)::
++
+--
+Whether to show inlay hints after a closing `}` to indicate what item it belongs to.
+--
+[[rust-analyzer.inlayHints.closingBraceHints.minLines]]rust-analyzer.inlayHints.closingBraceHints.minLines (default: `25`)::
++
+--
+Minimum number of lines required before the `}` until the hint is shown (set to 0 or 1
+to always show them).
 --
 [[rust-analyzer.inlayHints.closureReturnTypeHints.enable]]rust-analyzer.inlayHints.closureReturnTypeHints.enable (default: `false`)::
 +

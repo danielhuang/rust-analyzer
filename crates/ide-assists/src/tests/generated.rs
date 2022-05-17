@@ -3,6 +3,26 @@
 use super::check_doc_test;
 
 #[test]
+fn doctest_add_attribute() {
+    check_doc_test(
+        "add_derive",
+        r#####"
+struct Point {
+    x: u32,
+    y: u32,$0
+}
+"#####,
+        r#####"
+#[derive($0)]
+struct Point {
+    x: u32,
+    y: u32,
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_add_explicit_type() {
     check_doc_test(
         "add_explicit_type",
@@ -359,6 +379,26 @@ fn main() {
     for (x, y) in iter {
         println!("x: {}, y: {}", x, y);
     }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_let_else_to_match() {
+    check_doc_test(
+        "convert_let_else_to_match",
+        r#####"
+fn main() {
+    let Ok(mut x) = f() else$0 { return };
+}
+"#####,
+        r#####"
+fn main() {
+    let mut x = match f() {
+        Ok(x) => x,
+        _ => return,
+    };
 }
 "#####,
     )
@@ -799,6 +839,7 @@ fn doctest_generate_deref() {
     check_doc_test(
         "generate_deref",
         r#####"
+//- minicore: deref, deref_mut
 struct A;
 struct B {
    $0a: A
@@ -810,32 +851,12 @@ struct B {
    a: A
 }
 
-impl std::ops::Deref for B {
+impl core::ops::Deref for B {
     type Target = A;
 
     fn deref(&self) -> &Self::Target {
         &self.a
     }
-}
-"#####,
-    )
-}
-
-#[test]
-fn doctest_generate_derive() {
-    check_doc_test(
-        "generate_derive",
-        r#####"
-struct Point {
-    x: u32,
-    y: u32,$0
-}
-"#####,
-        r#####"
-#[derive($0)]
-struct Point {
-    x: u32,
-    y: u32,
 }
 "#####,
     )
@@ -1036,8 +1057,6 @@ struct Person {
 }
 
 impl Person {
-    /// Get a reference to the person's name.
-    #[must_use]
     fn $0name(&self) -> &str {
         self.name.as_ref()
     }
@@ -1061,8 +1080,6 @@ struct Person {
 }
 
 impl Person {
-    /// Get a mutable reference to the person's name.
-    #[must_use]
     fn $0name_mut(&mut self) -> &mut String {
         &mut self.name
     }
@@ -1160,7 +1177,6 @@ struct Person {
 }
 
 impl Person {
-    /// Set the person's name.
     fn set_name(&mut self, name: String) {
         self.name = name;
     }

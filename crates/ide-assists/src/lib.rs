@@ -106,6 +106,8 @@ mod handlers {
     mod add_explicit_type;
     mod add_lifetime_to_type;
     mod add_missing_impl_members;
+    mod add_missing_match_arms;
+    mod add_attribute;
     mod add_turbo_fish;
     mod apply_demorgan;
     mod auto_import;
@@ -115,6 +117,7 @@ mod handlers {
     mod convert_integer_literal;
     mod convert_into_to_from;
     mod convert_iter_for_each_to_for;
+    mod convert_let_else_to_match;
     mod convert_tuple_struct_to_named_struct;
     mod convert_to_guarded_return;
     mod convert_while_to_loop;
@@ -125,7 +128,6 @@ mod handlers {
     mod extract_struct_from_enum_variant;
     mod extract_type_alias;
     mod extract_variable;
-    mod add_missing_match_arms;
     mod fix_visibility;
     mod flip_binexpr;
     mod flip_comma;
@@ -134,7 +136,6 @@ mod handlers {
     mod generate_default_from_enum_variant;
     mod generate_default_from_new;
     mod generate_deref;
-    mod generate_derive;
     mod generate_documentation_template;
     mod generate_enum_is_method;
     mod generate_enum_projection_method;
@@ -190,6 +191,7 @@ mod handlers {
     pub(crate) fn all() -> &'static [Handler] {
         &[
             // These are alphabetic for the foolish consistency
+            add_attribute::add_attribute,
             add_explicit_type::add_explicit_type,
             add_missing_match_arms::add_missing_match_arms,
             add_lifetime_to_type::add_lifetime_to_type,
@@ -205,6 +207,7 @@ mod handlers {
             convert_into_to_from::convert_into_to_from,
             convert_iter_for_each_to_for::convert_iter_for_each_to_for,
             convert_iter_for_each_to_for::convert_for_loop_with_for_each,
+            convert_let_else_to_match::convert_let_else_to_match,
             convert_to_guarded_return::convert_to_guarded_return,
             convert_tuple_struct_to_named_struct::convert_tuple_struct_to_named_struct,
             convert_while_to_loop::convert_while_to_loop,
@@ -219,7 +222,6 @@ mod handlers {
             generate_constant::generate_constant,
             generate_default_from_enum_variant::generate_default_from_enum_variant,
             generate_default_from_new::generate_default_from_new,
-            generate_derive::generate_derive,
             generate_documentation_template::generate_documentation_template,
             generate_enum_is_method::generate_enum_is_method,
             generate_enum_projection_method::generate_enum_as_method,

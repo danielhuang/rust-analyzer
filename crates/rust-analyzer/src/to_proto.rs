@@ -358,7 +358,11 @@ pub(crate) fn signature_help(
             let params = call_info
                 .parameter_ranges()
                 .iter()
-                .map(|it| [u32::from(it.start()), u32::from(it.end())])
+                .map(|it| {
+                    let start = call_info.signature[..it.start().into()].chars().count() as u32;
+                    let end = call_info.signature[..it.end().into()].chars().count() as u32;
+                    [start, end]
+                })
                 .map(|label_offsets| lsp_types::ParameterInformation {
                     label: lsp_types::ParameterLabel::LabelOffsets(label_offsets),
                     documentation: None,
@@ -375,9 +379,9 @@ pub(crate) fn signature_help(
                     label.push_str(", ");
                 }
                 first = false;
-                let start = label.len() as u32;
+                let start = label.chars().count() as u32;
                 label.push_str(param);
-                let end = label.len() as u32;
+                let end = label.chars().count() as u32;
                 params.push(lsp_types::ParameterInformation {
                     label: lsp_types::ParameterLabel::LabelOffsets([start, end]),
                     documentation: None,
@@ -411,58 +415,78 @@ pub(crate) fn signature_help(
 }
 
 pub(crate) fn inlay_hint(
-    render_colons: bool,
     line_index: &LineIndex,
+    text_document: &lsp_types::TextDocumentIdentifier,
+    render_colons: bool,
     inlay_hint: InlayHint,
 ) -> lsp_types::InlayHint {
     lsp_types::InlayHint {
         position: match inlay_hint.kind {
             // before annotated thing
-            InlayKind::ParameterHint | InlayKind::ImplicitReborrow => {
-                position(line_index, inlay_hint.range.start())
-            }
+            InlayKind::ParameterHint
+            | InlayKind::ImplicitReborrowHint
+            | InlayKind::BindingModeHint => position(line_index, inlay_hint.range.start()),
             // after annotated thing
             InlayKind::ClosureReturnTypeHint
             | InlayKind::TypeHint
             | InlayKind::ChainingHint
             | InlayKind::GenericParamListHint
-            | InlayKind::LifetimeHint => position(line_index, inlay_hint.range.end()),
+            | InlayKind::LifetimeHint
+            | InlayKind::ClosingBraceHint => position(line_index, inlay_hint.range.end()),
         },
+        padding_left: Some(match inlay_hint.kind {
+            InlayKind::TypeHint => !render_colons,
+            InlayKind::ChainingHint | InlayKind::ClosingBraceHint => true,
+            InlayKind::BindingModeHint
+            | InlayKind::ClosureReturnTypeHint
+            | InlayKind::GenericParamListHint
+            | InlayKind::ImplicitReborrowHint
+            | InlayKind::LifetimeHint
+            | InlayKind::ParameterHint => false,
+        }),
+        padding_right: Some(match inlay_hint.kind {
+            InlayKind::ChainingHint
+            | InlayKind::ClosureReturnTypeHint
+            | InlayKind::GenericParamListHint
+            | InlayKind::ImplicitReborrowHint
+            | InlayKind::TypeHint
+            | InlayKind::ClosingBraceHint => false,
+            InlayKind::BindingModeHint => inlay_hint.label != "&",
+            InlayKind::ParameterHint | InlayKind::LifetimeHint => true,
+        }),
         label: lsp_types::InlayHintLabel::String(match inlay_hint.kind {
             InlayKind::ParameterHint if render_colons => format!("{}:", inlay_hint.label),
             InlayKind::TypeHint if render_colons => format!(": {}", inlay_hint.label),
             InlayKind::ClosureReturnTypeHint => format!(" -> {}", inlay_hint.label),
-            _ => inlay_hint.label.to_string(),
+            _ => inlay_hint.label.clone(),
         }),
         kind: match inlay_hint.kind {
             InlayKind::ParameterHint => Some(lsp_types::InlayHintKind::PARAMETER),
             InlayKind::ClosureReturnTypeHint | InlayKind::TypeHint | InlayKind::ChainingHint => {
                 Some(lsp_types::InlayHintKind::TYPE)
             }
-            InlayKind::GenericParamListHint
+            InlayKind::BindingModeHint
+            | InlayKind::GenericParamListHint
             | InlayKind::LifetimeHint
-            | InlayKind::ImplicitReborrow => None,
+            | InlayKind::ImplicitReborrowHint
+            | InlayKind::ClosingBraceHint => None,
         },
-        tooltip: None,
-        padding_left: Some(match inlay_hint.kind {
-            InlayKind::TypeHint => !render_colons,
-            InlayKind::ParameterHint | InlayKind::ClosureReturnTypeHint => false,
-            InlayKind::ChainingHint => true,
-            InlayKind::GenericParamListHint => false,
-            InlayKind::LifetimeHint => false,
-            InlayKind::ImplicitReborrow => false,
-        }),
-        padding_right: Some(match inlay_hint.kind {
-            InlayKind::TypeHint | InlayKind::ChainingHint | InlayKind::ClosureReturnTypeHint => {
-                false
-            }
-            InlayKind::ParameterHint => true,
-            InlayKind::LifetimeHint => true,
-            InlayKind::GenericParamListHint => false,
-            InlayKind::ImplicitReborrow => false,
-        }),
         text_edits: None,
-        data: None,
+        tooltip: Some(lsp_types::InlayHintTooltip::String(inlay_hint.label)),
+        data: inlay_hint.hover_trigger.map(|range_or_offset| {
+            to_value(lsp_ext::InlayHintResolveData {
+                text_document: text_document.clone(),
+                position: match range_or_offset {
+                    ide::RangeOrOffset::Offset(offset) => {
+                        lsp_ext::PositionOrRange::Position(position(line_index, offset))
+                    }
+                    ide::RangeOrOffset::Range(text_range) => {
+                        lsp_ext::PositionOrRange::Range(range(line_index, text_range))
+                    }
+                },
+            })
+            .unwrap()
+        }),
     }
 }
 

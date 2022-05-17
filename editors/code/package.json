@@ -1,15 +1,14 @@
 {
     "name": "rust-analyzer",
     "displayName": "rust-analyzer",
-    "description": "An alternative rust language server to the RLS",
-    "preview": true,
+    "description": "Rust language support for Visual Studio Code",
     "private": true,
     "icon": "icon.png",
-    "version": "0.4.0-dev",
+    "version": "0.5.0-dev",
     "releaseTag": null,
-    "publisher": "matklad",
+    "publisher": "rust-lang",
     "repository": {
-        "url": "https://github.com/rust-analyzer/rust-analyzer.git",
+        "url": "https://github.com/rust-lang/rust-analyzer.git",
         "type": "git"
     },
     "homepage": "https://rust-analyzer.github.io/",
@@ -30,8 +29,8 @@
         "build-base": "esbuild ./src/main.ts --bundle --outfile=out/main.js --external:vscode --format=cjs --platform=node --target=node16",
         "build": "npm run build-base -- --sourcemap",
         "watch": "npm run build-base -- --sourcemap --watch",
-        "lint": "tsfmt --verify && eslint -c .eslintrc.js --ext ts ./src ./tests",
-        "fix": " tsfmt -r       && eslint -c .eslintrc.js --ext ts ./src ./tests --fix",
+        "lint": "prettier --check . && eslint -c .eslintrc.js --ext ts ./src ./tests",
+        "fix": "prettier --write . && eslint -c .eslintrc.js --ext ts ./src ./tests --fix",
         "pretest": "tsc && npm run build",
         "test": "cross-env TEST_VARIABLE=test node ./out/tests/runTests.js"
     },
@@ -49,9 +48,10 @@
         "cross-env": "^7.0.3",
         "esbuild": "^0.14.27",
         "eslint": "^8.11.0",
+        "eslint-config-prettier": "^8.5.0",
+        "prettier": "^2.6.2",
         "tslib": "^2.3.0",
         "typescript": "^4.6.3",
-        "typescript-formatter": "^7.2.2",
         "vsce": "^2.7.0"
     },
     "activationEvents": [
@@ -423,18 +423,22 @@
                 "rust-analyzer.cargo.features": {
                     "markdownDescription": "List of features to activate.\n\nSet this to `\"all\"` to pass `--all-features` to cargo.",
                     "default": [],
-                    "type": [
-                        "string",
-                        "array"
-                    ],
-                    "items": {
-                        "type": "string"
-                    },
-                    "enum": [
-                        "all"
-                    ],
-                    "enumDescriptions": [
-                        "Pass `--all-features` to cargo"
+                    "anyOf": [
+                        {
+                            "type": "string",
+                            "enum": [
+                                "all"
+                            ],
+                            "enumDescriptions": [
+                                "Pass `--all-features` to cargo"
+                            ]
+                        },
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "string"
+                            }
+                        }
                     ]
                 },
                 "rust-analyzer.cargo.noDefaultFeatures": {
@@ -513,7 +517,7 @@
                     ]
                 },
                 "rust-analyzer.checkOnSave.noDefaultFeatures": {
-                    "markdownDescription": "Do not activate the `default` feature.",
+                    "markdownDescription": "Whether to pass `--no-default-features` to cargo. Defaults to\n`#rust-analyzer.cargo.noDefaultFeatures#`.",
                     "default": null,
                     "type": [
                         "null",
@@ -552,21 +556,16 @@
                 "rust-analyzer.completion.callable.snippets": {
                     "markdownDescription": "Whether to add parenthesis and argument snippets when completing function.",
                     "default": "fill_arguments",
-                    "anyOf": [
-                        {
-                            "type": "string",
-                            "enum": [
-                                "fill_arguments",
-                                "add_parentheses"
-                            ],
-                            "enumDescriptions": [
-                                "Add call parentheses and pre-fill arguments",
-                                "Add call parentheses"
-                            ]
-                        },
-                        {
-                            "type": "null"
-                        }
+                    "type": "string",
+                    "enum": [
+                        "fill_arguments",
+                        "add_parentheses",
+                        "none"
+                    ],
+                    "enumDescriptions": [
+                        "Add call parentheses and pre-fill arguments.",
+                        "Add call parentheses.",
+                        "Do no snippet completions for callables."
                     ]
                 },
                 "rust-analyzer.completion.postfix.enable": {
@@ -698,7 +697,7 @@
                     "type": "boolean"
                 },
                 "rust-analyzer.hover.actions.debug.enable": {
-                    "markdownDescription": "Whether to show `Debug` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
+                    "markdownDescription": "Whether to show `Debug` action. Only applies when\n`#rust-analyzer.hover.actions.enable#` is set.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -708,22 +707,22 @@
                     "type": "boolean"
                 },
                 "rust-analyzer.hover.actions.gotoTypeDef.enable": {
-                    "markdownDescription": "Whether to show `Go to Type Definition` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
+                    "markdownDescription": "Whether to show `Go to Type Definition` action. Only applies when\n`#rust-analyzer.hover.actions.enable#` is set.",
                     "default": true,
                     "type": "boolean"
                 },
                 "rust-analyzer.hover.actions.implementations.enable": {
-                    "markdownDescription": "Whether to show `Implementations` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
+                    "markdownDescription": "Whether to show `Implementations` action. Only applies when\n`#rust-analyzer.hover.actions.enable#` is set.",
                     "default": true,
                     "type": "boolean"
                 },
                 "rust-analyzer.hover.actions.references.enable": {
-                    "markdownDescription": "Whether to show `References` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
+                    "markdownDescription": "Whether to show `References` action. Only applies when\n`#rust-analyzer.hover.actions.enable#` is set.",
                     "default": false,
                     "type": "boolean"
                 },
                 "rust-analyzer.hover.actions.run.enable": {
-                    "markdownDescription": "Whether to show `Run` action. Only applies when\n`#rust-analyzer.hoverActions.enable#` is set.",
+                    "markdownDescription": "Whether to show `Run` action. Only applies when\n`#rust-analyzer.hover.actions.enable#` is set.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -784,10 +783,26 @@
                         "Force import paths to be absolute by always starting them with `crate` or the extern crate name they come from."
                     ]
                 },
+                "rust-analyzer.inlayHints.bindingModeHints.enable": {
+                    "markdownDescription": "Whether to show inlay type hints for binding modes.",
+                    "default": false,
+                    "type": "boolean"
+                },
                 "rust-analyzer.inlayHints.chainingHints.enable": {
                     "markdownDescription": "Whether to show inlay type hints for method chains.",
                     "default": true,
                     "type": "boolean"
+                },
+                "rust-analyzer.inlayHints.closingBraceHints.enable": {
+                    "markdownDescription": "Whether to show inlay hints after a closing `}` to indicate what item it belongs to.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.inlayHints.closingBraceHints.minLines": {
+                    "markdownDescription": "Minimum number of lines required before the `}` until the hint is shown (set to 0 or 1\nto always show them).",
+                    "default": 25,
+                    "type": "integer",
+                    "minimum": 0
                 },
                 "rust-analyzer.inlayHints.closureReturnTypeHints.enable": {
                     "markdownDescription": "Whether to show inlay type hints for return types of closures with blocks.",
@@ -797,23 +812,16 @@
                 "rust-analyzer.inlayHints.lifetimeElisionHints.enable": {
                     "markdownDescription": "Whether to show inlay type hints for elided lifetimes in function signatures.",
                     "default": "never",
-                    "anyOf": [
-                        {
-                            "type": "string",
-                            "enum": [
-                                "always",
-                                "never",
-                                "skip_trivial"
-                            ],
-                            "enumDescriptions": [
-                                "Always show lifetime elision hints.",
-                                "Never show lifetime elision hints.",
-                                "Only show lifetime elision hints if a return type is involved."
-                            ]
-                        },
-                        {
-                            "type": "boolean"
-                        }
+                    "type": "string",
+                    "enum": [
+                        "always",
+                        "never",
+                        "skip_trivial"
+                    ],
+                    "enumDescriptions": [
+                        "Always show lifetime elision hints.",
+                        "Never show lifetime elision hints.",
+                        "Only show lifetime elision hints if a return type is involved."
                     ]
                 },
                 "rust-analyzer.inlayHints.lifetimeElisionHints.useParameterNames": {
@@ -838,23 +846,16 @@
                 "rust-analyzer.inlayHints.reborrowHints.enable": {
                     "markdownDescription": "Whether to show inlay type hints for compiler inserted reborrows.",
                     "default": "never",
-                    "anyOf": [
-                        {
-                            "type": "string",
-                            "enum": [
-                                "always",
-                                "never",
-                                "mutable"
-                            ],
-                            "enumDescriptions": [
-                                "Always show reborrow hints.",
-                                "Never show reborrow hints.",
-                                "Only show mutable reborrow hints."
-                            ]
-                        },
-                        {
-                            "type": "boolean"
-                        }
+                    "type": "string",
+                    "enum": [
+                        "always",
+                        "never",
+                        "mutable"
+                    ],
+                    "enumDescriptions": [
+                        "Always show reborrow hints.",
+                        "Never show reborrow hints.",
+                        "Only show mutable reborrow hints."
                     ]
                 },
                 "rust-analyzer.inlayHints.renderColons": {
@@ -1065,8 +1066,8 @@
                         "all_symbols"
                     ],
                     "enumDescriptions": [
-                        "Search for types only",
-                        "Search for all symbols kinds"
+                        "Search for types only.",
+                        "Search for all symbols kinds."
                     ]
                 },
                 "rust-analyzer.workspace.symbol.search.limit": {
@@ -1084,8 +1085,8 @@
                         "workspace_and_dependencies"
                     ],
                     "enumDescriptions": [
-                        "Search in current workspace only",
-                        "Search in current workspace and dependencies"
+                        "Search in current workspace only.",
+                        "Search in current workspace and dependencies."
                     ]
                 },
                 "$generated-end": {}

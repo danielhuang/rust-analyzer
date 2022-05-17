@@ -226,7 +226,6 @@ fn assist_order_field_struct() {
     assert_eq!(assists.next().expect("expected assist").label, "Generate a getter method");
     assert_eq!(assists.next().expect("expected assist").label, "Generate a mut getter method");
     assert_eq!(assists.next().expect("expected assist").label, "Generate a setter method");
-    assert_eq!(assists.next().expect("expected assist").label, "Generate `Deref` impl using `bar`");
     assert_eq!(assists.next().expect("expected assist").label, "Add `#[derive]`");
 }
 
@@ -252,6 +251,7 @@ pub fn test_some_range(a: int) -> bool {
         Extract into variable
         Extract into function
         Replace if let with match
+        Add attribute
     "#]]
     .assert_eq(&expected);
 }

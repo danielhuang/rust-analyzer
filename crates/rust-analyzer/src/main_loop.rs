@@ -370,11 +370,13 @@ impl GlobalState {
                 loop {
                     match task {
                         flycheck::Message::AddDiagnostic { workspace_root, diagnostic } => {
+                            let snap = self.snapshot();
                             let diagnostics =
                                 crate::diagnostics::to_proto::map_rust_diagnostic_to_lsp(
                                     &self.config.diagnostics_map(),
                                     &diagnostic,
                                     &workspace_root,
+                                    &snap,
                                 );
                             for diag in diagnostics {
                                 match url_to_file_id(&self.vfs.read().0, &diag.url) {
@@ -610,6 +612,7 @@ impl GlobalState {
             .on::<lsp_types::request::GotoImplementation>(handlers::handle_goto_implementation)
             .on::<lsp_types::request::GotoTypeDefinition>(handlers::handle_goto_type_definition)
             .on::<lsp_types::request::InlayHintRequest>(handlers::handle_inlay_hints)
+            .on::<lsp_types::request::InlayHintResolveRequest>(handlers::handle_inlay_hints_resolve)
             .on::<lsp_types::request::Completion>(handlers::handle_completion)
             .on::<lsp_types::request::ResolveCompletionItem>(handlers::handle_completion_resolve)
             .on::<lsp_types::request::CodeLensRequest>(handlers::handle_code_lens)

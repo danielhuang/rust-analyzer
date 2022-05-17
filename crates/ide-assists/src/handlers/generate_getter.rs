@@ -38,8 +38,6 @@ use crate::{
 // }
 //
 // impl Person {
-//     /// Get a reference to the person's name.
-//     #[must_use]
 //     fn $0name(&self) -> &str {
 //         self.name.as_ref()
 //     }
@@ -65,8 +63,6 @@ pub(crate) fn generate_getter(acc: &mut Assists, ctx: &AssistContext) -> Option<
 // }
 //
 // impl Person {
-//     /// Get a mutable reference to the person's name.
-//     #[must_use]
 //     fn $0name_mut(&mut self) -> &mut String {
 //         &mut self.name
 //     }
@@ -84,7 +80,6 @@ pub(crate) fn generate_getter_impl(
     let strukt = ctx.find_node_at_offset::<ast::Struct>()?;
     let field = ctx.find_node_at_offset::<ast::RecordField>()?;
 
-    let strukt_name = strukt.name()?;
     let field_name = field.name()?;
     let field_ty = field.ty()?;
 
@@ -114,12 +109,8 @@ pub(crate) fn generate_getter_impl(
             }
 
             let vis = strukt.visibility().map_or(String::new(), |v| format!("{} ", v));
-            let (ty, body, description) = if mutable {
-                (
-                    format!("&mut {}", field_ty),
-                    format!("&mut self.{}", field_name),
-                    "a mutable reference to ",
-                )
+            let (ty, body) = if mutable {
+                (format!("&mut {}", field_ty), format!("&mut self.{}", field_name))
             } else {
                 (|| {
                     let krate = ctx.sema.scope(field_ty.syntax())?.krate();
@@ -132,25 +123,17 @@ pub(crate) fn generate_getter_impl(
                             (
                                 conversion.convert_type(ctx.db()),
                                 conversion.getter(field_name.to_string()),
-                                if conversion.is_copy() { "" } else { "a reference to " },
                             )
                         })
                 })()
-                .unwrap_or_else(|| {
-                    (format!("&{}", field_ty), format!("&self.{}", field_name), "a reference to ")
-                })
+                .unwrap_or_else(|| (format!("&{}", field_ty), format!("&self.{}", field_name)))
             };
 
             format_to!(
                 buf,
-                "    /// Get {}the {}'s {}.
-    #[must_use]
-    {}fn {}(&{}self) -> {} {{
+                "    {}fn {}(&{}self) -> {} {{
         {}
     }}",
-                description,
-                to_lower_snake_case(&strukt_name.to_string()).replace('_', " "),
-                fn_name.trim_end_matches("_mut").replace('_', " "),
                 vis,
                 fn_name,
                 mutable.then(|| "mut ").unwrap_or_default(),
@@ -196,8 +179,6 @@ struct Context {
 }
 
 impl Context {
-    /// Get a reference to the context's data.
-    #[must_use]
     fn $0data(&self) -> &Data {
         &self.data
     }
@@ -218,8 +199,6 @@ struct Context {
 }
 
 impl Context {
-    /// Get a mutable reference to the context's data.
-    #[must_use]
     fn $0data_mut(&mut self) -> &mut Data {
         &mut self.data
     }
@@ -253,7 +232,6 @@ struct Context {
 }
 
 impl Context {
-    #[must_use]
     fn data_mut(&mut self) -> &mut Data {
         &mut self.data
     }
@@ -277,8 +255,6 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    /// Get a reference to the context's data.
-    #[must_use]
     pub(crate) fn $0data(&self) -> &Data {
         &self.data
     }
@@ -298,8 +274,6 @@ struct Context {
 }
 
 impl Context {
-    /// Get a reference to the context's data.
-    #[must_use]
     fn data(&self) -> &Data {
         &self.data
     }
@@ -312,14 +286,10 @@ struct Context {
 }
 
 impl Context {
-    /// Get a reference to the context's data.
-    #[must_use]
     fn data(&self) -> &Data {
         &self.data
     }
 
-    /// Get a reference to the context's count.
-    #[must_use]
     fn $0count(&self) -> &usize {
         &self.count
     }
@@ -345,8 +315,6 @@ pub struct String;
 struct S { foo: String }
 
 impl S {
-    /// Get a reference to the s's foo.
-    #[must_use]
     fn $0foo(&self) -> &String {
         &self.foo
     }
@@ -370,8 +338,6 @@ struct S { foo: $0bool }
 struct S { foo: bool }
 
 impl S {
-    /// Get the s's foo.
-    #[must_use]
     fn $0foo(&self) -> bool {
         self.foo
     }
@@ -404,8 +370,6 @@ impl AsRef<str> for String {
 struct S { foo: String }
 
 impl S {
-    /// Get a reference to the s's foo.
-    #[must_use]
     fn $0foo(&self) -> &str {
         self.foo.as_ref()
     }
@@ -442,8 +406,6 @@ impl<T> AsRef<T> for Box<T> {
 struct S { foo: Box<Sweets> }
 
 impl S {
-    /// Get a reference to the s's foo.
-    #[must_use]
     fn $0foo(&self) -> &Sweets {
         self.foo.as_ref()
     }
@@ -476,8 +438,6 @@ impl<T> AsRef<[T]> for Vec<T> {
 struct S { foo: Vec<()> }
 
 impl S {
-    /// Get a reference to the s's foo.
-    #[must_use]
     fn $0foo(&self) -> &[()] {
         self.foo.as_ref()
     }
@@ -500,8 +460,6 @@ struct Failure;
 struct S { foo: Option<Failure> }
 
 impl S {
-    /// Get a reference to the s's foo.
-    #[must_use]
     fn $0foo(&self) -> Option<&Failure> {
         self.foo.as_ref()
     }
@@ -524,8 +482,6 @@ struct Context {
 }
 
 impl Context {
-    /// Get a reference to the context's data.
-    #[must_use]
     fn $0data(&self) -> Result<&bool, &i32> {
         self.data.as_ref()
     }

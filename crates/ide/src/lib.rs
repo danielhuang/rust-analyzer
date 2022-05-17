@@ -80,7 +80,9 @@ pub use crate::{
     folding_ranges::{Fold, FoldKind},
     highlight_related::{HighlightRelatedConfig, HighlightedRange},
     hover::{HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult},
-    inlay_hints::{InlayHint, InlayHintsConfig, InlayKind, LifetimeElisionHints, ReborrowHints},
+    inlay_hints::{
+        InlayHint, InlayHintsConfig, InlayKind, LifetimeElisionHints, RangeOrOffset, ReborrowHints,
+    },
     join_lines::JoinLinesConfig,
     markup::Markup,
     moniker::{MonikerKind, MonikerResult, PackageInformation},
@@ -102,8 +104,8 @@ pub use ide_assists::{
     Assist, AssistConfig, AssistId, AssistKind, AssistResolveStrategy, SingleResolve,
 };
 pub use ide_completion::{
-    CompletionConfig, CompletionItem, CompletionItemKind, CompletionRelevance, Snippet,
-    SnippetScope,
+    CallableSnippets, CompletionConfig, CompletionItem, CompletionItemKind, CompletionRelevance,
+    Snippet, SnippetScope,
 };
 pub use ide_db::{
     base_db::{

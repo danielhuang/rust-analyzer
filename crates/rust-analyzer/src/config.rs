@@ -11,8 +11,9 @@ use std::{ffi::OsString, fmt, iter, path::PathBuf};
 
 use flycheck::FlycheckConfig;
 use ide::{
-    AssistConfig, CompletionConfig, DiagnosticsConfig, ExprFillDefaultMode, HighlightRelatedConfig,
-    HoverConfig, HoverDocFormat, InlayHintsConfig, JoinLinesConfig, Snippet, SnippetScope,
+    AssistConfig, CallableSnippets, CompletionConfig, DiagnosticsConfig, ExprFillDefaultMode,
+    HighlightRelatedConfig, HoverConfig, HoverDocFormat, InlayHintsConfig, JoinLinesConfig,
+    Snippet, SnippetScope,
 };
 use ide_db::{
     imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
@@ -108,7 +109,8 @@ config_data! {
         ///
         /// Set to `"all"` to pass `--all-features` to cargo.
         checkOnSave_features: Option<CargoFeatures>      = "null",
-        /// Do not activate the `default` feature.
+        /// Whether to pass `--no-default-features` to cargo. Defaults to
+        /// `#rust-analyzer.cargo.noDefaultFeatures#`.
         checkOnSave_noDefaultFeatures: Option<bool>      = "null",
         /// Override the command rust-analyzer uses to  run build scripts and
         /// build procedural macros. The command is required to output json
@@ -133,7 +135,7 @@ config_data! {
         /// with `self` prefixed to them when inside a method.
         completion_autoself_enable: bool        = "true",
         /// Whether to add parenthesis and argument snippets when completing function.
-        completion_callable_snippets: Option<CallableCompletionDef>  = "\"fill_arguments\"",
+        completion_callable_snippets: CallableCompletionDef  = "\"fill_arguments\"",
         /// Whether to show postfix snippets like `dbg`, `if`, `not`, etc.
         completion_postfix_enable: bool         = "true",
         /// Enables completions of private items and fields that are defined in the current workspace even if they are not visible at the current position.
@@ -220,21 +222,21 @@ config_data! {
         highlightRelated_yieldPoints_enable: bool = "true",
 
         /// Whether to show `Debug` action. Only applies when
-        /// `#rust-analyzer.hoverActions.enable#` is set.
+        /// `#rust-analyzer.hover.actions.enable#` is set.
         hover_actions_debug_enable: bool           = "true",
         /// Whether to show HoverActions in Rust files.
         hover_actions_enable: bool          = "true",
         /// Whether to show `Go to Type Definition` action. Only applies when
-        /// `#rust-analyzer.hoverActions.enable#` is set.
+        /// `#rust-analyzer.hover.actions.enable#` is set.
         hover_actions_gotoTypeDef_enable: bool     = "true",
         /// Whether to show `Implementations` action. Only applies when
-        /// `#rust-analyzer.hoverActions.enable#` is set.
+        /// `#rust-analyzer.hover.actions.enable#` is set.
         hover_actions_implementations_enable: bool = "true",
         /// Whether to show `References` action. Only applies when
-        /// `#rust-analyzer.hoverActions.enable#` is set.
+        /// `#rust-analyzer.hover.actions.enable#` is set.
         hover_actions_references_enable: bool      = "false",
         /// Whether to show `Run` action. Only applies when
-        /// `#rust-analyzer.hoverActions.enable#` is set.
+        /// `#rust-analyzer.hover.actions.enable#` is set.
         hover_actions_run_enable: bool             = "true",
 
         /// Whether to show documentation on hover.
@@ -253,8 +255,15 @@ config_data! {
         /// The path structure for newly inserted paths to use.
         imports_prefix: ImportPrefixDef               = "\"plain\"",
 
+        /// Whether to show inlay type hints for binding modes.
+        inlayHints_bindingModeHints_enable: bool                   = "false",
         /// Whether to show inlay type hints for method chains.
         inlayHints_chainingHints_enable: bool                      = "true",
+        /// Whether to show inlay hints after a closing `}` to indicate what item it belongs to.
+        inlayHints_closingBraceHints_enable: bool                  = "true",
+        /// Minimum number of lines required before the `}` until the hint is shown (set to 0 or 1
+        /// to always show them).
+        inlayHints_closingBraceHints_minLines: usize               = "25",
         /// Whether to show inlay type hints for return types of closures with blocks.
         inlayHints_closureReturnTypeHints_enable: bool             = "false",
         /// Whether to show inlay type hints for elided lifetimes in function signatures.
@@ -996,10 +1005,16 @@ impl Config {
                 ReborrowHintsDef::Never => ide::ReborrowHints::Never,
                 ReborrowHintsDef::Mutable => ide::ReborrowHints::MutableOnly,
             },
+            binding_mode_hints: self.data.inlayHints_bindingModeHints_enable,
             param_names_for_lifetime_elision_hints: self
                 .data
                 .inlayHints_lifetimeElisionHints_useParameterNames,
             max_length: self.data.inlayHints_maxLength,
+            closing_brace_hints_min_lines: if self.data.inlayHints_closingBraceHints_enable {
+                Some(self.data.inlayHints_closingBraceHints_minLines)
+            } else {
+                None
+            },
         }
     }
 
@@ -1029,14 +1044,11 @@ impl Config {
                 && completion_item_edit_resolve(&self.caps),
             enable_self_on_the_fly: self.data.completion_autoself_enable,
             enable_private_editable: self.data.completion_privateEditable_enable,
-            add_call_parenthesis: matches!(
-                self.data.completion_callable_snippets,
-                Some(CallableCompletionDef::AddParentheses)
-            ),
-            add_call_argument_snippets: matches!(
-                self.data.completion_callable_snippets,
-                Some(CallableCompletionDef::FillArguments)
-            ),
+            callable: match self.data.completion_callable_snippets {
+                CallableCompletionDef::FillArguments => Some(CallableSnippets::FillArguments),
+                CallableCompletionDef::AddParentheses => Some(CallableSnippets::AddParentheses),
+                CallableCompletionDef::None => None,
+            },
             insert_use: self.insert_use_config(),
             snippet_cap: SnippetCap::new(try_or_def!(
                 self.caps
@@ -1383,11 +1395,12 @@ enum ImportGranularityDef {
     Module,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Copy, Clone)]
 #[serde(rename_all = "snake_case")]
 enum CallableCompletionDef {
     FillArguments,
     AddParentheses,
+    None,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1665,16 +1678,16 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "type": "string",
             "enum": ["workspace", "workspace_and_dependencies"],
             "enumDescriptions": [
-                "Search in current workspace only",
-                "Search in current workspace and dependencies"
+                "Search in current workspace only.",
+                "Search in current workspace and dependencies."
             ],
         },
         "WorkspaceSymbolSearchKindDef" => set! {
             "type": "string",
             "enum": ["only_types", "all_symbols"],
             "enumDescriptions": [
-                "Search for types only",
-                "Search for all symbols kinds"
+                "Search for types only.",
+                "Search for all symbols kinds."
             ],
         },
         "ParallelCachePrimingNumThreads" => set! {
@@ -1683,47 +1696,46 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "maximum": 255
         },
         "LifetimeElisionDef" => set! {
-            "anyOf": [
-                {
-                    "type": "string",
-                    "enum": [
-                        "always",
-                        "never",
-                        "skip_trivial"
-                    ],
-                    "enumDescriptions": [
-                        "Always show lifetime elision hints.",
-                        "Never show lifetime elision hints.",
-                        "Only show lifetime elision hints if a return type is involved."
-                    ]
-                },
-                { "type": "boolean" }
+            "type": "string",
+            "enum": [
+                "always",
+                "never",
+                "skip_trivial"
             ],
+            "enumDescriptions": [
+                "Always show lifetime elision hints.",
+                "Never show lifetime elision hints.",
+                "Only show lifetime elision hints if a return type is involved."
+            ]
         },
         "ReborrowHintsDef" => set! {
+            "type": "string",
+            "enum": [
+                "always",
+                "never",
+                "mutable"
+            ],
+            "enumDescriptions": [
+                "Always show reborrow hints.",
+                "Never show reborrow hints.",
+                "Only show mutable reborrow hints."
+            ]
+        },
+        "CargoFeatures" => set! {
             "anyOf": [
                 {
                     "type": "string",
                     "enum": [
-                        "always",
-                        "never",
-                        "mutable"
+                        "all"
                     ],
                     "enumDescriptions": [
-                        "Always show reborrow hints.",
-                        "Never show reborrow hints.",
-                        "Only show mutable reborrow hints."
+                        "Pass `--all-features` to cargo",
                     ]
                 },
-                { "type": "boolean" }
-            ],
-        },
-        "CargoFeatures" => set! {
-            "type": ["string", "array"],
-            "items": { "type": "string" },
-            "enum": ["all"],
-            "enumDescriptions": [
-                "Pass `--all-features` to cargo",
+                {
+                    "type": "array",
+                    "items": { "type": "string" }
+                }
             ],
         },
         "Option<CargoFeatures>" => set! {
@@ -1744,21 +1756,18 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                 { "type": "null" }
             ],
         },
-        "Option<CallableCompletionDef>" => set! {
-            "anyOf": [
-                {
-                    "type": "string",
-                    "enum": [
-                        "fill_arguments",
-                        "add_parentheses"
-                    ],
-                    "enumDescriptions": [
-                        "Add call parentheses and pre-fill arguments",
-                        "Add call parentheses"
-                    ]
-                },
-                { "type": "null" }
+        "CallableCompletionDef" => set! {
+            "type": "string",
+            "enum": [
+                "fill_arguments",
+                "add_parentheses",
+                "none",
             ],
+            "enumDescriptions": [
+                "Add call parentheses and pre-fill arguments.",
+                "Add call parentheses.",
+                "Do no snippet completions for callables."
+            ]
         },
         "SignatureDetail" => set! {
             "type": "string",
