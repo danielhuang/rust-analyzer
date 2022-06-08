@@ -277,7 +277,7 @@ pub(crate) fn handle_on_enter(
 pub(crate) fn handle_on_type_formatting(
     snap: GlobalStateSnapshot,
     params: lsp_types::DocumentOnTypeFormattingParams,
-) -> Result<Option<Vec<lsp_types::TextEdit>>> {
+) -> Result<Option<Vec<lsp_ext::SnippetTextEdit>>> {
     let _p = profile::span("handle_on_type_formatting");
     let mut position = from_proto::file_position(&snap, params.text_document_position)?;
     let line_index = snap.file_line_index(position.file_id)?;
@@ -300,16 +300,17 @@ pub(crate) fn handle_on_type_formatting(
         return Ok(None);
     }
 
-    let edit = snap.analysis.on_char_typed(position, char_typed)?;
+    let edit =
+        snap.analysis.on_char_typed(position, char_typed, snap.config.typing_autoclose_angle())?;
     let edit = match edit {
         Some(it) => it,
         None => return Ok(None),
     };
 
     // This should be a single-file edit
-    let (_, edit) = edit.source_file_edits.into_iter().next().unwrap();
+    let (_, text_edit) = edit.source_file_edits.into_iter().next().unwrap();
 
-    let change = to_proto::text_edit_vec(&line_index, edit);
+    let change = to_proto::snippet_text_edit_vec(&line_index, edit.is_snippet, text_edit);
     Ok(Some(change))
 }
 
@@ -796,27 +797,27 @@ pub(crate) fn handle_completion(
     let _p = profile::span("handle_completion");
     let text_document_position = params.text_document_position.clone();
     let position = from_proto::file_position(&snap, params.text_document_position)?;
-    let completion_triggered_after_single_colon = {
-        let mut res = false;
-        if let Some(ctx) = params.context {
-            if ctx.trigger_character.as_deref() == Some(":") {
-                let source_file = snap.analysis.parse(position.file_id)?;
-                let left_token =
-                    source_file.syntax().token_at_offset(position.offset).left_biased();
-                match left_token {
-                    Some(left_token) => res = left_token.kind() == T![:],
-                    None => res = true,
-                }
-            }
+    let completion_trigger_character =
+        params.context.and_then(|ctx| ctx.trigger_character).and_then(|s| s.chars().next());
+
+    if Some(':') == completion_trigger_character {
+        let source_file = snap.analysis.parse(position.file_id)?;
+        let left_token = source_file.syntax().token_at_offset(position.offset).left_biased();
+        let completion_triggered_after_single_colon = match left_token {
+            Some(left_token) => left_token.kind() == T![:],
+            None => true,
+        };
+        if completion_triggered_after_single_colon {
+            return Ok(None);
         }
-        res
-    };
-    if completion_triggered_after_single_colon {
-        return Ok(None);
     }
 
     let completion_config = &snap.config.completion();
-    let items = match snap.analysis.completions(completion_config, position)? {
+    let items = match snap.analysis.completions(
+        completion_config,
+        position,
+        completion_trigger_character,
+    )? {
         None => return Ok(None),
         Some(items) => items,
     };
@@ -1346,12 +1347,7 @@ pub(crate) fn handle_inlay_hints(
             .inlay_hints(&inlay_hints_config, file_id, Some(range))?
             .into_iter()
             .map(|it| {
-                to_proto::inlay_hint(
-                    &line_index,
-                    &params.text_document,
-                    inlay_hints_config.render_colons,
-                    it,
-                )
+                to_proto::inlay_hint(&snap, &line_index, inlay_hints_config.render_colons, it)
             })
             .collect(),
     ))

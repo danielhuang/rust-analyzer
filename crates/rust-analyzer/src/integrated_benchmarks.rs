@@ -148,7 +148,7 @@ fn integrated_completion_benchmark() {
         };
         let position =
             FilePosition { file_id, offset: TextSize::try_from(completion_offset).unwrap() };
-        test(analysis, config, position);
+        analysis.completions(&config, position, None).unwrap();
     }
 
     let completion_offset = {
@@ -185,7 +185,7 @@ fn integrated_completion_benchmark() {
         };
         let position =
             FilePosition { file_id, offset: TextSize::try_from(completion_offset).unwrap() };
-        test(analysis, config, position);
+        analysis.completions(&config, position, None).unwrap();
     }
 }
 

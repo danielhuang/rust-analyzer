@@ -66,7 +66,7 @@ export class Config {
         );
 
         if (userResponse === "Reload now") {
-            await vscode.commands.executeCommand("workbench.action.reloadWindow");
+            await vscode.commands.executeCommand("rust-analyzer.reload");
         }
     }
 
@@ -100,8 +100,12 @@ export class Config {
     get serverPath() {
         return this.get<null | string>("server.path") ?? this.get<null | string>("serverPath");
     }
-    get serverExtraEnv() {
-        return this.get<Env | null>("server.extraEnv") ?? {};
+    get serverExtraEnv(): Env {
+        const extraEnv =
+            this.get<{ [key: string]: string | number } | null>("server.extraEnv") ?? {};
+        return Object.fromEntries(
+            Object.entries(extraEnv).map(([k, v]) => [k, typeof v !== "string" ? v.toString() : v])
+        );
     }
     get traceExtension() {
         return this.get<boolean>("trace.extension");
@@ -215,7 +219,7 @@ export async function updateConfig(config: vscode.WorkspaceConfiguration) {
                 },
             ];
             for (const { val, langVal, target } of valMatrix) {
-                const pred = (val: unknown) => {
+                const patch = (val: unknown) => {
                     // some of the updates we do only append "enable" or "custom"
                     // that means on the next run we would find these again, but as objects with
                     // these properties causing us to destroy the config
@@ -225,15 +229,15 @@ export async function updateConfig(config: vscode.WorkspaceConfiguration) {
                         !(
                             typeof val === "object" &&
                             val !== null &&
-                            (val.hasOwnProperty("enable") || val.hasOwnProperty("custom"))
+                            (oldKey === "completion.snippets" || !val.hasOwnProperty("custom"))
                         )
                     );
                 };
-                if (pred(val)) {
+                if (patch(val)) {
                     await config.update(newKey, val, target, false);
                     await config.update(oldKey, undefined, target, false);
                 }
-                if (pred(langVal)) {
+                if (patch(langVal)) {
                     await config.update(newKey, langVal, target, true);
                     await config.update(oldKey, undefined, target, true);
                 }

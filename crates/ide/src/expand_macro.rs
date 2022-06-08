@@ -238,6 +238,23 @@ fn main() {
     }
 
     #[test]
+    fn macro_expand_underscore() {
+        check(
+            r#"
+macro_rules! bar {
+    ($i:tt) => { for _ in 0..$i {} }
+}
+fn main() {
+    ba$0r!(42);
+}
+"#,
+            expect![[r#"
+                bar
+                for _ in 0..42{}"#]],
+        );
+    }
+
+    #[test]
     fn macro_expand_recursive_expansion() {
         check(
             r#"
@@ -255,7 +272,6 @@ f$0oo!();
             expect![[r#"
                 foo
                 fn b(){}
-
             "#]],
         );
     }
@@ -279,8 +295,7 @@ f$0oo!();
                 fn some_thing() -> u32 {
                   let a = 0;
                   a+10
-                }
-            "#]],
+                }"#]],
         );
     }
 
@@ -341,8 +356,7 @@ fn main() {
 "#,
             expect![[r#"
                 match_ast
-                {}
-            "#]],
+                {}"#]],
         );
     }
 
@@ -385,7 +399,7 @@ fn main() {
 "#,
             expect![[r#"
                 foo
-                0 "#]],
+                0"#]],
         );
     }
 
@@ -403,8 +417,7 @@ fn main() {
 "#,
             expect![[r#"
                 foo
-                fn f<T>(_: &dyn ::std::marker::Copy){}
-            "#]],
+                fn f<T>(_: &dyn ::std::marker::Copy){}"#]],
         );
     }
 
@@ -422,7 +435,6 @@ struct Foo {}
             expect![[r#"
                 Clone
                 impl < >core::clone::Clone for Foo< >{}
-
             "#]],
         );
     }
@@ -440,7 +452,6 @@ struct Foo {}
             expect![[r#"
                 Copy
                 impl < >core::marker::Copy for Foo< >{}
-
             "#]],
         );
     }
@@ -457,7 +468,6 @@ struct Foo {}
             expect![[r#"
                 Copy
                 impl < >core::marker::Copy for Foo< >{}
-
             "#]],
         );
         check(
@@ -470,7 +480,6 @@ struct Foo {}
             expect![[r#"
                 Clone
                 impl < >core::clone::Clone for Foo< >{}
-
             "#]],
         );
     }

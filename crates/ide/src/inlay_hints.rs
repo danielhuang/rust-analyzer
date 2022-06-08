@@ -21,13 +21,21 @@ pub struct InlayHintsConfig {
     pub parameter_hints: bool,
     pub chaining_hints: bool,
     pub reborrow_hints: ReborrowHints,
-    pub closure_return_type_hints: bool,
+    pub closure_return_type_hints: ClosureReturnTypeHints,
     pub binding_mode_hints: bool,
     pub lifetime_elision_hints: LifetimeElisionHints,
     pub param_names_for_lifetime_elision_hints: bool,
     pub hide_named_constructor_hints: bool,
+    pub hide_closure_initialization_hints: bool,
     pub max_length: Option<usize>,
     pub closing_brace_hints_min_lines: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClosureReturnTypeHints {
+    Always,
+    WithBlock,
+    Never,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,19 +65,19 @@ pub enum InlayKind {
     TypeHint,
 }
 
-// FIXME: This should live somewhere more general
-#[derive(Debug)]
-pub enum RangeOrOffset {
-    Range(TextRange),
-    Offset(TextSize),
-}
-
 #[derive(Debug)]
 pub struct InlayHint {
     pub range: TextRange,
     pub kind: InlayKind,
     pub label: String,
-    pub hover_trigger: Option<RangeOrOffset>,
+    pub tooltip: Option<InlayTooltip>,
+}
+
+#[derive(Debug)]
+pub enum InlayTooltip {
+    String(String),
+    HoverRanged(FileId, TextRange),
+    HoverOffset(FileId, TextSize),
 }
 
 // Feature: Inlay Hints
@@ -85,7 +93,7 @@ pub struct InlayHint {
 //
 // Optionally, one can enable additional hints for
 //
-// * return types of closure expressions with blocks
+// * return types of closure expressions
 // * elided lifetimes
 // * compiler inserted reborrows
 //
@@ -109,43 +117,43 @@ pub(crate) fn inlay_hints(
 
     let mut acc = Vec::new();
 
-    let hints = |node| hints(&mut acc, &sema, config, node);
-    match range_limit {
-        Some(FileRange { range, .. }) => match file.covering_element(range) {
-            NodeOrToken::Token(_) => return acc,
-            NodeOrToken::Node(n) => n
-                .descendants()
-                .filter(|descendant| range.intersect(descendant.text_range()).is_some())
-                .for_each(hints),
-        },
-        None => file.descendants().for_each(hints),
-    };
+    if let Some(scope) = sema.scope(&file) {
+        let famous_defs = FamousDefs(&sema, scope.krate());
+
+        let hints = |node| hints(&mut acc, &famous_defs, config, file_id, node);
+        match range_limit {
+            Some(FileRange { range, .. }) => match file.covering_element(range) {
+                NodeOrToken::Token(_) => return acc,
+                NodeOrToken::Node(n) => n
+                    .descendants()
+                    .filter(|descendant| range.intersect(descendant.text_range()).is_some())
+                    .for_each(hints),
+            },
+            None => file.descendants().for_each(hints),
+        };
+    }
 
     acc
 }
 
 fn hints(
     hints: &mut Vec<InlayHint>,
-    sema: &Semantics<RootDatabase>,
+    famous_defs @ FamousDefs(sema, _): &FamousDefs,
     config: &InlayHintsConfig,
+    file_id: FileId,
     node: SyntaxNode,
 ) {
-    let famous_defs = match sema.scope(&node) {
-        Some(it) => FamousDefs(sema, it.krate()),
-        None => return,
-    };
-
-    closing_brace_hints(hints, sema, config, node.clone());
+    closing_brace_hints(hints, sema, config, file_id, node.clone());
     match_ast! {
         match node {
             ast::Expr(expr) => {
-                chaining_hints(hints, sema, &famous_defs, config, &expr);
+                chaining_hints(hints, sema, &famous_defs, config, file_id, &expr);
                 match expr {
                     ast::Expr::CallExpr(it) => param_name_hints(hints, sema, config, ast::Expr::from(it)),
                     ast::Expr::MethodCallExpr(it) => {
                         param_name_hints(hints, sema, config, ast::Expr::from(it))
                     }
-                    ast::Expr::ClosureExpr(it) => closure_ret_hints(hints, sema, &famous_defs, config, it),
+                    ast::Expr::ClosureExpr(it) => closure_ret_hints(hints, sema, &famous_defs, config, file_id, it),
                     // We could show reborrows for all expressions, but usually that is just noise to the user
                     // and the main point here is to show why "moving" a mutable reference doesn't necessarily move it
                     ast::Expr::PathExpr(_) => reborrow_hints(hints, sema, config, &expr),
@@ -155,12 +163,22 @@ fn hints(
             ast::Pat(it) => {
                 binding_mode_hints(hints, sema, config, &it);
                 if let ast::Pat::IdentPat(it) = it {
-                    bind_pat_hints(hints, sema, config, &it);
+                    bind_pat_hints(hints, sema, config, file_id, &it);
                 }
                 Some(())
             },
-            ast::Fn(it) => lifetime_fn_hints(hints, config, it),
-            _ => Some(()),
+            ast::Item(it) => match it {
+                // FIXME: record impl lifetimes so they aren't being reused in assoc item lifetime inlay hints
+                ast::Item::Impl(_) => None,
+                ast::Item::Fn(it) => fn_lifetime_fn_hints(hints, config, it),
+                // static type elisions
+                ast::Item::Static(it) => implicit_static_hints(hints, config, Either::Left(it)),
+                ast::Item::Const(it) => implicit_static_hints(hints, config, Either::Right(it)),
+                _ => None,
+            },
+            // FIXME: fn-ptr type, dyn fn type, and trait object type elisions
+            ast::Type(_) => None,
+            _ => None,
         }
     };
 }
@@ -169,6 +187,7 @@ fn closing_brace_hints(
     acc: &mut Vec<InlayHint>,
     sema: &Semantics<RootDatabase>,
     config: &InlayHintsConfig,
+    file_id: FileId,
     node: SyntaxNode,
 ) -> Option<()> {
     let min_lines = config.closing_brace_hints_min_lines?;
@@ -263,13 +282,45 @@ fn closing_brace_hints(
         range: closing_token.text_range(),
         kind: InlayKind::ClosingBraceHint,
         label,
-        hover_trigger: name_offset.map(RangeOrOffset::Offset),
+        tooltip: name_offset.map(|it| InlayTooltip::HoverOffset(file_id, it)),
     });
 
     None
 }
 
-fn lifetime_fn_hints(
+fn implicit_static_hints(
+    acc: &mut Vec<InlayHint>,
+    config: &InlayHintsConfig,
+    statik_or_const: Either<ast::Static, ast::Const>,
+) -> Option<()> {
+    if config.lifetime_elision_hints != LifetimeElisionHints::Always {
+        return None;
+    }
+
+    if let Either::Right(it) = &statik_or_const {
+        if ast::AssocItemList::can_cast(
+            it.syntax().parent().map_or(SyntaxKind::EOF, |it| it.kind()),
+        ) {
+            return None;
+        }
+    }
+
+    if let Some(ast::Type::RefType(ty)) = statik_or_const.either(|it| it.ty(), |it| it.ty()) {
+        if ty.lifetime().is_none() {
+            let t = ty.amp_token()?;
+            acc.push(InlayHint {
+                range: t.text_range(),
+                kind: InlayKind::LifetimeHint,
+                label: "'static".to_owned(),
+                tooltip: Some(InlayTooltip::String("Elided static lifetime".into())),
+            });
+        }
+    }
+
+    Some(())
+}
+
+fn fn_lifetime_fn_hints(
     acc: &mut Vec<InlayHint>,
     config: &InlayHintsConfig,
     func: ast::Fn,
@@ -282,7 +333,7 @@ fn lifetime_fn_hints(
         range: t.text_range(),
         kind: InlayKind::LifetimeHint,
         label,
-        hover_trigger: None,
+        tooltip: Some(InlayTooltip::String("Elided lifetime".into())),
     };
 
     let param_list = func.param_list()?;
@@ -428,20 +479,22 @@ fn lifetime_fn_hints(
         (Some(gpl), allocated_lifetimes) => {
             let angle_tok = gpl.l_angle_token()?;
             let is_empty = gpl.generic_params().next().is_none();
-            acc.push(mk_lt_hint(
-                angle_tok,
-                format!(
+            acc.push(InlayHint {
+                range: angle_tok.text_range(),
+                kind: InlayKind::LifetimeHint,
+                label: format!(
                     "{}{}",
                     allocated_lifetimes.iter().format(", "),
                     if is_empty { "" } else { ", " }
                 ),
-            ));
+                tooltip: Some(InlayTooltip::String("Elided lifetimes".into())),
+            });
         }
         (None, allocated_lifetimes) => acc.push(InlayHint {
             range: func.name()?.syntax().text_range(),
             kind: InlayKind::GenericParamListHint,
             label: format!("<{}>", allocated_lifetimes.iter().format(", "),).into(),
-            hover_trigger: None,
+            tooltip: Some(InlayTooltip::String("Elided lifetimes".into())),
         }),
     }
     Some(())
@@ -452,16 +505,24 @@ fn closure_ret_hints(
     sema: &Semantics<RootDatabase>,
     famous_defs: &FamousDefs,
     config: &InlayHintsConfig,
+    file_id: FileId,
     closure: ast::ClosureExpr,
 ) -> Option<()> {
-    if !config.closure_return_type_hints {
+    if config.closure_return_type_hints == ClosureReturnTypeHints::Never {
         return None;
     }
 
-    let param_list = match closure.body() {
-        Some(ast::Expr::BlockExpr(_)) => closure.param_list()?,
-        _ => return None,
-    };
+    if closure.ret_type().is_some() {
+        return None;
+    }
+
+    if !closure_has_block_body(&closure)
+        && config.closure_return_type_hints == ClosureReturnTypeHints::WithBlock
+    {
+        return None;
+    }
+
+    let param_list = closure.param_list()?;
 
     let closure = sema.descend_node_into_attributes(closure.clone()).pop()?;
     let ty = sema.type_of_expr(&ast::Expr::ClosureExpr(closure))?.adjusted();
@@ -475,7 +536,7 @@ fn closure_ret_hints(
         kind: InlayKind::ClosureReturnTypeHint,
         label: hint_iterator(sema, &famous_defs, config, &ty)
             .unwrap_or_else(|| ty.display_truncated(sema.db, config.max_length).to_string()),
-        hover_trigger: None,
+        tooltip: Some(InlayTooltip::HoverRanged(file_id, param_list.syntax().text_range())),
     });
     Some(())
 }
@@ -502,7 +563,7 @@ fn reborrow_hints(
         range: expr.syntax().text_range(),
         kind: InlayKind::ImplicitReborrowHint,
         label: label.to_string(),
-        hover_trigger: None,
+        tooltip: Some(InlayTooltip::String("Compiler inserted reborrow".into())),
     });
     Some(())
 }
@@ -512,6 +573,7 @@ fn chaining_hints(
     sema: &Semantics<RootDatabase>,
     famous_defs: &FamousDefs,
     config: &InlayHintsConfig,
+    file_id: FileId,
     expr: &ast::Expr,
 ) -> Option<()> {
     if !config.chaining_hints {
@@ -561,7 +623,7 @@ fn chaining_hints(
                 label: hint_iterator(sema, &famous_defs, config, &ty).unwrap_or_else(|| {
                     ty.display_truncated(sema.db, config.max_length).to_string()
                 }),
-                hover_trigger: Some(RangeOrOffset::Range(expr.syntax().text_range())),
+                tooltip: Some(InlayTooltip::HoverRanged(file_id, expr.syntax().text_range())),
             });
         }
     }
@@ -586,24 +648,35 @@ fn param_name_hints(
         .filter_map(|((param, _ty), arg)| {
             // Only annotate hints for expressions that exist in the original file
             let range = sema.original_range_opt(arg.syntax())?;
-            let param_name = match param? {
-                Either::Left(_) => "self".to_string(),
+            let (param_name, name_syntax) = match param.as_ref()? {
+                Either::Left(pat) => ("self".to_string(), pat.name()),
                 Either::Right(pat) => match pat {
-                    ast::Pat::IdentPat(it) => it.name()?.to_string(),
+                    ast::Pat::IdentPat(it) => (it.name()?.to_string(), it.name()),
                     _ => return None,
                 },
             };
-            Some((param_name, arg, range))
+            Some((name_syntax, param_name, arg, range))
         })
-        .filter(|(param_name, arg, _)| {
+        .filter(|(_, param_name, arg, _)| {
             !should_hide_param_name_hint(sema, &callable, param_name, arg)
         })
-        .map(|(param_name, _, FileRange { range, .. })| InlayHint {
-            range,
-            kind: InlayKind::ParameterHint,
-            label: param_name.into(),
-            // FIXME: Show hover for parameter
-            hover_trigger: None,
+        .map(|(param, param_name, _, FileRange { range, .. })| {
+            let mut tooltip = None;
+            if let Some(name) = param {
+                if let hir::CallableKind::Function(f) = callable.kind() {
+                    // assert the file is cached so we can map out of macros
+                    if let Some(_) = sema.source(f) {
+                        tooltip = sema.original_range_opt(name.syntax());
+                    }
+                }
+            }
+
+            InlayHint {
+                range,
+                kind: InlayKind::ParameterHint,
+                label: param_name,
+                tooltip: tooltip.map(|it| InlayTooltip::HoverOffset(it.file_id, it.range.start())),
+            }
         });
 
     acc.extend(hints);
@@ -633,7 +706,7 @@ fn binding_mode_hints(
             range,
             kind: InlayKind::BindingModeHint,
             label: r.to_string(),
-            hover_trigger: None,
+            tooltip: Some(InlayTooltip::String("Inferred binding mode".into())),
         });
     });
     match pat {
@@ -648,7 +721,7 @@ fn binding_mode_hints(
                 range,
                 kind: InlayKind::BindingModeHint,
                 label: bm.to_string(),
-                hover_trigger: None,
+                tooltip: Some(InlayTooltip::String("Inferred binding mode".into())),
             });
         }
         _ => (),
@@ -661,6 +734,7 @@ fn bind_pat_hints(
     acc: &mut Vec<InlayHint>,
     sema: &Semantics<RootDatabase>,
     config: &InlayHintsConfig,
+    file_id: FileId,
     pat: &ast::IdentPat,
 ) -> Option<()> {
     if !config.type_hints {
@@ -671,7 +745,7 @@ fn bind_pat_hints(
     let desc_pat = descended.as_ref().unwrap_or(pat);
     let ty = sema.type_of_pat(&desc_pat.clone().into())?.original;
 
-    if should_not_display_type_hint(sema, pat, &ty) {
+    if should_not_display_type_hint(sema, config, pat, &ty) {
         return None;
     }
 
@@ -699,7 +773,10 @@ fn bind_pat_hints(
         },
         kind: InlayKind::TypeHint,
         label,
-        hover_trigger: pat.name().map(|it| it.syntax().text_range()).map(RangeOrOffset::Range),
+        tooltip: pat
+            .name()
+            .map(|it| it.syntax().text_range())
+            .map(|it| InlayTooltip::HoverRanged(file_id, it)),
     });
 
     Some(())
@@ -823,6 +900,7 @@ fn pat_is_enum_variant(db: &RootDatabase, bind_pat: &ast::IdentPat, pat_ty: &hir
 
 fn should_not_display_type_hint(
     sema: &Semantics<RootDatabase>,
+    config: &InlayHintsConfig,
     bind_pat: &ast::IdentPat,
     pat_ty: &hir::Type,
 ) -> bool {
@@ -835,6 +913,18 @@ fn should_not_display_type_hint(
     if let Some(hir::Adt::Struct(s)) = pat_ty.as_adt() {
         if s.fields(db).is_empty() && s.name(db).to_smol_str() == bind_pat.to_string() {
             return true;
+        }
+    }
+
+    if config.hide_closure_initialization_hints {
+        if let Some(parent) = bind_pat.syntax().parent() {
+            if let Some(it) = ast::LetStmt::cast(parent.clone()) {
+                if let Some(ast::Expr::ClosureExpr(closure)) = it.initializer() {
+                    if closure_has_block_body(&closure) {
+                        return true;
+                    }
+                }
+            }
         }
     }
 
@@ -864,6 +954,10 @@ fn should_not_display_type_hint(
     false
 }
 
+fn closure_has_block_body(closure: &ast::ClosureExpr) -> bool {
+    matches!(closure.body(), Some(ast::Expr::BlockExpr(_)))
+}
+
 fn should_hide_param_name_hint(
     sema: &Semantics<RootDatabase>,
     callable: &hir::Callable,
@@ -873,7 +967,7 @@ fn should_hide_param_name_hint(
     // These are to be tested in the `parameter_hint_heuristics` test
     // hide when:
     // - the parameter name is a suffix of the function's name
-    // - the argument is an enum whose name is equal to the parameter
+    // - the argument is a qualified constructing or call expression where the qualifier is an ADT
     // - exact argument<->parameter match(ignoring leading underscore) or parameter is a prefix/suffix
     //   of argument with _ splitting it off
     // - param starts with `ra_fixture`
@@ -894,10 +988,10 @@ fn should_hide_param_name_hint(
     };
     let fn_name = fn_name.as_deref();
     is_param_name_suffix_of_fn_name(param_name, callable, fn_name)
-        || is_enum_name_similar_to_param_name(sema, argument, param_name)
         || is_argument_similar_to_param_name(argument, param_name)
         || param_name.starts_with("ra_fixture")
         || (callable.n_params() == 1 && is_obvious_param(param_name))
+        || is_adt_constructor_similar_to_param_name(sema, argument, param_name)
 }
 
 fn is_argument_similar_to_param_name(argument: &ast::Expr, param_name: &str) -> bool {
@@ -953,17 +1047,43 @@ fn is_param_name_suffix_of_fn_name(
     }
 }
 
-fn is_enum_name_similar_to_param_name(
+fn is_adt_constructor_similar_to_param_name(
     sema: &Semantics<RootDatabase>,
     argument: &ast::Expr,
     param_name: &str,
 ) -> bool {
-    match sema.type_of_expr(argument).and_then(|t| t.original.as_adt()) {
-        Some(hir::Adt::Enum(e)) => {
-            to_lower_snake_case(&e.name(sema.db).to_smol_str()) == param_name
+    let path = match argument {
+        ast::Expr::CallExpr(c) => c.expr().and_then(|e| match e {
+            ast::Expr::PathExpr(p) => p.path(),
+            _ => None,
+        }),
+        ast::Expr::PathExpr(p) => p.path(),
+        ast::Expr::RecordExpr(r) => r.path(),
+        _ => return false,
+    };
+    let path = match path {
+        Some(it) => it,
+        None => return false,
+    };
+    (|| match sema.resolve_path(&path)? {
+        hir::PathResolution::Def(hir::ModuleDef::Adt(_)) => {
+            Some(to_lower_snake_case(&path.segment()?.name_ref()?.text()) == param_name)
         }
-        _ => false,
-    }
+        hir::PathResolution::Def(hir::ModuleDef::Function(_) | hir::ModuleDef::Variant(_)) => {
+            if to_lower_snake_case(&path.segment()?.name_ref()?.text()) == param_name {
+                return Some(true);
+            }
+            let qual = path.qualifier()?;
+            match sema.resolve_path(&qual)? {
+                hir::PathResolution::Def(hir::ModuleDef::Adt(_)) => {
+                    Some(to_lower_snake_case(&qual.segment()?.name_ref()?.text()) == param_name)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    })()
+    .unwrap_or(false)
 }
 
 fn get_string_representation(expr: &ast::Expr) -> Option<String> {
@@ -1022,16 +1142,19 @@ mod tests {
     use crate::inlay_hints::ReborrowHints;
     use crate::{fixture, inlay_hints::InlayHintsConfig, LifetimeElisionHints};
 
+    use super::ClosureReturnTypeHints;
+
     const DISABLED_CONFIG: InlayHintsConfig = InlayHintsConfig {
         render_colons: false,
         type_hints: false,
         parameter_hints: false,
         chaining_hints: false,
         lifetime_elision_hints: LifetimeElisionHints::Never,
-        closure_return_type_hints: false,
+        closure_return_type_hints: ClosureReturnTypeHints::Never,
         reborrow_hints: ReborrowHints::Always,
         binding_mode_hints: false,
         hide_named_constructor_hints: false,
+        hide_closure_initialization_hints: false,
         param_names_for_lifetime_elision_hints: false,
         max_length: None,
         closing_brace_hints_min_lines: None,
@@ -1041,7 +1164,7 @@ mod tests {
         parameter_hints: true,
         chaining_hints: true,
         reborrow_hints: ReborrowHints::Always,
-        closure_return_type_hints: true,
+        closure_return_type_hints: ClosureReturnTypeHints::WithBlock,
         binding_mode_hints: true,
         lifetime_elision_hints: LifetimeElisionHints::Always,
         ..DISABLED_CONFIG
@@ -1119,6 +1242,23 @@ fn main() {
       //^ b
     );
 }"#,
+        );
+    }
+
+    #[test]
+    fn param_hints_on_closure() {
+        check_params(
+            r#"
+fn main() {
+    let clo = |a: u8, b: u8| a + b;
+    clo(
+        1,
+      //^ a
+        2,
+      //^ b
+    );
+}
+            "#,
         );
     }
 
@@ -1288,7 +1428,6 @@ fn main() {
                //^^ self  ^^^^ param
     Test::from_syntax(
         FileId {},
-      //^^^^^^^^^ file_id
         "impl".into(),
       //^^^^^^^^^^^^^ name
         None,
@@ -1954,7 +2093,8 @@ fn main() {
 
     ;
 
-    let _: i32 = multiply(1, 2);
+    let _: i32 = multiply(1,  2);
+                        //^ a ^ b
     let multiply_ref = &multiply;
       //^^^^^^^^^^^^ &|i32, i32| -> i32
 
@@ -1963,6 +2103,70 @@ fn main() {
       || { 42 };
     //^^ i32
 }"#,
+        );
+    }
+
+    #[test]
+    fn return_type_hints_for_closure_without_block() {
+        check_with_config(
+            InlayHintsConfig {
+                closure_return_type_hints: ClosureReturnTypeHints::Always,
+                ..DISABLED_CONFIG
+            },
+            r#"
+fn main() {
+    let a = || { 0 };
+          //^^ i32
+    let b = || 0;
+          //^^ i32
+}"#,
+        );
+    }
+
+    #[test]
+    fn skip_closure_type_hints() {
+        check_with_config(
+            InlayHintsConfig {
+                type_hints: true,
+                hide_closure_initialization_hints: true,
+                ..DISABLED_CONFIG
+            },
+            r#"
+//- minicore: fn
+fn main() {
+    let multiple_2 = |x: i32| { x * 2 };
+
+    let multiple_2 = |x: i32| x * 2;
+    //  ^^^^^^^^^^ |i32| -> i32
+
+    let (not) = (|x: bool| { !x });
+    //   ^^^ |bool| -> bool
+
+    let (is_zero, _b) = (|x: usize| { x == 0 }, false);
+    //   ^^^^^^^ |usize| -> bool
+    //            ^^ bool
+
+    let plus_one = |x| { x + 1 };
+    //              ^ u8
+    foo(plus_one);
+
+    let add_mul = bar(|x: u8| { x + 1 });
+    //  ^^^^^^^ impl FnOnce(u8) -> u8 + ?Sized
+
+    let closure = if let Some(6) = add_mul(2).checked_sub(1) {
+    //  ^^^^^^^ fn(i32) -> i32
+        |x: i32| { x * 2 }
+    } else {
+        |x: i32| { x * 3 }
+    };
+}
+
+fn foo(f: impl FnOnce(u8) -> u8) {}
+
+fn bar(f: impl FnOnce(u8) -> u8) -> impl FnOnce(u8) -> u8 {
+    move |x: u8| f(x) * 2
+}
+"#,
         );
     }
 
@@ -2012,8 +2216,11 @@ fn main() {
                         range: 147..172,
                         kind: ChainingHint,
                         label: "B",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 147..172,
                             ),
                         ),
@@ -2022,8 +2229,11 @@ fn main() {
                         range: 147..154,
                         kind: ChainingHint,
                         label: "A",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 147..154,
                             ),
                         ),
@@ -2077,8 +2287,11 @@ fn main() {
                         range: 143..190,
                         kind: ChainingHint,
                         label: "C",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 143..190,
                             ),
                         ),
@@ -2087,8 +2300,11 @@ fn main() {
                         range: 143..179,
                         kind: ChainingHint,
                         label: "B",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 143..179,
                             ),
                         ),
@@ -2127,8 +2343,11 @@ fn main() {
                         range: 246..283,
                         kind: ChainingHint,
                         label: "B<X<i32, bool>>",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 246..283,
                             ),
                         ),
@@ -2137,8 +2356,11 @@ fn main() {
                         range: 246..265,
                         kind: ChainingHint,
                         label: "A<X<i32, bool>>",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 246..265,
                             ),
                         ),
@@ -2179,8 +2401,11 @@ fn main() {
                         range: 174..241,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 174..241,
                             ),
                         ),
@@ -2189,8 +2414,11 @@ fn main() {
                         range: 174..224,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 174..224,
                             ),
                         ),
@@ -2199,8 +2427,11 @@ fn main() {
                         range: 174..206,
                         kind: ChainingHint,
                         label: "impl Iterator<Item = ()>",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 174..206,
                             ),
                         ),
@@ -2209,8 +2440,11 @@ fn main() {
                         range: 174..189,
                         kind: ChainingHint,
                         label: "&mut MyIter",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 174..189,
                             ),
                         ),
@@ -2248,8 +2482,11 @@ fn main() {
                         range: 124..130,
                         kind: TypeHint,
                         label: "Struct",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 124..130,
                             ),
                         ),
@@ -2258,8 +2495,11 @@ fn main() {
                         range: 145..185,
                         kind: ChainingHint,
                         label: "Struct",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 145..185,
                             ),
                         ),
@@ -2268,8 +2508,11 @@ fn main() {
                         range: 145..168,
                         kind: ChainingHint,
                         label: "Struct",
-                        hover_trigger: Some(
-                            Range(
+                        tooltip: Some(
+                            HoverRanged(
+                                FileId(
+                                    0,
+                                ),
                                 145..168,
                             ),
                         ),
@@ -2278,7 +2521,14 @@ fn main() {
                         range: 222..228,
                         kind: ParameterHint,
                         label: "self",
-                        hover_trigger: None,
+                        tooltip: Some(
+                            HoverOffset(
+                                FileId(
+                                    0,
+                                ),
+                                42,
+                            ),
+                        ),
                     },
                 ]
             "#]],
@@ -2379,6 +2629,30 @@ impl () {
     fn foo(&self, a: &()) -> &() {}
     // ^^^<'0, '1>
         // ^'0       ^'1     ^'0
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn hints_lifetimes_static() {
+        check_with_config(
+            InlayHintsConfig {
+                lifetime_elision_hints: LifetimeElisionHints::Always,
+                ..TEST_CONFIG
+            },
+            r#"
+trait Trait {}
+static S: &str = "";
+//        ^'static
+const C: &str = "";
+//       ^'static
+const C: &dyn Trait = panic!();
+//       ^'static
+
+impl () {
+    const C: &str = "";
+    const C: &dyn Trait = panic!();
 }
 "#,
         );

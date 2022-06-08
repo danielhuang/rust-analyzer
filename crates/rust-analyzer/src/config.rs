@@ -59,7 +59,7 @@ config_data! {
 
         /// Warm up caches on project load.
         cachePriming_enable: bool = "true",
-        /// How many worker threads to to handle priming caches. The default `0` means to pick automatically.
+        /// How many worker threads to handle priming caches. The default `0` means to pick automatically.
         cachePriming_numThreads: ParallelCachePrimingNumThreads = "0",
 
         /// Automatically refresh project info via `cargo metadata` on
@@ -264,8 +264,8 @@ config_data! {
         /// Minimum number of lines required before the `}` until the hint is shown (set to 0 or 1
         /// to always show them).
         inlayHints_closingBraceHints_minLines: usize               = "25",
-        /// Whether to show inlay type hints for return types of closures with blocks.
-        inlayHints_closureReturnTypeHints_enable: bool             = "false",
+        /// Whether to show inlay type hints for return types of closures.
+        inlayHints_closureReturnTypeHints_enable: ClosureReturnTypeHintsDef  = "\"never\"",
         /// Whether to show inlay type hints for elided lifetimes in function signatures.
         inlayHints_lifetimeElisionHints_enable: LifetimeElisionDef = "\"never\"",
         /// Whether to prefer using parameter names as the name for elided lifetime hints if possible.
@@ -281,6 +281,9 @@ config_data! {
         inlayHints_renderColons: bool                              = "true",
         /// Whether to show inlay type hints for variables.
         inlayHints_typeHints_enable: bool                          = "true",
+        /// Whether to hide inlay type hints for `let` statements that initialize to a closure.
+        /// Only applies to closures with blocks, same as `#rust-analyzer.inlayHints.closureReturnTypeHints.enable#`.
+        inlayHints_typeHints_hideClosureInitialization: bool       = "false",
         /// Whether to hide inlay type hints for constructors.
         inlayHints_typeHints_hideNamedConstructor: bool            = "false",
 
@@ -382,6 +385,9 @@ config_data! {
         signatureInfo_detail: SignatureDetail                           = "\"full\"",
         /// Show documentation.
         signatureInfo_documentation_enable: bool                       = "true",
+
+        /// Whether to insert closing angle brackets when typing an opening angle bracket of a generic argument list.
+        typing_autoClosingAngleBrackets_enable: bool = "false",
 
         /// Workspace symbol search kind.
         workspace_symbol_search_kind: WorkspaceSymbolSearchKindDef = "\"only_types\"",
@@ -691,7 +697,22 @@ impl Config {
         match self.data.linkedProjects.as_slice() {
             [] => match self.discovered_projects.as_ref() {
                 Some(discovered_projects) => {
-                    discovered_projects.iter().cloned().map(LinkedProject::from).collect()
+                    let exclude_dirs: Vec<_> = self
+                        .data
+                        .files_excludeDirs
+                        .iter()
+                        .map(|p| self.root_path.join(p))
+                        .collect();
+                    discovered_projects
+                        .iter()
+                        .filter(|p| {
+                            let (ProjectManifest::ProjectJson(path)
+                            | ProjectManifest::CargoToml(path)) = p;
+                            !exclude_dirs.iter().any(|p| path.starts_with(p))
+                        })
+                        .cloned()
+                        .map(LinkedProject::from)
+                        .collect()
                 }
                 None => Vec::new(),
             },
@@ -993,13 +1014,20 @@ impl Config {
             type_hints: self.data.inlayHints_typeHints_enable,
             parameter_hints: self.data.inlayHints_parameterHints_enable,
             chaining_hints: self.data.inlayHints_chainingHints_enable,
-            closure_return_type_hints: self.data.inlayHints_closureReturnTypeHints_enable,
+            closure_return_type_hints: match self.data.inlayHints_closureReturnTypeHints_enable {
+                ClosureReturnTypeHintsDef::Always => ide::ClosureReturnTypeHints::Always,
+                ClosureReturnTypeHintsDef::Never => ide::ClosureReturnTypeHints::Never,
+                ClosureReturnTypeHintsDef::WithBlock => ide::ClosureReturnTypeHints::WithBlock,
+            },
             lifetime_elision_hints: match self.data.inlayHints_lifetimeElisionHints_enable {
                 LifetimeElisionDef::Always => ide::LifetimeElisionHints::Always,
                 LifetimeElisionDef::Never => ide::LifetimeElisionHints::Never,
                 LifetimeElisionDef::SkipTrivial => ide::LifetimeElisionHints::SkipTrivial,
             },
             hide_named_constructor_hints: self.data.inlayHints_typeHints_hideNamedConstructor,
+            hide_closure_initialization_hints: self
+                .data
+                .inlayHints_typeHints_hideClosureInitialization,
             reborrow_hints: match self.data.inlayHints_reborrowHints_enable {
                 ReborrowHintsDef::Always => ide::ReborrowHints::Always,
                 ReborrowHintsDef::Never => ide::ReborrowHints::Never,
@@ -1062,6 +1090,10 @@ impl Config {
             )),
             snippets: self.snippets.clone(),
         }
+    }
+
+    pub fn snippet_cap(&self) -> bool {
+        self.experimental("snippetTextEdit")
     }
 
     pub fn assist(&self) -> AssistConfig {
@@ -1210,6 +1242,10 @@ impl Config {
             n => n,
         }
     }
+
+    pub fn typing_autoclose_angle(&self) -> bool {
+        self.data.typing_autoClosingAngleBrackets_enable
+    }
 }
 // Deserialization definitions
 
@@ -1310,6 +1346,7 @@ mod de_unit_v {
     named_unit_variant!(all);
     named_unit_variant!(skip_trivial);
     named_unit_variant!(mutable);
+    named_unit_variant!(with_block);
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]
@@ -1420,6 +1457,17 @@ enum LifetimeElisionDef {
     Never,
     #[serde(deserialize_with = "de_unit_v::skip_trivial")]
     SkipTrivial,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum ClosureReturnTypeHintsDef {
+    #[serde(deserialize_with = "true_or_always")]
+    Always,
+    #[serde(deserialize_with = "false_or_never")]
+    Never,
+    #[serde(deserialize_with = "de_unit_v::with_block")]
+    WithBlock,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1706,6 +1754,19 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                 "Always show lifetime elision hints.",
                 "Never show lifetime elision hints.",
                 "Only show lifetime elision hints if a return type is involved."
+            ]
+        },
+        "ClosureReturnTypeHintsDef" => set! {
+            "type": "string",
+            "enum": [
+                "always",
+                "never",
+                "with_block"
+            ],
+            "enumDescriptions": [
+                "Always show type hints for return types of closures.",
+                "Never show type hints for return types of closures.",
+                "Only show type hints for return types of closures with blocks."
             ]
         },
         "ReborrowHintsDef" => set! {

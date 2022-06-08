@@ -32,15 +32,21 @@
 //! ```
 
 use hir::{self, HasAttrs};
-use ide_db::{path_transform::PathTransform, traits::get_missing_assoc_items, SymbolKind};
+use ide_db::{
+    path_transform::PathTransform, syntax_helpers::insert_whitespace_into_node,
+    traits::get_missing_assoc_items, SymbolKind,
+};
 use syntax::{
     ast::{self, edit_in_place::AttrsOwnerEdit},
-    display::function_declaration,
     AstNode, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, T,
 };
 use text_edit::TextEdit;
 
 use crate::{
+    context::{
+        IdentContext, ItemListKind, NameContext, NameKind, NameRefContext, PathCompletionCtx,
+        PathKind,
+    },
     CompletionContext, CompletionItem, CompletionItemKind, CompletionRelevance, Completions,
 };
 
@@ -52,7 +58,6 @@ enum ImplCompletionKind {
     Const,
 }
 
-// FIXME: Make this a submodule of [`item_list`]
 pub(crate) fn complete_trait_impl(acc: &mut Completions, ctx: &CompletionContext) {
     if let Some((kind, replacement_range, impl_def)) = completion_match(ctx) {
         if let Some(hir_impl) = ctx.sema.to_def(&impl_def) {
@@ -75,73 +80,49 @@ pub(crate) fn complete_trait_impl(acc: &mut Completions, ctx: &CompletionContext
     }
 }
 
-// FIXME: This should be lifted out so that we can do proper smart item keyword completions
 fn completion_match(ctx: &CompletionContext) -> Option<(ImplCompletionKind, TextRange, ast::Impl)> {
-    let token = ctx.token.clone();
-
-    // For keyword without name like `impl .. { fn $0 }`, the current position is inside
-    // the whitespace token, which is outside `FN` syntax node.
-    // We need to follow the previous token in this case.
-    let mut token_before_ws = token.clone();
-    if token.kind() == SyntaxKind::WHITESPACE {
-        token_before_ws = token.prev_token()?;
-    }
-
-    let parent_kind = token_before_ws.parent().map_or(SyntaxKind::EOF, |it| it.kind());
-    if token.parent().map(|n| n.kind()) == Some(SyntaxKind::ASSOC_ITEM_LIST)
-        && matches!(
-            token_before_ws.kind(),
-            SyntaxKind::SEMICOLON | SyntaxKind::R_CURLY | SyntaxKind::L_CURLY
-        )
-    {
-        let impl_def = ast::Impl::cast(token.parent()?.parent()?)?;
-        let kind = ImplCompletionKind::All;
-        let replacement_range = TextRange::empty(ctx.position.offset);
-        Some((kind, replacement_range, impl_def))
-    } else {
-        let impl_item_offset = match token_before_ws.kind() {
-            // `impl .. { const $0 }`
-            // ERROR      0
-            //   CONST_KW <- *
-            T![const] => 0,
-            // `impl .. { fn/type $0 }`
-            // FN/TYPE_ALIAS  0
-            //   FN_KW        <- *
-            T![fn] | T![type] => 0,
-            // `impl .. { fn/type/const foo$0 }`
-            // FN/TYPE_ALIAS/CONST  1
-            //  NAME                0
-            //    IDENT             <- *
-            SyntaxKind::IDENT if parent_kind == SyntaxKind::NAME => 1,
-            // `impl .. { foo$0 }`
-            // MACRO_CALL       3
-            //  PATH            2
-            //    PATH_SEGMENT  1
-            //      NAME_REF    0
-            //        IDENT     <- *
-            SyntaxKind::IDENT if parent_kind == SyntaxKind::NAME_REF => 3,
-            _ => return None,
-        };
-
-        let impl_item = token_before_ws.ancestors().nth(impl_item_offset)?;
-        // Must directly belong to an impl block.
-        // IMPL
-        //   ASSOC_ITEM_LIST
-        //     <item>
-        let impl_def = ast::Impl::cast(impl_item.parent()?.parent()?)?;
-        let kind = match impl_item.kind() {
-            // `impl ... { const $0 fn/type/const }`
-            _ if token_before_ws.kind() == T![const] => ImplCompletionKind::Const,
-            SyntaxKind::CONST | SyntaxKind::ERROR => ImplCompletionKind::Const,
-            SyntaxKind::TYPE_ALIAS => ImplCompletionKind::TypeAlias,
-            SyntaxKind::FN => ImplCompletionKind::Fn,
-            SyntaxKind::MACRO_CALL => ImplCompletionKind::All,
-            _ => return None,
-        };
-
-        let replacement_range = replacement_range(ctx, &impl_item);
-
-        Some((kind, replacement_range, impl_def))
+    match &ctx.ident_ctx {
+        IdentContext::Name(NameContext { name, kind, .. }) => {
+            let kind = match kind {
+                NameKind::Const => ImplCompletionKind::Const,
+                NameKind::Function => ImplCompletionKind::Fn,
+                NameKind::TypeAlias => ImplCompletionKind::TypeAlias,
+                _ => return None,
+            };
+            let token = ctx.token.clone();
+            let item = match name {
+                Some(name) => name.syntax().parent(),
+                None => {
+                    if token.kind() == SyntaxKind::WHITESPACE { token.prev_token()? } else { token }
+                        .parent()
+                }
+            }?;
+            Some((
+                kind,
+                replacement_range(ctx, &item),
+                // item -> ASSOC_ITEM_LIST -> IMPL
+                ast::Impl::cast(item.parent()?.parent()?)?,
+            ))
+        }
+        IdentContext::NameRef(NameRefContext {
+            nameref,
+            path_ctx:
+                Some(
+                    path_ctx @ PathCompletionCtx {
+                        kind: PathKind::Item { kind: ItemListKind::TraitImpl },
+                        ..
+                    },
+                ),
+            ..
+        }) if path_ctx.is_trivial_path() => Some((
+            ImplCompletionKind::All,
+            match nameref {
+                Some(name) => name.syntax().text_range(),
+                None => ctx.source_range(),
+            },
+            ctx.impl_def.clone()?,
+        )),
+        _ => None,
     }
 }
 
@@ -179,7 +160,7 @@ fn add_function_impl(
                 _ => unreachable!(),
             };
 
-            let function_decl = function_declaration(&transformed_fn);
+            let function_decl = function_declaration(&transformed_fn, source.file_id.is_macro());
             match ctx.config.snippet_cap {
                 Some(cap) => {
                     let snippet = format!("{} {{\n    $0\n}}", function_decl);
@@ -260,7 +241,7 @@ fn add_const_impl(
                     _ => unreachable!(),
                 };
 
-                let label = make_const_compl_syntax(&transformed_const);
+                let label = make_const_compl_syntax(&transformed_const, source.file_id.is_macro());
                 let replacement = format!("{} ", label);
 
                 let mut item = CompletionItem::new(SymbolKind::Const, replacement_range, label);
@@ -283,17 +264,18 @@ fn add_const_impl(
     }
 }
 
-fn make_const_compl_syntax(const_: &ast::Const) -> String {
+fn make_const_compl_syntax(const_: &ast::Const, needs_whitespace: bool) -> String {
     const_.remove_attrs_and_docs();
+    let const_ = if needs_whitespace {
+        insert_whitespace_into_node::insert_ws_into(const_.syntax().clone())
+    } else {
+        const_.syntax().clone()
+    };
 
-    let const_start = const_.syntax().text_range().start();
-    let const_end = const_.syntax().text_range().end();
-
-    let start =
-        const_.syntax().first_child_or_token().map_or(const_start, |f| f.text_range().start());
+    let start = const_.text_range().start();
+    let const_end = const_.text_range().end();
 
     let end = const_
-        .syntax()
         .children_with_tokens()
         .find(|s| s.kind() == T![;] || s.kind() == T![=])
         .map_or(const_end, |f| f.text_range().start());
@@ -301,9 +283,34 @@ fn make_const_compl_syntax(const_: &ast::Const) -> String {
     let len = end - start;
     let range = TextRange::new(0.into(), len);
 
-    let syntax = const_.syntax().text().slice(range).to_string();
+    let syntax = const_.text().slice(range).to_string();
 
     format!("{} =", syntax.trim_end())
+}
+
+fn function_declaration(node: &ast::Fn, needs_whitespace: bool) -> String {
+    node.remove_attrs_and_docs();
+
+    let node = if needs_whitespace {
+        insert_whitespace_into_node::insert_ws_into(node.syntax().clone())
+    } else {
+        node.syntax().clone()
+    };
+
+    let start = node.text_range().start();
+    let end = node.text_range().end();
+
+    let end = node
+        .last_child_or_token()
+        .filter(|s| s.kind() == T![;] || s.kind() == SyntaxKind::BLOCK_EXPR)
+        .map_or(end, |f| f.text_range().start());
+
+    let len = end - start;
+    let range = TextRange::new(0.into(), len);
+
+    let syntax = node.text().slice(range).to_string();
+
+    syntax.trim_end().to_owned()
 }
 
 fn replacement_range(ctx: &CompletionContext, item: &SyntaxNode) -> TextRange {
@@ -655,8 +662,7 @@ trait Test {
 struct T;
 
 impl Test for T {
-    fn foo<T>()
-where T: Into<String> {
+    fn foo<T>() where T: Into<String> {
     $0
 }
 }
@@ -675,6 +681,27 @@ trait Test {
 
 impl Test for () {
     type S$0
+}
+"#,
+            "
+trait Test {
+    type SomeType;
+}
+
+impl Test for () {
+    type SomeType = $0;\n\
+}
+",
+        );
+        check_edit(
+            "type SomeType",
+            r#"
+trait Test {
+    type SomeType;
+}
+
+impl Test for () {
+    type$0
 }
 "#,
             "
@@ -992,7 +1019,7 @@ trait SomeTrait<T> {}
 
 trait Foo<T> {
     fn function()
-    where Self: SomeTrait<T>;
+        where Self: SomeTrait<T>;
 }
 struct Bar;
 
@@ -1005,13 +1032,13 @@ trait SomeTrait<T> {}
 
 trait Foo<T> {
     fn function()
-    where Self: SomeTrait<T>;
+        where Self: SomeTrait<T>;
 }
 struct Bar;
 
 impl Foo<u32> for Bar {
     fn function()
-where Self: SomeTrait<u32> {
+        where Self: SomeTrait<u32> {
     $0
 }
 }
@@ -1050,6 +1077,53 @@ impl Tr for () {
             expect![[r#"
             fn fn required()
         "#]],
+        );
+    }
+
+    #[test]
+    fn fixes_up_macro_generated() {
+        check_edit(
+            "fn foo",
+            r#"
+macro_rules! noop {
+    ($($item: item)*) => {
+        $($item)*
+    }
+}
+
+noop! {
+    trait Foo {
+        fn foo(&mut self, bar: i64, baz: &mut u32) -> Result<(), u32>;
+    }
+}
+
+struct Test;
+
+impl Foo for Test {
+    $0
+}
+"#,
+            r#"
+macro_rules! noop {
+    ($($item: item)*) => {
+        $($item)*
+    }
+}
+
+noop! {
+    trait Foo {
+        fn foo(&mut self, bar: i64, baz: &mut u32) -> Result<(), u32>;
+    }
+}
+
+struct Test;
+
+impl Foo for Test {
+    fn foo(&mut self,bar:i64,baz: &mut u32) -> Result<(),u32> {
+    $0
+}
+}
+"#,
         );
     }
 }

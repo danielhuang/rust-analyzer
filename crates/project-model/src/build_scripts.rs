@@ -6,11 +6,7 @@
 //! This module implements this second part. We use "build script" terminology
 //! here, but it covers procedural macros as well.
 
-use std::{
-    io,
-    path::PathBuf,
-    process::{Command, Stdio},
-};
+use std::{cell::RefCell, io, path::PathBuf, process::Command};
 
 use cargo_metadata::{camino::Utf8Path, Message};
 use la_arena::ArenaMap;
@@ -22,7 +18,7 @@ use crate::{cfg_flag::CfgFlag, CargoConfig, CargoWorkspace, Package};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WorkspaceBuildScripts {
-    pub(crate) outputs: ArenaMap<Package, BuildScriptOutput>,
+    outputs: ArenaMap<Package, Option<BuildScriptOutput>>,
     error: Option<String>,
 }
 
@@ -76,6 +72,7 @@ impl WorkspaceBuildScripts {
 
         cmd
     }
+
     pub(crate) fn run(
         config: &CargoConfig,
         workspace: &CargoWorkspace,
@@ -94,28 +91,28 @@ impl WorkspaceBuildScripts {
 
         cmd.current_dir(workspace.workspace_root());
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-
         let mut res = WorkspaceBuildScripts::default();
+        let outputs = &mut res.outputs;
         // NB: Cargo.toml could have been modified between `cargo metadata` and
         // `cargo check`. We shouldn't assume that package ids we see here are
         // exactly those from `config`.
         let mut by_id: FxHashMap<String, Package> = FxHashMap::default();
-
         for package in workspace.packages() {
-            res.outputs.insert(package, BuildScriptOutput::default());
+            outputs.insert(package, None);
             by_id.insert(workspace[package].id.clone(), package);
         }
 
-        let mut cfg_err = None;
-        let mut stderr = String::new();
+        let errors = RefCell::new(String::new());
+        let push_err = |err: &str| {
+            let mut e = errors.borrow_mut();
+            e.push_str(err);
+            e.push('\n');
+        };
+
+        tracing::info!("Running build scripts: {:?}", cmd);
         let output = stdx::process::streaming_output(
             cmd,
             &mut |line| {
-                if cfg_err.is_some() {
-                    return;
-                }
-
                 // Copy-pasted from existing cargo_metadata. It seems like we
                 // should be using serde_stacker here?
                 let mut deserializer = serde_json::Deserializer::from_str(line);
@@ -135,7 +132,7 @@ impl WorkspaceBuildScripts {
                                 match cfg.parse::<CfgFlag>() {
                                     Ok(it) => acc.push(it),
                                     Err(err) => {
-                                        cfg_err = Some(format!(
+                                        push_err(&format!(
                                             "invalid cfg from cargo-metadata: {}",
                                             err
                                         ));
@@ -145,17 +142,18 @@ impl WorkspaceBuildScripts {
                             }
                             acc
                         };
-                        let package_build_data = &mut res.outputs[package];
                         // cargo_metadata crate returns default (empty) path for
                         // older cargos, which is not absolute, so work around that.
-                        if !message.out_dir.as_str().is_empty() {
-                            let out_dir =
-                                AbsPathBuf::assert(PathBuf::from(message.out_dir.into_os_string()));
-                            package_build_data.out_dir = Some(out_dir);
-                            package_build_data.cfgs = cfgs;
+                        let out_dir = message.out_dir.into_os_string();
+                        if !out_dir.is_empty() {
+                            let data = outputs[package].get_or_insert_with(Default::default);
+                            data.out_dir = Some(AbsPathBuf::assert(PathBuf::from(out_dir)));
+                            data.cfgs = cfgs;
                         }
-
-                        package_build_data.envs = message.env;
+                        if !message.env.is_empty() {
+                            outputs[package].get_or_insert_with(Default::default).envs =
+                                message.env;
+                        }
                     }
                     Message::CompilerArtifact(message) => {
                         let package = match by_id.get(&message.package_id.repr) {
@@ -171,12 +169,18 @@ impl WorkspaceBuildScripts {
                                 message.filenames.iter().find(|name| is_dylib(name))
                             {
                                 let filename = AbsPathBuf::assert(PathBuf::from(&filename));
-                                res.outputs[package].proc_macro_dylib_path = Some(filename);
+                                outputs[package]
+                                    .get_or_insert_with(Default::default)
+                                    .proc_macro_dylib_path = Some(filename);
                             }
                         }
                     }
                     Message::CompilerMessage(message) => {
                         progress(message.target.name);
+
+                        if let Some(diag) = message.message.rendered.as_deref() {
+                            push_err(diag);
+                        }
                     }
                     Message::BuildFinished(_) => {}
                     Message::TextLine(_) => {}
@@ -184,37 +188,33 @@ impl WorkspaceBuildScripts {
                 }
             },
             &mut |line| {
-                stderr.push_str(line);
-                stderr.push('\n');
+                push_err(line);
             },
         )?;
 
         for package in workspace.packages() {
-            let package_build_data = &mut res.outputs[package];
-            tracing::info!(
-                "{} BuildScriptOutput: {:?}",
-                workspace[package].manifest.parent().display(),
-                package_build_data,
-            );
-            // inject_cargo_env(package, package_build_data);
-            if let Some(out_dir) = &package_build_data.out_dir {
-                // NOTE: cargo and rustc seem to hide non-UTF-8 strings from env! and option_env!()
-                if let Some(out_dir) = out_dir.as_os_str().to_str().map(|s| s.to_owned()) {
-                    package_build_data.envs.push(("OUT_DIR".to_string(), out_dir));
+            if let Some(package_build_data) = &mut outputs[package] {
+                tracing::info!(
+                    "{}: {:?}",
+                    workspace[package].manifest.parent().display(),
+                    package_build_data,
+                );
+                // inject_cargo_env(package, package_build_data);
+                if let Some(out_dir) = &package_build_data.out_dir {
+                    // NOTE: cargo and rustc seem to hide non-UTF-8 strings from env! and option_env!()
+                    if let Some(out_dir) = out_dir.as_os_str().to_str().map(|s| s.to_owned()) {
+                        package_build_data.envs.push(("OUT_DIR".to_string(), out_dir));
+                    }
                 }
             }
         }
 
-        if let Some(cfg_err) = cfg_err {
-            stderr.push_str(&cfg_err);
-            stderr.push('\n');
-        }
-
+        let mut errors = errors.into_inner();
         if !output.status.success() {
-            if stderr.is_empty() {
-                stderr = "cargo check failed".to_string();
+            if errors.is_empty() {
+                errors = "cargo check failed".to_string();
             }
-            res.error = Some(stderr)
+            res.error = Some(errors);
         }
 
         Ok(res)
@@ -222,6 +222,10 @@ impl WorkspaceBuildScripts {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    pub(crate) fn get_output(&self, idx: Package) -> Option<&BuildScriptOutput> {
+        self.outputs.get(idx)?.as_ref()
     }
 }
 

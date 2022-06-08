@@ -11,6 +11,7 @@ import { AstInspector } from "./ast_inspector";
 import { isRustDocument, isCargoTomlDocument, sleep, isRustEditor } from "./util";
 import { startDebugSession, makeDebugConfig } from "./debug";
 import { LanguageClient } from "vscode-languageclient/node";
+import { LINKED_COMMANDS } from "./client";
 
 export * from "./ast_inspector";
 export * from "./run";
@@ -124,8 +125,9 @@ export function joinLines(ctx: Ctx): Cmd {
                 editor.document
             ),
         });
-        await editor.edit(async (builder) => {
-            (await client.protocol2CodeConverter.asTextEdits(items)).forEach((edit: any) => {
+        const textEdits = await client.protocol2CodeConverter.asTextEdits(items);
+        await editor.edit((builder) => {
+            textEdits.forEach((edit: any) => {
                 builder.replace(edit.range, edit.newText);
             });
         });
@@ -926,5 +928,15 @@ export function newDebugConfig(ctx: Ctx): Cmd {
         if (!item) return;
 
         await makeDebugConfig(ctx, item.runnable);
+    };
+}
+
+export function linkToCommand(ctx: Ctx): Cmd {
+    return async (commandId: string) => {
+        const link = LINKED_COMMANDS.get(commandId);
+        if (ctx.client && link) {
+            const { command, arguments: args = [] } = link;
+            await vscode.commands.executeCommand(command, ...args);
+        }
     };
 }

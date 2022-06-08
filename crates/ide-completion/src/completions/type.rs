@@ -13,14 +13,14 @@ use crate::{
 
 pub(crate) fn complete_type_path(acc: &mut Completions, ctx: &CompletionContext) {
     let _p = profile::span("complete_type_path");
-    if ctx.is_path_disallowed() {
-        return;
-    }
 
     let (&is_absolute_path, qualifier) = match ctx.path_context() {
-        Some(PathCompletionCtx { kind: PathKind::Type, is_absolute_path, qualifier, .. }) => {
-            (is_absolute_path, qualifier)
-        }
+        Some(PathCompletionCtx {
+            kind: PathKind::Type { .. },
+            is_absolute_path,
+            qualifier,
+            ..
+        }) => (is_absolute_path, qualifier),
         _ => return,
     };
 

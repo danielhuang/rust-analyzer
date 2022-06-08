@@ -57,7 +57,7 @@ pub fn insert_ws_into(syn: SyntaxNode) -> SyntaxNode {
             |f: fn(SyntaxKind) -> bool, default| -> bool { last.map(f).unwrap_or(default) };
 
         match tok.kind() {
-            k if is_text(k) && is_next(|it| !it.is_punct(), true) => {
+            k if is_text(k) && is_next(|it| !it.is_punct() || it == UNDERSCORE, false) => {
                 mods.push(do_ws(after, tok));
             }
             L_CURLY if is_next(|it| it != R_CURLY, true) => {
@@ -114,9 +114,13 @@ pub fn insert_ws_into(syn: SyntaxNode) -> SyntaxNode {
         ted::insert(pos, insert);
     }
 
+    if let Some(it) = syn.last_token().filter(|it| it.kind() == SyntaxKind::WHITESPACE) {
+        ted::remove(it);
+    }
+
     syn
 }
 
 fn is_text(k: SyntaxKind) -> bool {
-    k.is_keyword() || k.is_literal() || k == IDENT
+    k.is_keyword() || k.is_literal() || k == IDENT || k == UNDERSCORE
 }

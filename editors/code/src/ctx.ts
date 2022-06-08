@@ -81,18 +81,26 @@ export class Ctx {
         let icon = "";
         switch (status.health) {
             case "ok":
+                this.statusBar.command = undefined;
                 this.statusBar.color = undefined;
+                this.statusBar.backgroundColor = undefined;
                 break;
             case "warning":
                 this.statusBar.tooltip += "\nClick to reload.";
                 this.statusBar.command = "rust-analyzer.reloadWorkspace";
-                this.statusBar.color = new vscode.ThemeColor("notificationsWarningIcon.foreground");
+                this.statusBar.color = new vscode.ThemeColor("statusBarItem.warningForeground");
+                this.statusBar.backgroundColor = new vscode.ThemeColor(
+                    "statusBarItem.warningBackground"
+                );
                 icon = "$(warning) ";
                 break;
             case "error":
                 this.statusBar.tooltip += "\nClick to reload.";
                 this.statusBar.command = "rust-analyzer.reloadWorkspace";
-                this.statusBar.color = new vscode.ThemeColor("notificationsErrorIcon.foreground");
+                this.statusBar.color = new vscode.ThemeColor("statusBarItem.errorForeground");
+                this.statusBar.backgroundColor = new vscode.ThemeColor(
+                    "statusBarItem.errorBackground"
+                );
                 icon = "$(error) ";
                 break;
         }

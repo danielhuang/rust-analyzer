@@ -3598,6 +3598,72 @@ const FOO$0: u8 = b'\x61';
             This is a doc
         "#]],
     );
+    // show float literal
+    check(
+        r#"
+    /// This is a doc
+    const FOO$0: f64 = 1.0234;
+    "#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: f64 = 1.0234
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
+    //show float typecasted from int
+    check(
+        r#"
+/// This is a doc
+const FOO$0: f32 = 1f32;
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: f32 = 1.0
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
+    //show f64 typecasted from float
+    check(
+        r#"
+/// This is a doc
+const FOO$0: f64 = 1.0f64;
+"#,
+        expect![[r#"
+            *FOO*
+
+            ```rust
+            test
+            ```
+
+            ```rust
+            const FOO: f64 = 1.0
+            ```
+
+            ---
+
+            This is a doc
+        "#]],
+    );
 }
 
 #[test]
@@ -3796,6 +3862,7 @@ cosnt _: &str$0 = ""; }
 
 //- /libstd.rs crate:std
 /// Docs for prim_str
+/// [`foo`](../std/keyword.foo.html)
 mod prim_str {}
 "#,
         expect![[r#"
@@ -3808,6 +3875,7 @@ mod prim_str {}
                 ---
 
                 Docs for prim_str
+                [`foo`](https://doc.rust-lang.org/nightly/std/keyword.foo.html)
             "#]],
     );
 }

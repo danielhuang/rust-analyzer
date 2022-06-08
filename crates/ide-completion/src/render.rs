@@ -286,7 +286,7 @@ fn render_resolution_simple_(
     // Add `<>` for generic types
     let type_path_no_ty_args = matches!(
         ctx.completion.path_context(),
-        Some(PathCompletionCtx { kind: PathKind::Type, has_type_args: false, .. })
+        Some(PathCompletionCtx { kind: PathKind::Type { .. }, has_type_args: false, .. })
     ) && ctx.completion.config.callable.is_some();
     if type_path_no_ty_args {
         if let Some(cap) = ctx.snippet_cap() {
@@ -410,7 +410,7 @@ mod tests {
 
     #[track_caller]
     fn check_relevance_for_kinds(ra_fixture: &str, kinds: &[CompletionItemKind], expect: Expect) {
-        let mut actual = get_all_items(TEST_CONFIG, ra_fixture);
+        let mut actual = get_all_items(TEST_CONFIG, ra_fixture, None);
         actual.retain(|it| kinds.contains(&it.kind()));
         actual.sort_by_key(|it| cmp::Reverse(it.relevance().score()));
         check_relevance_(actual, expect);
@@ -418,7 +418,7 @@ mod tests {
 
     #[track_caller]
     fn check_relevance(ra_fixture: &str, expect: Expect) {
-        let mut actual = get_all_items(TEST_CONFIG, ra_fixture);
+        let mut actual = get_all_items(TEST_CONFIG, ra_fixture, None);
         actual.retain(|it| it.kind() != CompletionItemKind::Snippet);
         actual.retain(|it| it.kind() != CompletionItemKind::Keyword);
         actual.retain(|it| it.kind() != CompletionItemKind::BuiltinType);
@@ -1099,6 +1099,8 @@ fn go(world: &WorldSnapshot) { go(w$0) }
 "#,
             expect![[r#"
                 lc world [type+name+local]
+                st WorldSnapshot {…} []
+                st &WorldSnapshot {…} [type]
                 st WorldSnapshot []
                 fn go(…) []
             "#]],
@@ -1197,6 +1199,8 @@ fn main() {
                 lc s [name+local]
                 lc &mut s [type+name+local]
                 st S []
+                st &mut S [type]
+                st S []
                 fn main() []
                 fn foo(…) []
             "#]],
@@ -1266,6 +1270,8 @@ fn main() {
                 lc m [local]
                 lc t [local]
                 lc &t [type+local]
+                st S []
+                st &S [type]
                 st T []
                 st S []
                 fn main() []
@@ -1311,6 +1317,8 @@ fn main() {
                 lc m [local]
                 lc t [local]
                 lc &mut t [type+local]
+                st S []
+                st &mut S [type]
                 st T []
                 st S []
                 fn main() []
@@ -1405,6 +1413,8 @@ fn main() {
 }
 "#,
             expect![[r#"
+                st S []
+                st &S [type]
                 st T []
                 st S []
                 fn main() []

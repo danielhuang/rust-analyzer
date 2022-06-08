@@ -312,9 +312,9 @@ impl ProjectWorkspace {
                         let pkg_root = cargo[pkg].manifest.parent().to_path_buf();
 
                         let mut include = vec![pkg_root.clone()];
-                        include.extend(
-                            build_scripts.outputs.get(pkg).and_then(|it| it.out_dir.clone()),
-                        );
+                        let out_dir =
+                            build_scripts.get_output(pkg).and_then(|it| it.out_dir.clone());
+                        include.extend(out_dir);
 
                         // In case target's path is manually set in Cargo.toml to be
                         // outside the package root, add its parent as an extra include.
@@ -389,14 +389,10 @@ impl ProjectWorkspace {
 
     pub fn to_crate_graph(
         &self,
-        dummy_replace: &FxHashMap<Box<str>, Box<[Box<str>]>>,
-        load_proc_macro: &mut dyn FnMut(&AbsPath, &[Box<str>]) -> Vec<ProcMacro>,
+        load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> Vec<ProcMacro>,
         load: &mut dyn FnMut(&AbsPath) -> Option<FileId>,
     ) -> CrateGraph {
         let _p = profile::span("ProjectWorkspace::to_crate_graph");
-        let load_proc_macro = &mut |crate_name: &_, path: &_| {
-            load_proc_macro(path, dummy_replace.get(crate_name).map(|it| &**it).unwrap_or_default())
-        };
 
         let mut crate_graph = match self {
             ProjectWorkspace::Json { project, sysroot, rustc_cfg } => project_json_to_crate_graph(
@@ -590,7 +586,7 @@ fn cargo_to_crate_graph(
                 let crate_id = add_target_crate_root(
                     &mut crate_graph,
                     &cargo[pkg],
-                    build_scripts.outputs.get(pkg),
+                    build_scripts.get_output(pkg),
                     cfg_options,
                     &mut |path| load_proc_macro(&cargo[tgt].name, path),
                     file_id,

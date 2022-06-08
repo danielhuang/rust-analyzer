@@ -81,7 +81,8 @@ pub use crate::{
     highlight_related::{HighlightRelatedConfig, HighlightedRange},
     hover::{HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult},
     inlay_hints::{
-        InlayHint, InlayHintsConfig, InlayKind, LifetimeElisionHints, RangeOrOffset, ReborrowHints,
+        ClosureReturnTypeHints, InlayHint, InlayHintsConfig, InlayKind, InlayTooltip,
+        LifetimeElisionHints, ReborrowHints,
     },
     join_lines::JoinLinesConfig,
     markup::Markup,
@@ -342,11 +343,16 @@ impl Analysis {
         &self,
         position: FilePosition,
         char_typed: char,
+        autoclose: bool,
     ) -> Cancellable<Option<SourceChange>> {
         // Fast path to not even parse the file.
         if !typing::TRIGGER_CHARS.contains(char_typed) {
             return Ok(None);
         }
+        if char_typed == '<' && !autoclose {
+            return Ok(None);
+        }
+
         self.with_db(|db| typing::on_char_typed(db, position, char_typed))
     }
 
@@ -542,8 +548,11 @@ impl Analysis {
         &self,
         config: &CompletionConfig,
         position: FilePosition,
+        trigger_character: Option<char>,
     ) -> Cancellable<Option<Vec<CompletionItem>>> {
-        self.with_db(|db| ide_completion::completions(db, config, position).map(Into::into))
+        self.with_db(|db| {
+            ide_completion::completions(db, config, position, trigger_character).map(Into::into)
+        })
     }
 
     /// Resolves additional completion data at the position given.
