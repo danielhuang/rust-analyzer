@@ -141,7 +141,7 @@ dependencies = [
  "async-rwlock",
  "cached_proc_macro",
  "cached_proc_macro_types",
- "hashbrown 0.12.0",
+ "hashbrown 0.12.1",
  "once_cell",
  "thiserror",
  "tokio",
