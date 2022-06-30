@@ -4,39 +4,40 @@ use hir::{db::HirDatabase, AsAssocItem, HirDisplay};
 use ide_db::{SnippetCap, SymbolKind};
 use itertools::Itertools;
 use stdx::{format_to, to_lower_snake_case};
-use syntax::SmolStr;
+use syntax::{AstNode, SmolStr};
 
 use crate::{
-    context::{
-        CompletionContext, DotAccess, DotAccessKind, NameRefContext, PathCompletionCtx, PathKind,
-    },
+    context::{CompletionContext, DotAccess, DotAccessKind, PathCompletionCtx, PathKind},
     item::{Builder, CompletionItem, CompletionItemKind, CompletionRelevance},
     render::{compute_exact_name_match, compute_ref_match, compute_type_match, RenderContext},
     CallableSnippets,
 };
 
-enum FuncKind {
-    Function,
-    Method(Option<hir::Name>),
+#[derive(Debug)]
+enum FuncKind<'ctx> {
+    Function(&'ctx PathCompletionCtx),
+    Method(&'ctx DotAccess, Option<hir::Name>),
 }
 
 pub(crate) fn render_fn(
     ctx: RenderContext<'_>,
+    path_ctx: &PathCompletionCtx,
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> Builder {
     let _p = profile::span("render_fn");
-    render(ctx, local_name, func, FuncKind::Function)
+    render(ctx, local_name, func, FuncKind::Function(path_ctx))
 }
 
 pub(crate) fn render_method(
     ctx: RenderContext<'_>,
+    dot_access: &DotAccess,
     receiver: Option<hir::Name>,
     local_name: Option<hir::Name>,
     func: hir::Function,
 ) -> Builder {
     let _p = profile::span("render_method");
-    render(ctx, local_name, func, FuncKind::Method(receiver))
+    render(ctx, local_name, func, FuncKind::Method(dot_access, receiver))
 }
 
 fn render(
@@ -50,7 +51,7 @@ fn render(
     let name = local_name.unwrap_or_else(|| func.name(db));
 
     let call = match &func_kind {
-        FuncKind::Method(Some(receiver)) => format!("{}.{}", receiver, &name).into(),
+        FuncKind::Method(_, Some(receiver)) => format!("{}.{}", receiver, &name).into(),
         _ => name.to_smol_str(),
     };
     let mut item = CompletionItem::new(
@@ -76,11 +77,14 @@ fn render(
     });
 
     if let Some(ref_match) = compute_ref_match(completion, &ret_type) {
-        // FIXME For now we don't properly calculate the edits for ref match
-        // completions on methods or qualified paths, so we've disabled them.
-        // See #8058.
-        if matches!(func_kind, FuncKind::Function) && ctx.completion.path_qual().is_none() {
-            item.ref_match(ref_match);
+        match func_kind {
+            FuncKind::Function(path_ctx) => {
+                item.ref_match(ref_match, path_ctx.path.syntax().text_range().start());
+            }
+            FuncKind::Method(DotAccess { receiver: Some(receiver), .. }, _) => {
+                item.ref_match(ref_match, receiver.syntax().text_range().start());
+            }
+            _ => (),
         }
     }
 
@@ -89,13 +93,34 @@ fn render(
         .detail(detail(db, func))
         .lookup_by(name.to_smol_str());
 
-    match completion.config.snippet_cap {
-        Some(cap) if should_add_parens(completion) => {
-            let (self_param, params) = params(completion, func, &func_kind);
-            add_call_parens(&mut item, completion, cap, call, self_param, params);
+    match ctx.completion.config.snippet_cap {
+        Some(cap) => {
+            let complete_params = match func_kind {
+                FuncKind::Function(PathCompletionCtx {
+                    kind: PathKind::Expr { .. },
+                    has_call_parens: false,
+                    ..
+                }) => Some(false),
+                FuncKind::Method(
+                    DotAccess {
+                        kind:
+                            DotAccessKind::Method { has_parens: false } | DotAccessKind::Field { .. },
+                        ..
+                    },
+                    _,
+                ) => Some(true),
+                _ => None,
+            };
+            if let Some(has_dot_receiver) = complete_params {
+                if let Some((self_param, params)) =
+                    params(ctx.completion, func, &func_kind, has_dot_receiver)
+                {
+                    add_call_parens(&mut item, completion, cap, call, self_param, params);
+                }
+            }
         }
         _ => (),
-    }
+    };
 
     match ctx.import_to_add {
         Some(import_to_add) => {
@@ -193,45 +218,6 @@ fn ref_of_param(ctx: &CompletionContext, arg: &str, ty: &hir::Type) -> &'static 
     ""
 }
 
-fn should_add_parens(ctx: &CompletionContext) -> bool {
-    if ctx.config.callable.is_none() {
-        return false;
-    }
-
-    match ctx.path_context() {
-        Some(PathCompletionCtx { kind: PathKind::Expr { .. }, has_call_parens: true, .. }) => {
-            return false
-        }
-        Some(PathCompletionCtx { kind: PathKind::Use | PathKind::Type { .. }, .. }) => {
-            cov_mark::hit!(no_parens_in_use_item);
-            return false;
-        }
-        _ => {}
-    };
-
-    if matches!(
-        ctx.nameref_ctx(),
-        Some(NameRefContext {
-            dot_access: Some(DotAccess { kind: DotAccessKind::Method { has_parens: true }, .. }),
-            ..
-        })
-    ) {
-        return false;
-    }
-
-    // Don't add parentheses if the expected type is some function reference.
-    if let Some(ty) = &ctx.expected_type {
-        // FIXME: check signature matches?
-        if ty.is_fn() {
-            cov_mark::hit!(no_call_parens_if_fn_ptr_needed);
-            return false;
-        }
-    }
-
-    // Nothing prevents us from adding parentheses
-    true
-}
-
 fn detail(db: &dyn HirDatabase, func: hir::Function) -> String {
     let mut ret_ty = func.ret_type(db);
     let mut detail = String::new();
@@ -281,13 +267,27 @@ fn params(
     ctx: &CompletionContext<'_>,
     func: hir::Function,
     func_kind: &FuncKind,
-) -> (Option<hir::SelfParam>, Vec<hir::Param>) {
-    let self_param = if ctx.has_dot_receiver() || matches!(func_kind, FuncKind::Method(Some(_))) {
+    has_dot_receiver: bool,
+) -> Option<(Option<hir::SelfParam>, Vec<hir::Param>)> {
+    if ctx.config.callable.is_none() {
+        return None;
+    }
+
+    // Don't add parentheses if the expected type is some function reference.
+    if let Some(ty) = &ctx.expected_type {
+        // FIXME: check signature matches?
+        if ty.is_fn() {
+            cov_mark::hit!(no_call_parens_if_fn_ptr_needed);
+            return None;
+        }
+    }
+
+    let self_param = if has_dot_receiver || matches!(func_kind, FuncKind::Method(_, Some(_))) {
         None
     } else {
         func.self_param(ctx.db)
     };
-    (self_param, func.params_without_self(ctx.db))
+    Some((self_param, func.params_without_self(ctx.db)))
 }
 
 #[cfg(test)]

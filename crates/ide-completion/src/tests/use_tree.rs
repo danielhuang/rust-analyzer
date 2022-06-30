@@ -10,18 +10,23 @@ fn check(ra_fixture: &str, expect: Expect) {
 
 #[test]
 fn use_tree_start() {
-    cov_mark::check!(unqualified_path_only_modules_in_import);
+    cov_mark::check!(unqualified_path_selected_only);
     check(
         r#"
 //- /lib.rs crate:main deps:other_crate
 use f$0
 
 struct Foo;
+enum FooBar {
+    Foo,
+    Bar
+}
 mod foo {}
 //- /other_crate/lib.rs crate:other_crate
 // nothing here
 "#,
         expect![[r#"
+            en FooBar::
             md foo
             md other_crate
             kw crate::
@@ -168,6 +173,27 @@ impl Foo {
 "#,
         expect![[r#"
             ev Variant Variant
+        "#]],
+    );
+}
+
+#[test]
+fn enum_no_parens_in_qualified_use_tree() {
+    cov_mark::check!(enum_plain_qualified_use_tree);
+    check(
+        r#"
+use Foo::$0
+
+enum Foo {
+    UnitVariant,
+    TupleVariant(),
+    RecordVariant {},
+}
+"#,
+        expect![[r#"
+            ev RecordVariant RecordVariant
+            ev TupleVariant  TupleVariant
+            ev UnitVariant   UnitVariant
         "#]],
     );
 }

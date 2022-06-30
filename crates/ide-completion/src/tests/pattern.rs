@@ -14,6 +14,18 @@ fn check(ra_fixture: &str, expect: Expect) {
 }
 
 #[test]
+fn wildcard() {
+    check(
+        r#"
+fn quux() {
+    let _$0
+}
+"#,
+        expect![""],
+    );
+}
+
+#[test]
 fn ident_rebind_pat() {
     check_empty(
         r#"
@@ -397,9 +409,7 @@ fn foo() {
 }
 "#,
         expect![[r#"
-            fn foo()   fn()
             st Bar
-            bt u32
             kw crate::
             kw self::
             kw super::
@@ -415,9 +425,7 @@ fn foo() {
 }
 "#,
         expect![[r#"
-            fn foo()   fn()
             st Foo
-            bt u32
             kw crate::
             kw self::
             kw super::
@@ -435,7 +443,7 @@ fn foo() {
 }
 "#,
         expect![[r#"
-            ev TupleVariant(…) TupleVariant
+            ev TupleVariant TupleVariant
         "#]],
     );
     check_empty(
@@ -450,7 +458,7 @@ fn foo() {
 }
 "#,
         expect![[r#"
-            ev RecordVariant {…} RecordVariant
+            ev RecordVariant RecordVariant
         "#]],
     );
 }

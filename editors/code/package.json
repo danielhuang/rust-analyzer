@@ -49,6 +49,7 @@
         "esbuild": "^0.14.27",
         "eslint": "^8.11.0",
         "eslint-config-prettier": "^8.5.0",
+        "ovsx": "^0.5.1",
         "prettier": "^2.6.2",
         "tslib": "^2.3.0",
         "typescript": "^4.6.3",
@@ -1115,6 +1116,11 @@
                         "Search in current workspace and dependencies."
                     ]
                 },
+                "rust-analyzer.restartServerOnConfigChange": {
+                    "markdownDescription": "Whether to restart the server automatically when certain settings that require a restart are changed.",
+                    "default": false,
+                    "type": "boolean"
+                },
                 "$generated-end": {}
             }
         },
@@ -1425,7 +1431,7 @@
             },
             {
                 "id": "public",
-                "description": "Style tems that are from the current crate and are `pub`"
+                "description": "Style for items that are from the current crate and are `pub`"
             },
             {
                 "id": "reference",

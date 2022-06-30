@@ -2,9 +2,10 @@
 
 use hir::{db::HirDatabase, Documentation, HasAttrs, StructKind};
 use ide_db::SymbolKind;
+use syntax::AstNode;
 
 use crate::{
-    context::{CompletionContext, PathCompletionCtx},
+    context::{CompletionContext, PathCompletionCtx, PathKind},
     item::{Builder, CompletionItem},
     render::{
         compute_ref_match, compute_type_match,
@@ -19,6 +20,7 @@ use crate::{
 
 pub(crate) fn render_variant_lit(
     ctx: RenderContext<'_>,
+    path_ctx: &PathCompletionCtx,
     local_name: Option<hir::Name>,
     variant: hir::Variant,
     path: Option<hir::ModPath>,
@@ -27,11 +29,12 @@ pub(crate) fn render_variant_lit(
     let db = ctx.db();
 
     let name = local_name.unwrap_or_else(|| variant.name(db));
-    render(ctx, Variant::EnumVariant(variant), name, path)
+    render(ctx, path_ctx, Variant::EnumVariant(variant), name, path)
 }
 
 pub(crate) fn render_struct_literal(
     ctx: RenderContext<'_>,
+    path_ctx: &PathCompletionCtx,
     strukt: hir::Struct,
     path: Option<hir::ModPath>,
     local_name: Option<hir::Name>,
@@ -40,19 +43,23 @@ pub(crate) fn render_struct_literal(
     let db = ctx.db();
 
     let name = local_name.unwrap_or_else(|| strukt.name(db));
-    render(ctx, Variant::Struct(strukt), name, path)
+    render(ctx, path_ctx, Variant::Struct(strukt), name, path)
 }
 
 fn render(
     ctx @ RenderContext { completion, .. }: RenderContext<'_>,
+    path_ctx: &PathCompletionCtx,
     thing: Variant,
     name: hir::Name,
     path: Option<hir::ModPath>,
 ) -> Option<Builder> {
     let db = completion.db;
-    let kind = thing.kind(db);
-    let has_call_parens =
-        matches!(completion.path_context(), Some(PathCompletionCtx { has_call_parens: true, .. }));
+    let mut kind = thing.kind(db);
+    let should_add_parens = match &path_ctx {
+        PathCompletionCtx { has_call_parens: true, .. } => false,
+        PathCompletionCtx { kind: PathKind::Use | PathKind::Type { .. }, .. } => false,
+        _ => true,
+    };
 
     let fields = thing.fields(completion)?;
     let (qualified_name, short_qualified_name, qualified) = match path {
@@ -69,10 +76,10 @@ fn render(
     let snippet_cap = ctx.snippet_cap();
 
     let mut rendered = match kind {
-        StructKind::Tuple if !has_call_parens => {
+        StructKind::Tuple if should_add_parens => {
             render_tuple_lit(db, snippet_cap, &fields, &qualified_name)
         }
-        StructKind::Record if !has_call_parens => {
+        StructKind::Record if should_add_parens => {
             render_record_lit(db, snippet_cap, &fields, &qualified_name)
         }
         _ => RenderedLiteral { literal: qualified_name.clone(), detail: qualified_name.clone() },
@@ -80,6 +87,11 @@ fn render(
 
     if snippet_cap.is_some() {
         rendered.literal.push_str("$0");
+    }
+
+    // only show name in label if not adding parens
+    if !should_add_parens {
+        kind = StructKind::Unit;
     }
 
     let mut item = CompletionItem::new(
@@ -106,7 +118,7 @@ fn render(
         ..ctx.completion_relevance()
     });
     if let Some(ref_match) = compute_ref_match(completion, &ty) {
-        item.ref_match(ref_match);
+        item.ref_match(ref_match, path_ctx.path.syntax().text_range().start());
     }
 
     if let Some(import_to_add) = ctx.import_to_add {

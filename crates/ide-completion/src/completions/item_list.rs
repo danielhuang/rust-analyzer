@@ -1,61 +1,53 @@
 //! Completion of paths and keywords at item list position.
 
 use crate::{
-    completions::module_or_fn_macro,
-    context::{ItemListKind, PathCompletionCtx, PathKind, PathQualifierCtx},
+    context::{ExprCtx, ItemListKind, PathCompletionCtx, Qualified},
     CompletionContext, Completions,
 };
 
-mod trait_impl;
+pub(crate) mod trait_impl;
 
-pub(crate) fn complete_item_list(acc: &mut Completions, ctx: &CompletionContext) {
+pub(crate) fn complete_item_list_in_expr(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    path_ctx: &PathCompletionCtx,
+    expr_ctx: &ExprCtx,
+) {
+    if !expr_ctx.in_block_expr {
+        return;
+    }
+    if !path_ctx.is_trivial_path() {
+        return;
+    }
+    add_keywords(acc, ctx, None);
+}
+
+pub(crate) fn complete_item_list(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
+    kind: &ItemListKind,
+) {
     let _p = profile::span("complete_item_list");
-
-    if let Some(_) = ctx.name_ctx() {
-        trait_impl::complete_trait_impl(acc, ctx);
-        return;
+    if path_ctx.is_trivial_path() {
+        add_keywords(acc, ctx, Some(kind));
     }
 
-    let (&is_absolute_path, path_qualifier, kind, is_trivial_path) = match ctx.path_context() {
-        Some(
-            ctx @ PathCompletionCtx {
-                kind: PathKind::Item { kind },
-                is_absolute_path,
-                qualifier,
-                ..
-            },
-        ) => (is_absolute_path, qualifier, Some(kind), ctx.is_trivial_path()),
-        Some(
-            ctx @ PathCompletionCtx {
-                kind: PathKind::Expr { in_block_expr: true, .. },
-                is_absolute_path,
-                qualifier,
-                ..
-            },
-        ) => (is_absolute_path, qualifier, None, ctx.is_trivial_path()),
-        _ => return,
-    };
-
-    if matches!(kind, Some(ItemListKind::TraitImpl)) {
-        trait_impl::complete_trait_impl(acc, ctx);
-    }
-
-    if is_trivial_path {
-        add_keywords(acc, ctx, kind);
-    }
-
-    if kind.is_none() {
-        // this is already handled by expression
-        return;
-    }
-
-    match path_qualifier {
-        Some(PathQualifierCtx { resolution, is_super_chain, .. }) => {
-            if let Some(hir::PathResolution::Def(hir::ModuleDef::Module(module))) = resolution {
-                for (name, def) in module.scope(ctx.db, Some(ctx.module)) {
-                    if let Some(def) = module_or_fn_macro(ctx.db, def) {
-                        acc.add_resolution(ctx, name, def);
+    match qualified {
+        Qualified::With {
+            resolution: Some(hir::PathResolution::Def(hir::ModuleDef::Module(module))),
+            is_super_chain,
+            ..
+        } => {
+            for (name, def) in module.scope(ctx.db, Some(ctx.module)) {
+                match def {
+                    hir::ScopeDef::ModuleDef(hir::ModuleDef::Macro(m)) if m.is_fn_like(ctx.db) => {
+                        acc.add_macro(ctx, path_ctx, m, name)
                     }
+                    hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+                        acc.add_module(ctx, path_ctx, m, name)
+                    }
+                    _ => (),
                 }
             }
 
@@ -63,16 +55,20 @@ pub(crate) fn complete_item_list(acc: &mut Completions, ctx: &CompletionContext)
                 acc.add_keyword(ctx, "super::");
             }
         }
-        None if is_absolute_path => acc.add_crate_roots(ctx),
-        None if ctx.qualifier_ctx.none() => {
-            ctx.process_all_names(&mut |name, def| {
-                if let Some(def) = module_or_fn_macro(ctx.db, def) {
-                    acc.add_resolution(ctx, name, def);
+        Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
+        Qualified::No if ctx.qualifier_ctx.none() => {
+            ctx.process_all_names(&mut |name, def| match def {
+                hir::ScopeDef::ModuleDef(hir::ModuleDef::Macro(m)) if m.is_fn_like(ctx.db) => {
+                    acc.add_macro(ctx, path_ctx, m, name)
                 }
+                hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+                    acc.add_module(ctx, path_ctx, m, name)
+                }
+                _ => (),
             });
             acc.add_nameref_keywords_with_colon(ctx);
         }
-        None => {}
+        Qualified::Infer | Qualified::No | Qualified::With { .. } => {}
     }
 }
 
@@ -83,7 +79,7 @@ fn add_keywords(acc: &mut Completions, ctx: &CompletionContext, kind: Option<&It
     let in_assoc_non_trait_impl = matches!(kind, Some(ItemListKind::Impl | ItemListKind::Trait));
     let in_extern_block = matches!(kind, Some(ItemListKind::ExternBlock));
     let in_trait = matches!(kind, Some(ItemListKind::Trait));
-    let in_trait_impl = matches!(kind, Some(ItemListKind::TraitImpl));
+    let in_trait_impl = matches!(kind, Some(ItemListKind::TraitImpl(_)));
     let in_inherent_impl = matches!(kind, Some(ItemListKind::Impl));
     let no_qualifiers = ctx.qualifier_ctx.vis_node.is_none();
     let in_block = matches!(kind, None);

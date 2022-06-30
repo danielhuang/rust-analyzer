@@ -7,7 +7,7 @@ use std::{collections::VecDeque, fmt, fs, process::Command};
 use anyhow::{format_err, Context, Result};
 use base_db::{
     CrateDisplayName, CrateGraph, CrateId, CrateName, CrateOrigin, Dependency, Edition, Env,
-    FileId, LangCrateOrigin, ProcMacro,
+    FileId, LangCrateOrigin, ProcMacroLoadResult,
 };
 use cfg::{CfgDiff, CfgOptions};
 use paths::{AbsPath, AbsPathBuf};
@@ -389,7 +389,7 @@ impl ProjectWorkspace {
 
     pub fn to_crate_graph(
         &self,
-        load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> Vec<ProcMacro>,
+        load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> ProcMacroLoadResult,
         load: &mut dyn FnMut(&AbsPath) -> Option<FileId>,
     ) -> CrateGraph {
         let _p = profile::span("ProjectWorkspace::to_crate_graph");
@@ -434,7 +434,7 @@ impl ProjectWorkspace {
 
 fn project_json_to_crate_graph(
     rustc_cfg: Vec<CfgFlag>,
-    load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> Vec<ProcMacro>,
+    load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> ProcMacroLoadResult,
     load: &mut dyn FnMut(&AbsPath) -> Option<FileId>,
     project: &ProjectJson,
     sysroot: &Option<Sysroot>,
@@ -454,12 +454,13 @@ fn project_json_to_crate_graph(
         })
         .map(|(crate_id, krate, file_id)| {
             let env = krate.env.clone().into_iter().collect();
-            let proc_macro = krate.proc_macro_dylib_path.clone().map(|it| {
-                load_proc_macro(
+            let proc_macro = match krate.proc_macro_dylib_path.clone() {
+                Some(it) => load_proc_macro(
                     krate.display_name.as_ref().map(|it| it.canonical_name()).unwrap_or(""),
                     &it,
-                )
-            });
+                ),
+                None => Err("no proc macro dylib present".into()),
+            };
 
             let target_cfgs = match krate.target.as_deref() {
                 Some(target) => {
@@ -480,7 +481,7 @@ fn project_json_to_crate_graph(
                     cfg_options.clone(),
                     cfg_options,
                     env,
-                    proc_macro.unwrap_or_default(),
+                    proc_macro,
                     krate.is_proc_macro,
                     if krate.display_name.is_some() {
                         CrateOrigin::CratesIo { repo: krate.repository.clone() }
@@ -521,7 +522,7 @@ fn project_json_to_crate_graph(
 fn cargo_to_crate_graph(
     rustc_cfg: Vec<CfgFlag>,
     override_cfg: &CfgOverrides,
-    load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> Vec<ProcMacro>,
+    load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> ProcMacroLoadResult,
     load: &mut dyn FnMut(&AbsPath) -> Option<FileId>,
     cargo: &CargoWorkspace,
     build_scripts: &WorkspaceBuildScripts,
@@ -540,8 +541,6 @@ fn cargo_to_crate_graph(
 
     let mut pkg_to_lib_crate = FxHashMap::default();
 
-    // Add test cfg for non-sysroot crates
-    cfg_options.insert_atom("test".into());
     cfg_options.insert_atom("debug_assertions".into());
 
     let mut pkg_crates = FxHashMap::default();
@@ -549,13 +548,17 @@ fn cargo_to_crate_graph(
     let mut has_private = false;
     // Next, create crates for each package, target pair
     for pkg in cargo.packages() {
-        let mut cfg_options = &cfg_options;
-        let mut replaced_cfg_options;
+        let mut cfg_options = cfg_options.clone();
 
         let overrides = match override_cfg {
             CfgOverrides::Wildcard(cfg_diff) => Some(cfg_diff),
             CfgOverrides::Selective(cfg_overrides) => cfg_overrides.get(&cargo[pkg].name),
         };
+
+        // Add test cfg for local crates
+        if cargo[pkg].is_local {
+            cfg_options.insert_atom("test".into());
+        }
 
         if let Some(overrides) = overrides {
             // FIXME: this is sort of a hack to deal with #![cfg(not(test))] vanishing such as seen
@@ -565,9 +568,7 @@ fn cargo_to_crate_graph(
             // A more ideal solution might be to reanalyze crates based on where the cursor is and
             // figure out the set of cfgs that would have to apply to make it active.
 
-            replaced_cfg_options = cfg_options.clone();
-            replaced_cfg_options.apply_diff(overrides.clone());
-            cfg_options = &replaced_cfg_options;
+            cfg_options.apply_diff(overrides.clone());
         };
 
         has_private |= cargo[pkg].metadata.rustc_private;
@@ -587,7 +588,7 @@ fn cargo_to_crate_graph(
                     &mut crate_graph,
                     &cargo[pkg],
                     build_scripts.get_output(pkg),
-                    cfg_options,
+                    cfg_options.clone(),
                     &mut |path| load_proc_macro(&cargo[tgt].name, path),
                     file_id,
                     &cargo[tgt].name,
@@ -667,6 +668,7 @@ fn cargo_to_crate_graph(
                 &public_deps,
                 cargo,
                 &pkg_crates,
+                build_scripts,
             );
         }
     }
@@ -707,7 +709,7 @@ fn detached_files_to_crate_graph(
             cfg_options.clone(),
             cfg_options.clone(),
             Env::default(),
-            Vec::new(),
+            Ok(Vec::new()),
             false,
             CrateOrigin::CratesIo { repo: None },
         );
@@ -723,11 +725,12 @@ fn handle_rustc_crates(
     crate_graph: &mut CrateGraph,
     cfg_options: &CfgOptions,
     override_cfg: &CfgOverrides,
-    load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> Vec<ProcMacro>,
+    load_proc_macro: &mut dyn FnMut(&str, &AbsPath) -> ProcMacroLoadResult,
     pkg_to_lib_crate: &mut FxHashMap<la_arena::Idx<crate::PackageData>, CrateId>,
     public_deps: &SysrootPublicDeps,
     cargo: &CargoWorkspace,
     pkg_crates: &FxHashMap<la_arena::Idx<crate::PackageData>, Vec<(CrateId, TargetKind)>>,
+    build_scripts: &WorkspaceBuildScripts,
 ) {
     let mut rustc_pkg_crates = FxHashMap::default();
     // The root package of the rustc-dev component is rustc_driver, so we match that
@@ -750,8 +753,7 @@ fn handle_rustc_crates(
                 queue.push_back(dep.pkg);
             }
 
-            let mut cfg_options = cfg_options;
-            let mut replaced_cfg_options;
+            let mut cfg_options = cfg_options.clone();
 
             let overrides = match override_cfg {
                 CfgOverrides::Wildcard(cfg_diff) => Some(cfg_diff),
@@ -768,9 +770,7 @@ fn handle_rustc_crates(
                 // A more ideal solution might be to reanalyze crates based on where the cursor is and
                 // figure out the set of cfgs that would have to apply to make it active.
 
-                replaced_cfg_options = cfg_options.clone();
-                replaced_cfg_options.apply_diff(overrides.clone());
-                cfg_options = &replaced_cfg_options;
+                cfg_options.apply_diff(overrides.clone());
             };
 
             for &tgt in rustc_workspace[pkg].targets.iter() {
@@ -781,8 +781,8 @@ fn handle_rustc_crates(
                     let crate_id = add_target_crate_root(
                         crate_graph,
                         &rustc_workspace[pkg],
-                        None,
-                        cfg_options,
+                        build_scripts.get_output(pkg),
+                        cfg_options.clone(),
                         &mut |path| load_proc_macro(&rustc_workspace[tgt].name, path),
                         file_id,
                         &rustc_workspace[tgt].name,
@@ -837,15 +837,21 @@ fn add_target_crate_root(
     crate_graph: &mut CrateGraph,
     pkg: &PackageData,
     build_data: Option<&BuildScriptOutput>,
-    cfg_options: &CfgOptions,
-    load_proc_macro: &mut dyn FnMut(&AbsPath) -> Vec<ProcMacro>,
+    cfg_options: CfgOptions,
+    load_proc_macro: &mut dyn FnMut(&AbsPath) -> ProcMacroLoadResult,
     file_id: FileId,
     cargo_name: &str,
     is_proc_macro: bool,
 ) -> CrateId {
     let edition = pkg.edition;
+    let mut potential_cfg_options = cfg_options.clone();
+    potential_cfg_options.extend(
+        pkg.features
+            .iter()
+            .map(|feat| CfgFlag::KeyValue { key: "feature".into(), value: feat.0.into() }),
+    );
     let cfg_options = {
-        let mut opts = cfg_options.clone();
+        let mut opts = cfg_options;
         for feature in pkg.active_features.iter() {
             opts.insert_key_value("feature".into(), feature.into());
         }
@@ -864,19 +870,13 @@ fn add_target_crate_root(
         }
     }
 
-    let proc_macro = build_data
-        .as_ref()
-        .and_then(|it| it.proc_macro_dylib_path.as_ref())
-        .map(|it| load_proc_macro(it))
-        .unwrap_or_default();
+    let proc_macro = match build_data.as_ref().map(|it| it.proc_macro_dylib_path.as_ref()) {
+        Some(Some(it)) => load_proc_macro(it),
+        Some(None) => Err("no proc macro dylib present".into()),
+        None => Err("crate has not (yet) been built".into()),
+    };
 
     let display_name = CrateDisplayName::from_canonical_name(cargo_name.to_string());
-    let mut potential_cfg_options = cfg_options.clone();
-    potential_cfg_options.extend(
-        pkg.features
-            .iter()
-            .map(|feat| CfgFlag::KeyValue { key: "feature".into(), value: feat.0.into() }),
-    );
     crate_graph.add_crate_root(
         file_id,
         edition,
@@ -920,7 +920,6 @@ fn sysroot_to_crate_graph(
             let file_id = load(&sysroot[krate].root)?;
 
             let env = Env::default();
-            let proc_macro = vec![];
             let display_name = CrateDisplayName::from_canonical_name(sysroot[krate].name.clone());
             let crate_id = crate_graph.add_crate_root(
                 file_id,
@@ -930,7 +929,7 @@ fn sysroot_to_crate_graph(
                 cfg_options.clone(),
                 cfg_options.clone(),
                 env,
-                proc_macro,
+                Err("no proc macro loaded for sysroot crate".into()),
                 false,
                 CrateOrigin::Lang(LangCrateOrigin::from(&*sysroot[krate].name)),
             );

@@ -3,20 +3,15 @@
 use ide_db::FxHashSet;
 
 use crate::{
-    context::{
-        CompletionContext, DotAccess, DotAccessKind, NameRefContext, PathCompletionCtx, PathKind,
-    },
+    context::{CompletionContext, DotAccess, DotAccessKind, ExprCtx, PathCompletionCtx, Qualified},
     CompletionItem, CompletionItemKind, Completions,
 };
 
 /// Complete dot accesses, i.e. fields or methods.
-pub(crate) fn complete_dot(acc: &mut Completions, ctx: &CompletionContext) {
-    let (dot_access, receiver_ty) = match ctx.nameref_ctx() {
-        Some(NameRefContext {
-            dot_access: Some(access @ DotAccess { receiver_ty: Some(receiver_ty), .. }),
-            ..
-        }) => (access, &receiver_ty.original),
-        _ => return complete_undotted_self(acc, ctx),
+pub(crate) fn complete_dot(acc: &mut Completions, ctx: &CompletionContext, dot_access: &DotAccess) {
+    let receiver_ty = match dot_access {
+        DotAccess { receiver_ty: Some(receiver_ty), .. } => &receiver_ty.original,
+        _ => return,
     };
 
     // Suggest .await syntax for types that implement Future trait
@@ -34,44 +29,69 @@ pub(crate) fn complete_dot(acc: &mut Completions, ctx: &CompletionContext) {
             acc,
             ctx,
             &receiver_ty,
-            |acc, field, ty| acc.add_field(ctx, None, field, &ty),
+            |acc, field, ty| acc.add_field(ctx, dot_access, None, field, &ty),
             |acc, field, ty| acc.add_tuple_field(ctx, None, field, &ty),
         );
     }
-    complete_methods(ctx, &receiver_ty, |func| acc.add_method(ctx, func, None, None));
+    complete_methods(ctx, &receiver_ty, |func| acc.add_method(ctx, dot_access, func, None, None));
 }
 
-fn complete_undotted_self(acc: &mut Completions, ctx: &CompletionContext) {
+pub(crate) fn complete_undotted_self(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    path_ctx: &PathCompletionCtx,
+    expr_ctx: &ExprCtx,
+) {
     if !ctx.config.enable_self_on_the_fly {
         return;
     }
-    match ctx.path_context() {
-        Some(
-            path_ctx @ PathCompletionCtx {
-                is_absolute_path: false,
-                qualifier: None,
-                kind: PathKind::Expr { .. },
-                ..
-            },
-        ) if path_ctx.is_trivial_path() && ctx.qualifier_ctx.none() => {}
+    if !path_ctx.is_trivial_path() {
+        return;
+    }
+    if !ctx.qualifier_ctx.none() {
+        return;
+    }
+    if !matches!(path_ctx.qualified, Qualified::No) {
+        return;
+    }
+    let self_param = match expr_ctx {
+        ExprCtx { self_param: Some(self_param), .. } => self_param,
         _ => return,
-    }
+    };
 
-    if let Some(func) = ctx.function_def.as_ref().and_then(|fn_| ctx.sema.to_def(fn_)) {
-        if let Some(self_) = func.self_param(ctx.db) {
-            let ty = self_.ty(ctx.db);
-            complete_fields(
-                acc,
+    let ty = self_param.ty(ctx.db);
+    complete_fields(
+        acc,
+        ctx,
+        &ty,
+        |acc, field, ty| {
+            acc.add_field(
                 ctx,
+                &DotAccess {
+                    receiver: None,
+                    receiver_ty: None,
+                    kind: DotAccessKind::Field { receiver_is_ambiguous_float_literal: false },
+                },
+                Some(hir::known::SELF_PARAM),
+                field,
                 &ty,
-                |acc, field, ty| acc.add_field(ctx, Some(hir::known::SELF_PARAM), field, &ty),
-                |acc, field, ty| acc.add_tuple_field(ctx, Some(hir::known::SELF_PARAM), field, &ty),
-            );
-            complete_methods(ctx, &ty, |func| {
-                acc.add_method(ctx, func, Some(hir::known::SELF_PARAM), None)
-            });
-        }
-    }
+            )
+        },
+        |acc, field, ty| acc.add_tuple_field(ctx, Some(hir::known::SELF_PARAM), field, &ty),
+    );
+    complete_methods(ctx, &ty, |func| {
+        acc.add_method(
+            ctx,
+            &DotAccess {
+                receiver: None,
+                receiver_ty: None,
+                kind: DotAccessKind::Method { has_parens: false },
+            },
+            func,
+            Some(hir::known::SELF_PARAM),
+            None,
+        )
+    });
 }
 
 fn complete_fields(
@@ -101,7 +121,7 @@ fn complete_methods(
     receiver.iterate_method_candidates(
         ctx.db,
         &ctx.scope,
-        &ctx.traits_in_scope().0,
+        &ctx.traits_in_scope(),
         Some(ctx.module),
         None,
         |func| {
@@ -117,10 +137,17 @@ fn complete_methods(
 mod tests {
     use expect_test::{expect, Expect};
 
-    use crate::tests::{check_edit, completion_list_no_kw};
+    use crate::tests::{
+        check_edit, completion_list_no_kw, completion_list_no_kw_with_private_editable,
+    };
 
     fn check(ra_fixture: &str, expect: Expect) {
         let actual = completion_list_no_kw(ra_fixture);
+        expect.assert_eq(&actual);
+    }
+
+    fn check_with_private_editable(ra_fixture: &str, expect: Expect) {
+        let actual = completion_list_no_kw_with_private_editable(ra_fixture);
         expect.assert_eq(&actual);
     }
 
@@ -202,10 +229,7 @@ pub mod m {
 fn foo(a: lib::m::A) { a.$0 }
 "#,
             expect![[r#"
-                fd crate_field   u32
-                fd private_field u32
-                fd pub_field     u32
-                fd super_field   u32
+                fd pub_field u32
             "#]],
         );
 
@@ -260,12 +284,110 @@ mod m {
 fn foo(a: lib::A) { a.$0 }
 "#,
             expect![[r#"
+                me pub_method() fn(&self)
+            "#]],
+        );
+        check(
+            r#"
+//- /lib.rs crate:lib new_source_root:library
+pub struct A {}
+mod m {
+    impl super::A {
+        fn private_method(&self) {}
+        pub(crate) fn crate_method(&self) {}
+        pub fn pub_method(&self) {}
+    }
+}
+//- /main.rs crate:main deps:lib new_source_root:local
+fn foo(a: lib::A) { a.$0 }
+"#,
+            expect![[r#"
+                me pub_method() fn(&self)
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_visibility_filtering_with_private_editable_enabled() {
+        check_with_private_editable(
+            r#"
+//- /lib.rs crate:lib new_source_root:local
+pub mod m {
+    pub struct A {
+        private_field: u32,
+        pub pub_field: u32,
+        pub(crate) crate_field: u32,
+        pub(super) super_field: u32,
+    }
+}
+//- /main.rs crate:main deps:lib new_source_root:local
+fn foo(a: lib::m::A) { a.$0 }
+"#,
+            expect![[r#"
+                fd crate_field   u32
+                fd private_field u32
+                fd pub_field     u32
+                fd super_field   u32
+            "#]],
+        );
+
+        check_with_private_editable(
+            r#"
+//- /lib.rs crate:lib new_source_root:library
+pub mod m {
+    pub struct A {
+        private_field: u32,
+        pub pub_field: u32,
+        pub(crate) crate_field: u32,
+        pub(super) super_field: u32,
+    }
+}
+//- /main.rs crate:main deps:lib new_source_root:local
+fn foo(a: lib::m::A) { a.$0 }
+"#,
+            expect![[r#"
+                fd pub_field u32
+            "#]],
+        );
+
+        check_with_private_editable(
+            r#"
+//- /lib.rs crate:lib new_source_root:library
+pub mod m {
+    pub struct A(
+        i32,
+        pub f64,
+    );
+}
+//- /main.rs crate:main deps:lib new_source_root:local
+fn foo(a: lib::m::A) { a.$0 }
+"#,
+            expect![[r#"
+                fd 1 f64
+            "#]],
+        );
+
+        check_with_private_editable(
+            r#"
+//- /lib.rs crate:lib new_source_root:local
+pub struct A {}
+mod m {
+    impl super::A {
+        fn private_method(&self) {}
+        pub(crate) fn crate_method(&self) {}
+        pub fn pub_method(&self) {}
+    }
+}
+//- /main.rs crate:main deps:lib new_source_root:local
+fn foo(a: lib::A) { a.$0 }
+"#,
+            expect![[r#"
                 me crate_method()   fn(&self)
                 me private_method() fn(&self)
                 me pub_method()     fn(&self)
             "#]],
         );
-        check(
+        check_with_private_editable(
             r#"
 //- /lib.rs crate:lib new_source_root:library
 pub struct A {}

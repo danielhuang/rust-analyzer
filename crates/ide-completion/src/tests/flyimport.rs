@@ -1,14 +1,35 @@
 use expect_test::{expect, Expect};
 
-use crate::tests::{check_edit, check_edit_with_config, TEST_CONFIG};
+use crate::{
+    context::{CompletionAnalysis, NameContext, NameKind, NameRefKind},
+    tests::{check_edit, check_edit_with_config, TEST_CONFIG},
+};
 
 fn check(ra_fixture: &str, expect: Expect) {
     let config = TEST_CONFIG;
     let (db, position) = crate::tests::position(ra_fixture);
-    let ctx = crate::context::CompletionContext::new(&db, position, &config).unwrap();
+    let (ctx, analysis) = crate::context::CompletionContext::new(&db, position, &config).unwrap();
 
     let mut acc = crate::completions::Completions::default();
-    crate::completions::flyimport::import_on_the_fly(&mut acc, &ctx);
+    if let CompletionAnalysis::Name(NameContext { kind: NameKind::IdentPat(pat_ctx), .. }) =
+        &analysis
+    {
+        crate::completions::flyimport::import_on_the_fly_pat(&mut acc, &ctx, pat_ctx);
+    }
+    if let CompletionAnalysis::NameRef(name_ref_ctx) = &analysis {
+        match &name_ref_ctx.kind {
+            NameRefKind::Path(path) => {
+                crate::completions::flyimport::import_on_the_fly_path(&mut acc, &ctx, path);
+            }
+            NameRefKind::DotAccess(dot_access) => {
+                crate::completions::flyimport::import_on_the_fly_dot(&mut acc, &ctx, dot_access);
+            }
+            NameRefKind::Pattern(pattern) => {
+                crate::completions::flyimport::import_on_the_fly_pat(&mut acc, &ctx, pattern);
+            }
+            _ => (),
+        }
+    }
 
     expect.assert_eq(&super::render_completion_list(Vec::from(acc)));
 }

@@ -1,28 +1,23 @@
 //! Completion for use trees
 
 use hir::ScopeDef;
-use ide_db::FxHashSet;
+use ide_db::{FxHashSet, SymbolKind};
 use syntax::{ast, AstNode};
 
 use crate::{
-    context::{CompletionContext, NameRefContext, PathCompletionCtx, PathKind, PathQualifierCtx},
+    context::{CompletionContext, PathCompletionCtx, Qualified},
     item::Builder,
-    CompletionRelevance, Completions,
+    CompletionItem, CompletionItemKind, CompletionRelevance, Completions,
 };
 
-pub(crate) fn complete_use_tree(acc: &mut Completions, ctx: &CompletionContext) {
-    let (&is_absolute_path, qualifier, name_ref) = match ctx.nameref_ctx() {
-        Some(NameRefContext {
-            path_ctx:
-                Some(PathCompletionCtx { kind: PathKind::Use, is_absolute_path, qualifier, .. }),
-            nameref,
-            ..
-        }) => (is_absolute_path, qualifier, nameref),
-        _ => return,
-    };
-
-    match qualifier {
-        Some(PathQualifierCtx { path, resolution, is_super_chain, use_tree_parent, .. }) => {
+pub(crate) fn complete_use_path(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    path_ctx @ PathCompletionCtx { qualified, use_tree_parent, .. }: &PathCompletionCtx,
+    name_ref: &Option<ast::NameRef>,
+) {
+    match qualified {
+        Qualified::With { path, resolution: Some(resolution), is_super_chain } => {
             if *is_super_chain {
                 acc.add_keyword(ctx, "super::");
             }
@@ -36,13 +31,8 @@ pub(crate) fn complete_use_tree(acc: &mut Completions, ctx: &CompletionContext) 
                 acc.add_keyword(ctx, "self");
             }
 
-            let resolution = match resolution {
-                Some(it) => it,
-                None => return,
-            };
-
             let mut already_imported_names = FxHashSet::default();
-            if let Some(list) = ctx.token.ancestors().find_map(ast::UseTreeList::cast) {
+            if let Some(list) = ctx.token.parent_ancestors().find_map(ast::UseTreeList::cast) {
                 let use_tree = list.parent_use_tree();
                 if use_tree.path().as_ref() == Some(path) {
                     for tree in list.use_trees().filter(|tree| tree.is_simple_path()) {
@@ -78,7 +68,7 @@ pub(crate) fn complete_use_tree(acc: &mut Completions, ctx: &CompletionContext) 
                         };
 
                         if add_resolution {
-                            let mut builder = Builder::from_resolution(ctx, name, def);
+                            let mut builder = Builder::from_resolution(ctx, path_ctx, name, def);
                             builder.set_relevance(CompletionRelevance {
                                 is_name_already_imported,
                                 ..Default::default()
@@ -91,25 +81,43 @@ pub(crate) fn complete_use_tree(acc: &mut Completions, ctx: &CompletionContext) 
                     cov_mark::hit!(enum_plain_qualified_use_tree);
                     e.variants(ctx.db)
                         .into_iter()
-                        .for_each(|variant| acc.add_enum_variant(ctx, variant, None));
+                        .for_each(|variant| acc.add_enum_variant(ctx, path_ctx, variant, None));
                 }
                 _ => {}
             }
         }
         // fresh use tree with leading colon2, only show crate roots
-        None if is_absolute_path => {
+        Qualified::Absolute => {
             cov_mark::hit!(use_tree_crate_roots_only);
-            acc.add_crate_roots(ctx);
+            acc.add_crate_roots(ctx, path_ctx);
         }
-        // only show modules in a fresh UseTree
-        None => {
-            cov_mark::hit!(unqualified_path_only_modules_in_import);
+        // only show modules and non-std enum in a fresh UseTree
+        Qualified::No => {
+            cov_mark::hit!(unqualified_path_selected_only);
             ctx.process_all_names(&mut |name, res| {
-                if let ScopeDef::ModuleDef(hir::ModuleDef::Module(_)) = res {
-                    acc.add_resolution(ctx, name, res);
-                }
+                match res {
+                    ScopeDef::ModuleDef(hir::ModuleDef::Module(module)) => {
+                        acc.add_module(ctx, path_ctx, module, name);
+                    }
+                    ScopeDef::ModuleDef(hir::ModuleDef::Adt(hir::Adt::Enum(e))) => {
+                        // exclude prelude enum
+                        let is_builtin =
+                            res.krate(ctx.db).map_or(false, |krate| krate.is_builtin(ctx.db));
+
+                        if !is_builtin {
+                            let item = CompletionItem::new(
+                                CompletionItemKind::SymbolKind(SymbolKind::Enum),
+                                ctx.source_range(),
+                                format!("{}::", e.name(ctx.db)),
+                            );
+                            acc.add(item.build());
+                        }
+                    }
+                    _ => {}
+                };
             });
             acc.add_nameref_keywords_with_colon(ctx);
         }
+        Qualified::Infer | Qualified::With { resolution: None, .. } => {}
     }
 }

@@ -19,9 +19,13 @@ use crate::{
 /// `spam: &mut Spam` insert text/label will be suggested.
 ///
 /// Also complete parameters for closure or local functions from the surrounding defined locals.
-pub(crate) fn complete_fn_param(acc: &mut Completions, ctx: &CompletionContext) -> Option<()> {
-    let (param_list, _, param_kind) = match &ctx.pattern_ctx {
-        Some(PatternContext { param_ctx: Some(kind), .. }) => kind,
+pub(crate) fn complete_fn_param(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    pattern_ctx: &PatternContext,
+) -> Option<()> {
+    let ((param_list, _, param_kind), impl_) = match pattern_ctx {
+        PatternContext { param_ctx: Some(kind), impl_, .. } => (kind, impl_),
         _ => return None,
     };
 
@@ -41,7 +45,7 @@ pub(crate) fn complete_fn_param(acc: &mut Completions, ctx: &CompletionContext) 
 
     match param_kind {
         ParamKind::Function(function) => {
-            fill_fn_params(ctx, function, param_list, add_new_item_to_acc);
+            fill_fn_params(ctx, function, param_list, impl_, add_new_item_to_acc);
         }
         ParamKind::Closure(closure) => {
             let stmt_list = closure.syntax().ancestors().find_map(ast::StmtList::cast)?;
@@ -58,6 +62,7 @@ fn fill_fn_params(
     ctx: &CompletionContext,
     function: &ast::Fn,
     param_list: &ast::ParamList,
+    impl_: &Option<ast::Impl>,
     mut add_new_item_to_acc: impl FnMut(&str),
 ) {
     let mut file_params = FxHashMap::default();
@@ -73,7 +78,7 @@ fn fill_fn_params(
         });
     };
 
-    for node in ctx.token.ancestors() {
+    for node in ctx.token.parent_ancestors() {
         match_ast! {
             match node {
                 ast::SourceFile(it) => it.items().filter_map(|item| match item {
@@ -100,7 +105,7 @@ fn fill_fn_params(
     }
     remove_duplicated(&mut file_params, param_list.params());
     let self_completion_items = ["self", "&self", "mut self", "&mut self"];
-    if should_add_self_completions(ctx, param_list) {
+    if should_add_self_completions(param_list, impl_) {
         self_completion_items.into_iter().for_each(|self_item| add_new_item_to_acc(self_item));
     }
 
@@ -151,15 +156,14 @@ fn remove_duplicated(
     })
 }
 
-fn should_add_self_completions(ctx: &CompletionContext, param_list: &ast::ParamList) -> bool {
-    let inside_impl = ctx.impl_def.is_some();
+fn should_add_self_completions(param_list: &ast::ParamList, impl_: &Option<ast::Impl>) -> bool {
     let no_params = param_list.params().next().is_none() && param_list.self_param().is_none();
 
-    inside_impl && no_params
+    impl_.is_some() && no_params
 }
 
 fn comma_wrapper(ctx: &CompletionContext) -> Option<(impl Fn(&str) -> String, TextRange)> {
-    let param = ctx.token.ancestors().find(|node| node.kind() == SyntaxKind::PARAM)?;
+    let param = ctx.token.parent_ancestors().find(|node| node.kind() == SyntaxKind::PARAM)?;
 
     let next_token_kind = {
         let t = param.last_token()?.next_token()?;

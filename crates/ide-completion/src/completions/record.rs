@@ -1,24 +1,33 @@
 //! Complete fields in record literals and patterns.
 use ide_db::SymbolKind;
-use syntax::{ast::Expr, T};
+use syntax::ast::{self, Expr};
 
 use crate::{
-    context::{NameRefContext, PatternContext},
+    context::{DotAccess, DotAccessKind, ExprCtx, PathCompletionCtx, PatternContext, Qualified},
     CompletionContext, CompletionItem, CompletionItemKind, CompletionRelevance,
     CompletionRelevancePostfixMatch, Completions,
 };
 
-pub(crate) fn complete_record(acc: &mut Completions, ctx: &CompletionContext) -> Option<()> {
-    let missing_fields = if let Some(PatternContext { record_pat: Some(record_pat), .. }) =
-        &ctx.pattern_ctx
-    {
-        ctx.sema.record_pattern_missing_fields(record_pat)
-    } else if let Some(NameRefContext { record_expr: Some((record_expr, _)), .. }) =
-        ctx.nameref_ctx()
-    {
-        let ty = ctx.sema.type_of_expr(&Expr::RecordExpr(record_expr.clone()));
+pub(crate) fn complete_record_pattern_fields(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    pattern_ctx: &PatternContext,
+) {
+    if let PatternContext { record_pat: Some(record_pat), .. } = pattern_ctx {
+        complete_fields(acc, ctx, ctx.sema.record_pattern_missing_fields(record_pat));
+    }
+}
 
-        if let Some(hir::Adt::Union(un)) = ty.as_ref().and_then(|t| t.original.as_adt()) {
+pub(crate) fn complete_record_expr_fields(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    record_expr: &ast::RecordExpr,
+    &dot_prefix: &bool,
+) {
+    let ty = ctx.sema.type_of_expr(&Expr::RecordExpr(record_expr.clone()));
+
+    let missing_fields = match ty.as_ref().and_then(|t| t.original.as_adt()) {
+        Some(hir::Adt::Union(un)) => {
             // ctx.sema.record_literal_missing_fields will always return
             // an empty Vec on a union literal. This is normally
             // reasonable, but here we'd like to present the full list
@@ -28,47 +37,90 @@ pub(crate) fn complete_record(acc: &mut Completions, ctx: &CompletionContext) ->
 
             match were_fields_specified {
                 false => un.fields(ctx.db).into_iter().map(|f| (f, f.ty(ctx.db))).collect(),
-                true => vec![],
+                true => return,
             }
-        } else {
+        }
+        _ => {
             let missing_fields = ctx.sema.record_literal_missing_fields(record_expr);
-
-            let default_trait = ctx.famous_defs().core_default_Default();
-            let impl_default_trait =
-                default_trait.zip(ty.as_ref()).map_or(false, |(default_trait, ty)| {
-                    ty.original.impls_trait(ctx.db, default_trait, &[])
-                });
-
-            if impl_default_trait && !missing_fields.is_empty() && ctx.path_qual().is_none() {
-                let completion_text = "..Default::default()";
-                let mut item =
-                    CompletionItem::new(SymbolKind::Field, ctx.source_range(), completion_text);
-                let completion_text =
-                    completion_text.strip_prefix(ctx.token.text()).unwrap_or(completion_text);
-                item.insert_text(completion_text).set_relevance(CompletionRelevance {
-                    postfix_match: Some(CompletionRelevancePostfixMatch::Exact),
-                    ..Default::default()
-                });
-                item.add_to(acc);
-            }
-            if ctx.previous_token_is(T![.]) {
+            add_default_update(acc, ctx, ty, &missing_fields);
+            if dot_prefix {
                 let mut item =
                     CompletionItem::new(CompletionItemKind::Snippet, ctx.source_range(), "..");
                 item.insert_text(".");
                 item.add_to(acc);
-                return None;
+                return;
             }
             missing_fields
         }
-    } else {
-        return None;
     };
+    complete_fields(acc, ctx, missing_fields);
+}
 
-    for (field, ty) in missing_fields {
-        acc.add_field(ctx, None, field, &ty);
+// FIXME: This should probably be part of complete_path_expr
+pub(crate) fn complete_record_expr_func_update(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    path_ctx: &PathCompletionCtx,
+    expr_ctx: &ExprCtx,
+) {
+    if !matches!(path_ctx.qualified, Qualified::No) {
+        return;
     }
+    if let ExprCtx { is_func_update: Some(record_expr), .. } = expr_ctx {
+        let ty = ctx.sema.type_of_expr(&Expr::RecordExpr(record_expr.clone()));
 
-    Some(())
+        match ty.as_ref().and_then(|t| t.original.as_adt()) {
+            Some(hir::Adt::Union(_)) => (),
+            _ => {
+                let missing_fields = ctx.sema.record_literal_missing_fields(record_expr);
+                add_default_update(acc, ctx, ty, &missing_fields);
+            }
+        };
+    }
+}
+
+fn add_default_update(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    ty: Option<hir::TypeInfo>,
+    missing_fields: &[(hir::Field, hir::Type)],
+) {
+    let default_trait = ctx.famous_defs().core_default_Default();
+    let impl_default_trait = default_trait
+        .zip(ty.as_ref())
+        .map_or(false, |(default_trait, ty)| ty.original.impls_trait(ctx.db, default_trait, &[]));
+    if impl_default_trait && !missing_fields.is_empty() {
+        // FIXME: This should make use of scope_def like completions so we get all the other goodies
+        let completion_text = "..Default::default()";
+        let mut item = CompletionItem::new(SymbolKind::Field, ctx.source_range(), completion_text);
+        let completion_text =
+            completion_text.strip_prefix(ctx.token.text()).unwrap_or(completion_text);
+        item.insert_text(completion_text).set_relevance(CompletionRelevance {
+            postfix_match: Some(CompletionRelevancePostfixMatch::Exact),
+            ..Default::default()
+        });
+        item.add_to(acc);
+    }
+}
+
+fn complete_fields(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    missing_fields: Vec<(hir::Field, hir::Type)>,
+) {
+    for (field, ty) in missing_fields {
+        acc.add_field(
+            ctx,
+            &DotAccess {
+                receiver: None,
+                receiver_ty: None,
+                kind: DotAccessKind::Field { receiver_is_ambiguous_float_literal: false },
+            },
+            None,
+            field,
+            &ty,
+        );
+    }
 }
 
 #[cfg(test)]

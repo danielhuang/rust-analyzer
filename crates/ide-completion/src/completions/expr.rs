@@ -1,73 +1,57 @@
 //! Completion of names from the current scope in expression position.
 
 use hir::ScopeDef;
-use ide_db::FxHashSet;
-use syntax::T;
 
 use crate::{
-    context::{NameRefContext, PathCompletionCtx, PathKind, PathQualifierCtx},
+    context::{ExprCtx, PathCompletionCtx, Qualified},
     CompletionContext, Completions,
 };
 
-pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext) {
-    let _p = profile::span("complete_expr_path");
-
-    let (
-        is_absolute_path,
-        qualifier,
+pub(crate) fn complete_expr_path(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
+    &ExprCtx {
         in_block_expr,
         in_loop_body,
-        is_func_update,
         after_if_expr,
-        wants_mut_token,
-    ) = match ctx.nameref_ctx() {
-        Some(NameRefContext {
-            path_ctx:
-                Some(PathCompletionCtx {
-                    kind:
-                        PathKind::Expr { in_block_expr, in_loop_body, after_if_expr, ref_expr_parent },
-                    is_absolute_path,
-                    qualifier,
-                    ..
-                }),
-            record_expr,
-            ..
-        }) if ctx.qualifier_ctx.none() => (
-            *is_absolute_path,
-            qualifier,
-            *in_block_expr,
-            *in_loop_body,
-            record_expr.as_ref().map_or(false, |&(_, it)| it),
-            *after_if_expr,
-            ref_expr_parent.as_ref().map(|it| it.mut_token().is_none()).unwrap_or(false),
-        ),
-        _ => return,
+        in_condition,
+        incomplete_let,
+        ref ref_expr_parent,
+        ref is_func_update,
+        ref innermost_ret_ty,
+        ref impl_,
+        ..
+    }: &ExprCtx,
+) {
+    let _p = profile::span("complete_expr_path");
+    if !ctx.qualifier_ctx.none() {
+        return;
+    }
+
+    let wants_mut_token =
+        ref_expr_parent.as_ref().map(|it| it.mut_token().is_none()).unwrap_or(false);
+
+    let scope_def_applicable = |def| match def {
+        ScopeDef::GenericParam(hir::GenericParam::LifetimeParam(_)) | ScopeDef::Label(_) => false,
+        ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
+        _ => true,
     };
 
-    let scope_def_applicable = |def| {
-        use hir::{GenericParam::*, ModuleDef::*};
-        match def {
-            ScopeDef::GenericParam(LifetimeParam(_)) | ScopeDef::Label(_) => false,
-            // Don't suggest attribute macros and derives.
-            ScopeDef::ModuleDef(Macro(mac)) => mac.is_fn_like(ctx.db),
-            _ => true,
-        }
+    let add_assoc_item = |acc: &mut Completions, item| match item {
+        hir::AssocItem::Function(func) => acc.add_function(ctx, path_ctx, func, None),
+        hir::AssocItem::Const(ct) => acc.add_const(ctx, ct),
+        hir::AssocItem::TypeAlias(ty) => acc.add_type_alias(ctx, ty),
     };
 
-    match qualifier {
-        Some(PathQualifierCtx { is_infer_qualifier, resolution, .. }) => {
-            if *is_infer_qualifier {
-                ctx.traits_in_scope()
-                    .0
-                    .into_iter()
-                    .flat_map(|it| hir::Trait::from(it).items(ctx.sema.db))
-                    .for_each(|item| add_assoc_item(acc, ctx, item));
-                return;
-            }
-            let resolution = match resolution {
-                Some(it) => it,
-                None => return,
-            };
+    match qualified {
+        Qualified::Infer => ctx
+            .traits_in_scope()
+            .iter()
+            .flat_map(|&it| hir::Trait::from(it).items(ctx.sema.db))
+            .for_each(|item| add_assoc_item(acc, item)),
+        Qualified::With { resolution: None, .. } => {}
+        Qualified::With { resolution: Some(resolution), .. } => {
             // Add associated types on type parameters and `Self`.
             ctx.scope.assoc_type_shorthand_candidates(resolution, |_, alias| {
                 acc.add_type_alias(ctx, alias);
@@ -78,50 +62,36 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
                     let module_scope = module.scope(ctx.db, Some(ctx.module));
                     for (name, def) in module_scope {
                         if scope_def_applicable(def) {
-                            acc.add_resolution(ctx, name, def);
+                            acc.add_path_resolution(ctx, path_ctx, name, def);
                         }
                     }
                 }
-
                 hir::PathResolution::Def(
                     def @ (hir::ModuleDef::Adt(_)
                     | hir::ModuleDef::TypeAlias(_)
                     | hir::ModuleDef::BuiltinType(_)),
                 ) => {
-                    if let &hir::ModuleDef::Adt(hir::Adt::Enum(e)) = def {
-                        add_enum_variants(acc, ctx, e);
-                    }
                     let ty = match def {
                         hir::ModuleDef::Adt(adt) => adt.ty(ctx.db),
-                        hir::ModuleDef::TypeAlias(a) => {
-                            let ty = a.ty(ctx.db);
-                            if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
-                                cov_mark::hit!(completes_variant_through_alias);
-                                add_enum_variants(acc, ctx, e);
-                            }
-                            ty
-                        }
+                        hir::ModuleDef::TypeAlias(a) => a.ty(ctx.db),
                         hir::ModuleDef::BuiltinType(builtin) => {
                             cov_mark::hit!(completes_primitive_assoc_const);
                             builtin.ty(ctx.db)
                         }
-                        _ => unreachable!(),
+                        _ => return,
                     };
+
+                    if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
+                        cov_mark::hit!(completes_variant_through_alias);
+                        acc.add_enum_variants(ctx, path_ctx, e);
+                    }
 
                     // XXX: For parity with Rust bug #22519, this does not complete Ty::AssocType.
                     // (where AssocType is defined on a trait, not an inherent impl)
 
-                    ty.iterate_path_candidates(
-                        ctx.db,
-                        &ctx.scope,
-                        &ctx.traits_in_scope().0,
-                        Some(ctx.module),
-                        None,
-                        |item| {
-                            add_assoc_item(acc, ctx, item);
-                            None::<()>
-                        },
-                    );
+                    ctx.iterate_path_candidates(&ty, |item| {
+                        add_assoc_item(acc, item);
+                    });
 
                     // Iterate assoc types separately
                     ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
@@ -134,7 +104,7 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
                 hir::PathResolution::Def(hir::ModuleDef::Trait(t)) => {
                     // Handles `Trait::assoc` as well as `<Ty as Trait>::assoc`.
                     for item in t.items(ctx.db) {
-                        add_assoc_item(acc, ctx, item);
+                        add_assoc_item(acc, item);
                     }
                 }
                 hir::PathResolution::TypeParam(_) | hir::PathResolution::SelfType(_) => {
@@ -145,36 +115,23 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
                     };
 
                     if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
-                        add_enum_variants(acc, ctx, e);
+                        acc.add_enum_variants(ctx, path_ctx, e);
                     }
-                    let mut seen = FxHashSet::default();
-                    ty.iterate_path_candidates(
-                        ctx.db,
-                        &ctx.scope,
-                        &ctx.traits_in_scope().0,
-                        Some(ctx.module),
-                        None,
-                        |item| {
-                            // We might iterate candidates of a trait multiple times here, so deduplicate
-                            // them.
-                            if seen.insert(item) {
-                                add_assoc_item(acc, ctx, item);
-                            }
-                            None::<()>
-                        },
-                    );
+
+                    ctx.iterate_path_candidates(&ty, |item| {
+                        add_assoc_item(acc, item);
+                    });
                 }
                 _ => (),
             }
         }
-        None if is_absolute_path => acc.add_crate_roots(ctx),
-        None => {
+        Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
+        Qualified::No => {
             acc.add_nameref_keywords_with_colon(ctx);
             if let Some(adt) =
                 ctx.expected_type.as_ref().and_then(|ty| ty.strip_references().as_adt())
             {
-                let self_ty =
-                    (|| ctx.sema.to_def(ctx.impl_def.as_ref()?)?.self_ty(ctx.db).as_adt())();
+                let self_ty = (|| ctx.sema.to_def(impl_.as_ref()?)?.self_ty(ctx.db).as_adt())();
                 let complete_self = self_ty == Some(adt);
 
                 match adt {
@@ -184,10 +141,16 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
                             .find_use_path(ctx.db, hir::ModuleDef::from(strukt))
                             .filter(|it| it.len() > 1);
 
-                        acc.add_struct_literal(ctx, strukt, path, None);
+                        acc.add_struct_literal(ctx, path_ctx, strukt, path, None);
 
                         if complete_self {
-                            acc.add_struct_literal(ctx, strukt, None, Some(hir::known::SELF_TYPE));
+                            acc.add_struct_literal(
+                                ctx,
+                                path_ctx,
+                                strukt,
+                                None,
+                                Some(hir::known::SELF_TYPE),
+                            );
                         }
                     }
                     hir::Adt::Union(un) => {
@@ -202,20 +165,27 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
                         }
                     }
                     hir::Adt::Enum(e) => {
-                        super::enum_variants_with_paths(acc, ctx, e, |acc, ctx, variant, path| {
-                            acc.add_qualified_enum_variant(ctx, variant, path)
-                        });
+                        super::enum_variants_with_paths(
+                            acc,
+                            ctx,
+                            e,
+                            impl_,
+                            |acc, ctx, variant, path| {
+                                acc.add_qualified_enum_variant(ctx, path_ctx, variant, path)
+                            },
+                        );
                     }
                 }
             }
             ctx.process_all_names(&mut |name, def| {
                 if scope_def_applicable(def) {
-                    acc.add_resolution(ctx, name, def);
+                    acc.add_path_resolution(ctx, path_ctx, name, def);
                 }
             });
 
-            if !is_func_update {
-                let mut add_keyword = |kw, snippet| acc.add_keyword_snippet(ctx, kw, snippet);
+            if is_func_update.is_none() {
+                let mut add_keyword =
+                    |kw, snippet| acc.add_keyword_snippet_expr(ctx, incomplete_let, kw, snippet);
 
                 if !in_block_expr {
                     add_keyword("unsafe", "unsafe {\n    $0\n}");
@@ -230,10 +200,7 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
                 add_keyword("true", "true");
                 add_keyword("false", "false");
 
-                if ctx.previous_token_is(T![if])
-                    || ctx.previous_token_is(T![while])
-                    || in_block_expr
-                {
+                if in_condition || in_block_expr {
                     add_keyword("let", "let");
                 }
 
@@ -256,10 +223,10 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
                     }
                 }
 
-                if let Some(fn_def) = &ctx.function_def {
+                if let Some(ty) = innermost_ret_ty {
                     add_keyword(
                         "return",
-                        match (in_block_expr, fn_def.ret_type().is_some()) {
+                        match (in_block_expr, ty.is_unit()) {
                             (true, true) => "return ;",
                             (true, false) => "return;",
                             (false, true) => "return $0",
@@ -270,16 +237,4 @@ pub(crate) fn complete_expr_path(acc: &mut Completions, ctx: &CompletionContext)
             }
         }
     }
-}
-
-fn add_assoc_item(acc: &mut Completions, ctx: &CompletionContext, item: hir::AssocItem) {
-    match item {
-        hir::AssocItem::Function(func) => acc.add_function(ctx, func, None),
-        hir::AssocItem::Const(ct) => acc.add_const(ctx, ct),
-        hir::AssocItem::TypeAlias(ty) => acc.add_type_alias(ctx, ty),
-    }
-}
-
-fn add_enum_variants(acc: &mut Completions, ctx: &CompletionContext, e: hir::Enum) {
-    e.variants(ctx.db).into_iter().for_each(|variant| acc.add_enum_variant(ctx, variant, None));
 }

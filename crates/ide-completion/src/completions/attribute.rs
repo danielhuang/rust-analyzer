@@ -17,8 +17,7 @@ use syntax::{
 };
 
 use crate::{
-    completions::module_or_attr,
-    context::{CompletionContext, IdentContext, PathCompletionCtx, PathKind, PathQualifierCtx},
+    context::{AttrCtx, CompletionContext, PathCompletionCtx, Qualified},
     item::CompletionItem,
     Completions,
 };
@@ -28,17 +27,16 @@ mod derive;
 mod lint;
 mod repr;
 
-pub(crate) use self::derive::complete_derive;
+pub(crate) use self::derive::complete_derive_path;
 
 /// Complete inputs to known builtin attributes as well as derive attributes
 pub(crate) fn complete_known_attribute_input(
     acc: &mut Completions,
     ctx: &CompletionContext,
+    &colon_prefix: &bool,
+    fake_attribute_under_caret: &ast::Attr,
 ) -> Option<()> {
-    let attribute = match &ctx.ident_ctx {
-        IdentContext::UnexpandedAttrTT { fake_attribute_under_caret: Some(it) } => it,
-        _ => return None,
-    };
+    let attribute = fake_attribute_under_caret;
     let name_ref = match attribute.path() {
         Some(p) => Some(p.as_single_name_ref()?),
         None => None,
@@ -50,7 +48,9 @@ pub(crate) fn complete_known_attribute_input(
 
     match path.text().as_str() {
         "repr" => repr::complete_repr(acc, ctx, tt),
-        "feature" => lint::complete_lint(acc, ctx, &parse_tt_as_comma_sep_paths(tt)?, FEATURES),
+        "feature" => {
+            lint::complete_lint(acc, ctx, colon_prefix, &parse_tt_as_comma_sep_paths(tt)?, FEATURES)
+        }
         "allow" | "warn" | "deny" | "forbid" => {
             let existing_lints = parse_tt_as_comma_sep_paths(tt)?;
 
@@ -63,7 +63,7 @@ pub(crate) fn complete_known_attribute_input(
                 .cloned()
                 .collect();
 
-            lint::complete_lint(acc, ctx, &existing_lints, &lints);
+            lint::complete_lint(acc, ctx, colon_prefix, &existing_lints, &lints);
         }
         "cfg" => cfg::complete_cfg(acc, ctx),
         _ => (),
@@ -71,46 +71,53 @@ pub(crate) fn complete_known_attribute_input(
     Some(())
 }
 
-pub(crate) fn complete_attribute(acc: &mut Completions, ctx: &CompletionContext) {
-    let (is_absolute_path, qualifier, is_inner, annotated_item_kind) = match ctx.path_context() {
-        Some(&PathCompletionCtx {
-            kind: PathKind::Attr { kind, annotated_item_kind },
-            is_absolute_path,
-            ref qualifier,
-            ..
-        }) => (is_absolute_path, qualifier, kind == AttrKind::Inner, annotated_item_kind),
-        _ => return,
-    };
+pub(crate) fn complete_attribute_path(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
+    &AttrCtx { kind, annotated_item_kind }: &AttrCtx,
+) {
+    let is_inner = kind == AttrKind::Inner;
 
-    match qualifier {
-        Some(PathQualifierCtx { resolution, is_super_chain, .. }) => {
+    match qualified {
+        Qualified::With {
+            resolution: Some(hir::PathResolution::Def(hir::ModuleDef::Module(module))),
+            is_super_chain,
+            ..
+        } => {
             if *is_super_chain {
                 acc.add_keyword(ctx, "super::");
             }
 
-            let module = match resolution {
-                Some(hir::PathResolution::Def(hir::ModuleDef::Module(it))) => it,
-                _ => return,
-            };
-
             for (name, def) in module.scope(ctx.db, Some(ctx.module)) {
-                if let Some(def) = module_or_attr(ctx.db, def) {
-                    acc.add_resolution(ctx, name, def);
+                match def {
+                    hir::ScopeDef::ModuleDef(hir::ModuleDef::Macro(m)) if m.is_attr(ctx.db) => {
+                        acc.add_macro(ctx, path_ctx, m, name)
+                    }
+                    hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+                        acc.add_module(ctx, path_ctx, m, name)
+                    }
+                    _ => (),
                 }
             }
             return;
         }
         // fresh use tree with leading colon2, only show crate roots
-        None if is_absolute_path => acc.add_crate_roots(ctx),
+        Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
         // only show modules in a fresh UseTree
-        None => {
-            ctx.process_all_names(&mut |name, def| {
-                if let Some(def) = module_or_attr(ctx.db, def) {
-                    acc.add_resolution(ctx, name, def);
+        Qualified::No => {
+            ctx.process_all_names(&mut |name, def| match def {
+                hir::ScopeDef::ModuleDef(hir::ModuleDef::Macro(m)) if m.is_attr(ctx.db) => {
+                    acc.add_macro(ctx, path_ctx, m, name)
                 }
+                hir::ScopeDef::ModuleDef(hir::ModuleDef::Module(m)) => {
+                    acc.add_module(ctx, path_ctx, m, name)
+                }
+                _ => (),
             });
             acc.add_nameref_keywords_with_colon(ctx);
         }
+        Qualified::Infer | Qualified::With { .. } => {}
     }
 
     let attributes = annotated_item_kind.and_then(|kind| {
@@ -323,9 +330,9 @@ const ATTRIBUTES: &[AttrCompletion] = &[
     attr("repr(…)", Some("repr"), Some("repr(${0:C})")),
     attr("should_panic", Some("should_panic"), Some(r#"should_panic"#)),
     attr(
-        r#"target_feature = "…""#,
+        r#"target_feature(enable = "…")"#,
         Some("target_feature"),
-        Some(r#"target_feature = "${0:feature}""#),
+        Some(r#"target_feature(enable = "${0:feature}")"#),
     ),
     attr("test", None, None),
     attr("track_caller", None, None),

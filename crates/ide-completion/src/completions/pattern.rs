@@ -1,27 +1,20 @@
 //! Completes constants and paths in unqualified patterns.
 
 use hir::{db::DefDatabase, AssocItem, ScopeDef};
-use ide_db::FxHashSet;
 use syntax::ast::Pat;
 
 use crate::{
-    context::{PathCompletionCtx, PathQualifierCtx, PatternRefutability},
+    context::{PathCompletionCtx, PatternContext, PatternRefutability, Qualified},
     CompletionContext, Completions,
 };
 
 /// Completes constants and paths in unqualified patterns.
-pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
-    let patctx = match &ctx.pattern_ctx {
-        Some(ctx) => ctx,
-        _ => return,
-    };
-
-    if let Some(path_ctx) = ctx.path_context() {
-        pattern_path_completion(acc, ctx, path_ctx);
-        return;
-    }
-
-    match patctx.parent_pat.as_ref() {
+pub(crate) fn complete_pattern(
+    acc: &mut Completions,
+    ctx: &CompletionContext,
+    pattern_ctx: &PatternContext,
+) {
+    match pattern_ctx.parent_pat.as_ref() {
         Some(Pat::RangePat(_) | Pat::BoxPat(_)) => (),
         Some(Pat::RefPat(r)) => {
             if r.mut_token().is_none() {
@@ -30,7 +23,7 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
         }
         _ => {
             let tok = ctx.token.text_range().start();
-            match (patctx.ref_token.as_ref(), patctx.mut_token.as_ref()) {
+            match (pattern_ctx.ref_token.as_ref(), pattern_ctx.mut_token.as_ref()) {
                 (None, None) => {
                     acc.add_keyword(ctx, "ref");
                     acc.add_keyword(ctx, "mut");
@@ -46,20 +39,26 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
         }
     }
 
-    if patctx.record_pat.is_some() {
+    if pattern_ctx.record_pat.is_some() {
         return;
     }
 
-    let refutable = patctx.refutability == PatternRefutability::Refutable;
+    let refutable = pattern_ctx.refutability == PatternRefutability::Refutable;
     let single_variant_enum = |enum_: hir::Enum| ctx.db.enum_data(enum_.into()).variants.len() == 1;
 
     if let Some(hir::Adt::Enum(e)) =
         ctx.expected_type.as_ref().and_then(|ty| ty.strip_references().as_adt())
     {
         if refutable || single_variant_enum(e) {
-            super::enum_variants_with_paths(acc, ctx, e, |acc, ctx, variant, path| {
-                acc.add_qualified_variant_pat(ctx, variant, path);
-            });
+            super::enum_variants_with_paths(
+                acc,
+                ctx,
+                e,
+                &pattern_ctx.impl_,
+                |acc, ctx, variant, path| {
+                    acc.add_qualified_variant_pat(ctx, pattern_ctx, variant, path);
+                },
+            );
         }
     }
 
@@ -69,26 +68,24 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
         let add_simple_path = match res {
             hir::ScopeDef::ModuleDef(def) => match def {
                 hir::ModuleDef::Adt(hir::Adt::Struct(strukt)) => {
-                    acc.add_struct_pat(ctx, strukt, Some(name.clone()));
+                    acc.add_struct_pat(ctx, pattern_ctx, strukt, Some(name.clone()));
                     true
                 }
                 hir::ModuleDef::Variant(variant)
                     if refutable || single_variant_enum(variant.parent_enum(ctx.db)) =>
                 {
-                    acc.add_variant_pat(ctx, variant, Some(name.clone()));
+                    acc.add_variant_pat(ctx, pattern_ctx, variant, Some(name.clone()));
                     true
                 }
                 hir::ModuleDef::Adt(hir::Adt::Enum(e)) => refutable || single_variant_enum(e),
                 hir::ModuleDef::Const(..) => refutable,
                 hir::ModuleDef::Module(..) => true,
-                hir::ModuleDef::Macro(mac) if mac.is_fn_like(ctx.db) => {
-                    return acc.add_macro(ctx, mac, name)
-                }
+                hir::ModuleDef::Macro(mac) => mac.is_fn_like(ctx.db),
                 _ => false,
             },
             hir::ScopeDef::ImplSelfType(impl_) => match impl_.self_ty(ctx.db).as_adt() {
                 Some(hir::Adt::Struct(strukt)) => {
-                    acc.add_struct_pat(ctx, strukt, Some(name.clone()));
+                    acc.add_struct_pat(ctx, pattern_ctx, strukt, Some(name.clone()));
                     true
                 }
                 Some(hir::Adt::Enum(e)) => refutable || single_variant_enum(e),
@@ -103,26 +100,21 @@ pub(crate) fn complete_pattern(acc: &mut Completions, ctx: &CompletionContext) {
             | ScopeDef::Unknown => false,
         };
         if add_simple_path {
-            acc.add_resolution_simple(ctx, name, res);
+            acc.add_pattern_resolution(ctx, pattern_ctx, name, res);
         }
     });
 }
 
-fn pattern_path_completion(
+pub(crate) fn complete_pattern_path(
     acc: &mut Completions,
     ctx: &CompletionContext,
-    PathCompletionCtx { qualifier, is_absolute_path, .. }: &PathCompletionCtx,
+    path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
 ) {
-    match qualifier {
-        Some(PathQualifierCtx { resolution, is_super_chain, .. }) => {
+    match qualified {
+        Qualified::With { resolution: Some(resolution), is_super_chain, .. } => {
             if *is_super_chain {
                 acc.add_keyword(ctx, "super::");
             }
-
-            let resolution = match resolution {
-                Some(it) => it,
-                None => return,
-            };
 
             match resolution {
                 hir::PathResolution::Def(hir::ModuleDef::Module(module)) => {
@@ -137,16 +129,11 @@ fn pattern_path_completion(
                         };
 
                         if add_resolution {
-                            acc.add_resolution(ctx, name, def);
+                            acc.add_path_resolution(ctx, path_ctx, name, def);
                         }
                     }
                 }
-                res @ (hir::PathResolution::TypeParam(_)
-                | hir::PathResolution::SelfType(_)
-                | hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Struct(_)))
-                | hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Enum(_)))
-                | hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Union(_)))
-                | hir::PathResolution::Def(hir::ModuleDef::BuiltinType(_))) => {
+                res => {
                     let ty = match res {
                         hir::PathResolution::TypeParam(param) => param.ty(ctx.db),
                         hir::PathResolution::SelfType(impl_def) => impl_def.self_ty(ctx.db),
@@ -154,10 +141,6 @@ fn pattern_path_completion(
                             s.ty(ctx.db)
                         }
                         hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Enum(e))) => {
-                            cov_mark::hit!(enum_plain_qualified_use_tree);
-                            e.variants(ctx.db)
-                                .into_iter()
-                                .for_each(|variant| acc.add_enum_variant(ctx, variant, None));
                             e.ty(ctx.db)
                         }
                         hir::PathResolution::Def(hir::ModuleDef::Adt(hir::Adt::Union(u))) => {
@@ -167,46 +150,39 @@ fn pattern_path_completion(
                         _ => return,
                     };
 
-                    let mut seen = FxHashSet::default();
-                    ty.iterate_path_candidates(
-                        ctx.db,
-                        &ctx.scope,
-                        &ctx.scope.visible_traits().0,
-                        Some(ctx.module),
-                        None,
-                        |item| {
-                            match item {
-                                AssocItem::TypeAlias(ta) => {
-                                    // We might iterate candidates of a trait multiple times here, so deduplicate them.
-                                    if seen.insert(item) {
-                                        acc.add_type_alias(ctx, ta);
-                                    }
-                                }
-                                AssocItem::Const(c) => {
-                                    if seen.insert(item) {
-                                        acc.add_const(ctx, c);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            None::<()>
-                        },
-                    );
+                    if let Some(hir::Adt::Enum(e)) = ty.as_adt() {
+                        cov_mark::hit!(enum_plain_qualified_use_tree);
+                        acc.add_enum_variants(ctx, path_ctx, e);
+                    }
+
+                    ctx.iterate_path_candidates(&ty, |item| match item {
+                        AssocItem::TypeAlias(ta) => acc.add_type_alias(ctx, ta),
+                        AssocItem::Const(c) => acc.add_const(ctx, c),
+                        _ => {}
+                    });
                 }
-                _ => {}
             }
         }
-        // qualifier can only be none here if we are in a TuplePat or RecordPat in which case special characters have to follow the path
-        None if *is_absolute_path => acc.add_crate_roots(ctx),
-        None => {
+        Qualified::Absolute => acc.add_crate_roots(ctx, path_ctx),
+        Qualified::No => {
+            // this will only be hit if there are brackets or braces, otherwise this will be parsed as an ident pattern
             ctx.process_all_names(&mut |name, res| {
-                // FIXME: properly filter here
-                if let ScopeDef::ModuleDef(_) = res {
-                    acc.add_resolution(ctx, name, res);
+                // FIXME: we should check what kind of pattern we are in and filter accordingly
+                let add_completion = match res {
+                    ScopeDef::ModuleDef(hir::ModuleDef::Macro(mac)) => mac.is_fn_like(ctx.db),
+                    ScopeDef::ModuleDef(hir::ModuleDef::Adt(_)) => true,
+                    ScopeDef::ModuleDef(hir::ModuleDef::Variant(_)) => true,
+                    ScopeDef::ModuleDef(hir::ModuleDef::Module(_)) => true,
+                    ScopeDef::ImplSelfType(_) => true,
+                    _ => false,
+                };
+                if add_completion {
+                    acc.add_path_resolution(ctx, path_ctx, name, res);
                 }
             });
 
             acc.add_nameref_keywords_with_colon(ctx);
         }
+        Qualified::Infer | Qualified::With { .. } => {}
     }
 }

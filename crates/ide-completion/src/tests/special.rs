@@ -541,6 +541,46 @@ impl Foo {
 }
 
 #[test]
+fn completes_non_exhaustive_variant_within_the_defining_crate() {
+    check(
+        r#"
+enum Foo {
+    #[non_exhaustive]
+    Bar,
+    Baz,
+}
+
+fn foo(self) {
+    Foo::$0
+}
+"#,
+        expect![[r#"
+                ev Bar Bar
+                ev Baz Baz
+            "#]],
+    );
+
+    check(
+        r#"
+//- /main.rs crate:main deps:e
+fn foo(self) {
+    e::Foo::$0
+}
+
+//- /e.rs crate:e
+enum Foo {
+    #[non_exhaustive]
+    Bar,
+    Baz,
+}
+"#,
+        expect![[r#"
+                ev Baz Baz
+            "#]],
+    );
+}
+
+#[test]
 fn completes_primitive_assoc_const() {
     cov_mark::check!(completes_primitive_assoc_const);
     check(
@@ -634,5 +674,139 @@ fn bar() -> Bar {
         expect![[r#"
                 fn foo() (as Foo) fn() -> Self
             "#]],
+    )
+}
+
+#[test]
+fn completes_fn_in_pub_trait_generated_by_macro() {
+    check(
+        r#"
+mod other_mod {
+    macro_rules! make_method {
+        ($name:ident) => {
+            fn $name(&self) {}
+        };
+    }
+
+    pub trait MyTrait {
+        make_method! { by_macro }
+        fn not_by_macro(&self) {}
+    }
+
+    pub struct Foo {}
+
+    impl MyTrait for Foo {}
+}
+
+fn main() {
+    use other_mod::{Foo, MyTrait};
+    let f = Foo {};
+    f.$0
+}
+"#,
+        expect![[r#"
+            me by_macro() (as MyTrait) fn(&self)
+            me not_by_macro() (as MyTrait) fn(&self)
+        "#]],
+    )
+}
+
+#[test]
+fn completes_fn_in_pub_trait_generated_by_recursive_macro() {
+    check(
+        r#"
+mod other_mod {
+    macro_rules! make_method {
+        ($name:ident) => {
+            fn $name(&self) {}
+        };
+    }
+
+    macro_rules! make_trait {
+        () => {
+            pub trait MyTrait {
+                make_method! { by_macro }
+                fn not_by_macro(&self) {}
+            }
+        }
+    }
+
+    make_trait!();
+
+    pub struct Foo {}
+
+    impl MyTrait for Foo {}
+}
+
+fn main() {
+    use other_mod::{Foo, MyTrait};
+    let f = Foo {};
+    f.$0
+}
+"#,
+        expect![[r#"
+            me by_macro() (as MyTrait) fn(&self)
+            me not_by_macro() (as MyTrait) fn(&self)
+        "#]],
+    )
+}
+
+#[test]
+fn completes_const_in_pub_trait_generated_by_macro() {
+    check(
+        r#"
+mod other_mod {
+    macro_rules! make_const {
+        ($name:ident) => {
+            const $name: u8 = 1;
+        };
+    }
+
+    pub trait MyTrait {
+        make_const! { by_macro }
+    }
+
+    pub struct Foo {}
+
+    impl MyTrait for Foo {}
+}
+
+fn main() {
+    use other_mod::{Foo, MyTrait};
+    let f = Foo {};
+    Foo::$0
+}
+"#,
+        expect![[r#"
+            ct by_macro (as MyTrait) pub const by_macro: u8
+        "#]],
+    )
+}
+
+#[test]
+fn completes_locals_from_macros() {
+    check(
+        r#"
+
+macro_rules! x {
+    ($x:ident, $expr:expr) => {
+        let $x = 0;
+        $expr
+    };
+}
+fn main() {
+    x! {
+        foobar, {
+            f$0
+        }
+    };
+}
+"#,
+        expect![[r#"
+            fn main() fn()
+            lc foobar i32
+            ma x!(…)  macro_rules! x
+            bt u32
+        "#]],
     )
 }

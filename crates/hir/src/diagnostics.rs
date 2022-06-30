@@ -3,13 +3,14 @@
 //!
 //! This probably isn't the best way to do this -- ideally, diagnistics should
 //! be expressed in terms of hir types themselves.
+use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_def::path::ModPath;
 use hir_expand::{name::Name, HirFileId, InFile};
 use syntax::{ast, AstPtr, SyntaxNodePtr, TextRange};
 
-use crate::Type;
+use crate::{MacroKind, Type};
 
 macro_rules! diagnostics {
     ($($diag:ident,)*) => {
@@ -68,6 +69,7 @@ pub struct UnresolvedImport {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UnresolvedMacroCall {
     pub macro_call: InFile<SyntaxNodePtr>,
+    pub precise_location: Option<TextRange>,
     pub path: ModPath,
     pub is_bang: bool,
 }
@@ -86,11 +88,15 @@ pub struct UnresolvedProcMacro {
     /// to use instead.
     pub precise_location: Option<TextRange>,
     pub macro_name: Option<String>,
+    pub kind: MacroKind,
+    /// The crate id of the proc-macro this macro belongs to, or `None` if the proc-macro can't be found.
+    pub krate: CrateId,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MacroError {
     pub node: InFile<SyntaxNodePtr>,
+    pub precise_location: Option<TextRange>,
     pub message: String,
 }
 
