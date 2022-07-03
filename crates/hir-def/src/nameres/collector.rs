@@ -52,8 +52,8 @@ use crate::{
     ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UnresolvedMacro,
 };
 
-static GLOB_RECURSION_LIMIT: Limit = Limit::new(100);
-static EXPANSION_DEPTH_LIMIT: Limit = Limit::new(128);
+static GLOB_RECURSION_LIMIT: Limit = Limit::new(1000);
+static EXPANSION_DEPTH_LIMIT: Limit = Limit::new(1280);
 static FIXED_POINT_LIMIT: Limit = Limit::new(8192);
 
 pub(super) fn collect_defs(db: &dyn DefDatabase, mut def_map: DefMap, tree_id: TreeId) -> DefMap {

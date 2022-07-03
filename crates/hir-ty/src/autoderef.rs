@@ -15,7 +15,7 @@ use crate::{
     TraitEnvironment, Ty, TyBuilder, TyKind,
 };
 
-static AUTODEREF_RECURSION_LIMIT: Limit = Limit::new(10);
+static AUTODEREF_RECURSION_LIMIT: Limit = Limit::new(50);
 
 pub(crate) enum AutoderefKind {
     Builtin,
