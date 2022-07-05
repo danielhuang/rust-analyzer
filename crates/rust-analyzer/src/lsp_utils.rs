@@ -77,7 +77,8 @@ impl GlobalState {
         let from_source_build = option_env!("POKE_RA_DEVS").is_some();
         let profiling_enabled = std::env::var("RA_PROFILE").is_ok();
         if from_source_build || profiling_enabled {
-            self.show_message(lsp_types::MessageType::ERROR, message)
+            // no
+            // self.show_message(lsp_types::MessageType::ERROR, message)
         }
     }
 

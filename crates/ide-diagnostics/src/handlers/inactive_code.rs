@@ -19,7 +19,13 @@ pub(crate) fn inactive_code(
     let mut message = "code is inactive due to #[cfg] directives".to_string();
 
     if let Some(inactive) = inactive {
-        format_to!(message, ": {}", inactive);
+        let inactive_reasons = inactive.to_string();
+
+        if inactive_reasons.is_empty() {
+            format_to!(message);
+        } else {
+            format_to!(message, ": {}", inactive);
+        }
     }
 
     let res = Diagnostic::new(
@@ -91,6 +97,28 @@ fn f() {
 
     #[cfg(feature = "std")] use std;
   //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: feature = "std" is disabled
+
+    #[cfg(any())] pub fn f() {}
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives
+"#,
+        );
+    }
+
+    #[test]
+    fn inactive_assoc_item() {
+        // FIXME these currently don't work, hence the *
+        check(
+            r#"
+struct Foo;
+impl Foo {
+    #[cfg(any())] pub fn f() {}
+  //*************************** weak: code is inactive due to #[cfg] directives
+}
+
+trait Bar {
+    #[cfg(any())] pub fn f() {}
+  //*************************** weak: code is inactive due to #[cfg] directives
+}
 "#,
         );
     }

@@ -1312,7 +1312,7 @@ impl DefWithBody {
                         );
                     }
                 }
-                BodyValidationDiagnostic::MissingMatchArms { match_expr } => {
+                BodyValidationDiagnostic::MissingMatchArms { match_expr, uncovered_patterns } => {
                     match source_map.expr_syntax(match_expr) {
                         Ok(source_ptr) => {
                             let root = source_ptr.file_syntax(db.upcast());
@@ -1324,6 +1324,7 @@ impl DefWithBody {
                                         MissingMatchArms {
                                             file: source_ptr.file_id,
                                             match_expr: AstPtr::new(&match_expr),
+                                            uncovered_patterns,
                                         }
                                         .into(),
                                     );
@@ -2222,6 +2223,7 @@ impl Local {
         let src = source_map.pat_syntax(self.pat_id).unwrap(); // Hmm...
         let root = src.file_syntax(db.upcast());
         src.map(|ast| match ast {
+            // Suspicious unwrap
             Either::Left(it) => Either::Left(it.cast().unwrap().to_node(&root)),
             Either::Right(it) => Either::Right(it.to_node(&root)),
         })
