@@ -61,7 +61,7 @@ pub struct ItemScope {
     /// Module scoped macros will be inserted into `items` instead of here.
     // FIXME: Macro shadowing in one module is not properly handled. Non-item place macros will
     // be all resolved to the last one defined if shadowing happens.
-    legacy_macros: FxHashMap<Name, MacroId>,
+    legacy_macros: FxHashMap<Name, SmallVec<[MacroId; 1]>>,
     /// The derive macro invocations in this scope.
     attr_macros: FxHashMap<AstId<ast::Item>, MacroCallId>,
     /// The derive macro invocations in this scope, keyed by the owner item over the actual derive attributes
@@ -129,13 +129,13 @@ impl ItemScope {
     }
 
     /// Iterate over all module scoped macros
-    pub(crate) fn macros<'a>(&'a self) -> impl Iterator<Item = (&'a Name, MacroId)> + 'a {
+    pub(crate) fn macros(&self) -> impl Iterator<Item = (&Name, MacroId)> + '_ {
         self.entries().filter_map(|(name, def)| def.take_macros().map(|macro_| (name, macro_)))
     }
 
     /// Iterate over all legacy textual scoped macros visible at the end of the module
-    pub fn legacy_macros<'a>(&'a self) -> impl Iterator<Item = (&'a Name, MacroId)> + 'a {
-        self.legacy_macros.iter().map(|(name, def)| (name, *def))
+    pub fn legacy_macros(&self) -> impl Iterator<Item = (&Name, &[MacroId])> + '_ {
+        self.legacy_macros.iter().map(|(name, def)| (name, &**def))
     }
 
     /// Get a name from current module scope, legacy macros are not included
@@ -180,8 +180,8 @@ impl ItemScope {
         self.declarations.push(def)
     }
 
-    pub(crate) fn get_legacy_macro(&self, name: &Name) -> Option<MacroId> {
-        self.legacy_macros.get(name).copied()
+    pub(crate) fn get_legacy_macro(&self, name: &Name) -> Option<&[MacroId]> {
+        self.legacy_macros.get(name).map(|it| &**it)
     }
 
     pub(crate) fn define_impl(&mut self, imp: ImplId) {
@@ -193,7 +193,7 @@ impl ItemScope {
     }
 
     pub(crate) fn define_legacy_macro(&mut self, name: Name, mac: MacroId) {
-        self.legacy_macros.insert(name, mac);
+        self.legacy_macros.entry(name).or_default().push(mac);
     }
 
     pub(crate) fn add_attr_macro_invoc(&mut self, item: AstId<ast::Item>, call: MacroCallId) {
@@ -270,35 +270,33 @@ impl ItemScope {
                 $glob_imports:ident [ $lookup:ident ],
                 $def_import_type:ident
             ) => {{
-                let existing = $this.$field.entry($lookup.1.clone());
-                match (existing, $def.$field) {
-                    (Entry::Vacant(entry), Some(_)) => {
-                        match $def_import_type {
-                            ImportType::Glob => {
-                                $glob_imports.$field.insert($lookup.clone());
+                if let Some(fld) = $def.$field {
+                    let existing = $this.$field.entry($lookup.1.clone());
+                    match existing {
+                        Entry::Vacant(entry) => {
+                            match $def_import_type {
+                                ImportType::Glob => {
+                                    $glob_imports.$field.insert($lookup.clone());
+                                }
+                                ImportType::Named => {
+                                    $glob_imports.$field.remove(&$lookup);
+                                }
                             }
-                            ImportType::Named => {
-                                $glob_imports.$field.remove(&$lookup);
-                            }
-                        }
 
-                        if let Some(fld) = $def.$field {
                             entry.insert(fld);
+                            $changed = true;
                         }
-                        $changed = true;
-                    }
-                    (Entry::Occupied(mut entry), Some(_))
-                        if $glob_imports.$field.contains(&$lookup)
-                            && matches!($def_import_type, ImportType::Named) =>
-                    {
-                        cov_mark::hit!(import_shadowed);
-                        $glob_imports.$field.remove(&$lookup);
-                        if let Some(fld) = $def.$field {
+                        Entry::Occupied(mut entry)
+                            if $glob_imports.$field.contains(&$lookup)
+                                && matches!($def_import_type, ImportType::Named) =>
+                        {
+                            cov_mark::hit!(import_shadowed);
+                            $glob_imports.$field.remove(&$lookup);
                             entry.insert(fld);
+                            $changed = true;
                         }
-                        $changed = true;
+                        _ => {}
                     }
-                    _ => {}
                 }
             }};
         }
@@ -322,7 +320,7 @@ impl ItemScope {
         )
     }
 
-    pub(crate) fn collect_legacy_macros(&self) -> FxHashMap<Name, MacroId> {
+    pub(crate) fn collect_legacy_macros(&self) -> FxHashMap<Name, SmallVec<[MacroId; 1]>> {
         self.legacy_macros.clone()
     }
 

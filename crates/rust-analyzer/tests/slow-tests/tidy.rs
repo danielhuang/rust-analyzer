@@ -344,7 +344,7 @@ fn check_dbg(path: &Path, text: &str) {
 
 fn check_test_attrs(path: &Path, text: &str) {
     let ignore_rule =
-        "https://github.com/rust-analyzer/rust-analyzer/blob/master/docs/dev/style.md#ignore";
+        "https://github.com/rust-lang/rust-analyzer/blob/master/docs/dev/style.md#ignore";
     let need_ignore: &[&str] = &[
         // This file.
         "slow-tests/tidy.rs",
@@ -365,7 +365,7 @@ fn check_test_attrs(path: &Path, text: &str) {
     }
 
     let panic_rule =
-        "https://github.com/rust-analyzer/rust-analyzer/blob/master/docs/dev/style.md#should_panic";
+        "https://github.com/rust-lang/rust-analyzer/blob/master/docs/dev/style.md#should_panic";
     let need_panic: &[&str] = &[
         // This file.
         "slow-tests/tidy.rs",
@@ -471,17 +471,9 @@ struct TidyMarks {
 
 impl TidyMarks {
     fn visit(&mut self, _path: &Path, text: &str) {
-        for line in text.lines() {
-            if let Some(mark) = find_mark(line, "hit") {
-                self.hits.insert(mark.to_string());
-            }
-            if let Some(mark) = find_mark(line, "check") {
-                self.checks.insert(mark.to_string());
-            }
-            if let Some(mark) = find_mark(line, "check_count") {
-                self.checks.insert(mark.to_string());
-            }
-        }
+        find_marks(&mut self.hits, text, "hit");
+        find_marks(&mut self.checks, text, "check");
+        find_marks(&mut self.checks, text, "check_count");
     }
 
     fn finish(self) {
@@ -506,10 +498,21 @@ fn stable_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
-fn find_mark<'a>(text: &'a str, mark: &'static str) -> Option<&'a str> {
-    let idx = text.find(mark)?;
-    let text = text[idx + mark.len()..].strip_prefix("!(")?;
-    let idx = text.find(|c: char| !(c.is_alphanumeric() || c == '_'))?;
-    let text = &text[..idx];
-    Some(text)
+fn find_marks(set: &mut HashSet<String>, text: &str, mark: &str) {
+    let mut text = text;
+    let mut prev_text = "";
+    while text != prev_text {
+        prev_text = text;
+        if let Some(idx) = text.find(mark) {
+            text = &text[idx + mark.len()..];
+            if let Some(stripped_text) = text.strip_prefix("!(") {
+                text = stripped_text.trim_start();
+                if let Some(idx2) = text.find(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    let mark_text = &text[..idx2];
+                    set.insert(mark_text.to_string());
+                    text = &text[idx2..];
+                }
+            }
+        }
+    }
 }

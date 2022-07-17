@@ -125,7 +125,7 @@ impl fmt::Display for Location {
         let name = self.file.file_name().unwrap();
         write!(
             f,
-            "https://github.com/rust-analyzer/rust-analyzer/blob/master/{}#L{}[{}]",
+            "https://github.com/rust-lang/rust-analyzer/blob/master/{}#L{}[{}]",
             path,
             self.line,
             name.to_str().unwrap()
@@ -196,6 +196,6 @@ fn normalize_newlines(s: &str) -> String {
 pub fn project_root() -> PathBuf {
     let dir = env!("CARGO_MANIFEST_DIR");
     let res = PathBuf::from(dir).parent().unwrap().parent().unwrap().to_owned();
-    assert!(res.join("bors.toml").exists());
+    assert!(res.join("triagebot.toml").exists());
     res
 }

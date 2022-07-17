@@ -4,6 +4,8 @@ mod analysis;
 #[cfg(test)]
 mod tests;
 
+use std::iter;
+
 use base_db::SourceDatabaseExt;
 use hir::{
     HasAttrs, Local, Name, PathResolution, ScopeDef, Semantics, SemanticsScope, Type, TypeInfo,
@@ -31,6 +33,7 @@ pub(crate) enum PatternRefutability {
     Irrefutable,
 }
 
+#[derive(Debug)]
 pub(crate) enum Visible {
     Yes,
     Editable,
@@ -174,8 +177,17 @@ pub(super) enum Qualified {
     With {
         path: ast::Path,
         resolution: Option<PathResolution>,
-        /// Whether this path consists solely of `super` segments
-        is_super_chain: bool,
+        /// How many `super` segments are present in the path
+        ///
+        /// This would be None, if path is not solely made of
+        /// `super` segments, e.g.
+        ///
+        /// ```rust
+        ///   use super::foo;
+        /// ```
+        ///
+        /// Otherwise it should be Some(count of `super`)
+        super_chain_len: Option<usize>,
     },
     /// <_>::
     Infer,
@@ -187,7 +199,7 @@ pub(super) enum Qualified {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PatternContext {
     pub(super) refutability: PatternRefutability,
-    pub(super) param_ctx: Option<(ast::ParamList, ast::Param, ParamKind)>,
+    pub(super) param_ctx: Option<ParamContext>,
     pub(super) has_type_ascription: bool,
     pub(super) parent_pat: Option<ast::Pat>,
     pub(super) ref_token: Option<SyntaxToken>,
@@ -195,6 +207,13 @@ pub(super) struct PatternContext {
     /// The record pattern this name or ref is a field of
     pub(super) record_pat: Option<ast::RecordPat>,
     pub(super) impl_: Option<ast::Impl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ParamContext {
+    pub(super) param_list: ast::ParamList,
+    pub(super) param: ast::Param,
+    pub(super) kind: ParamKind,
 }
 
 /// The state of the lifetime we are completing.
@@ -343,6 +362,13 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) qualifier_ctx: QualifierCtx,
 
     pub(super) locals: FxHashMap<Name, Local>,
+
+    /// The module depth of the current module of the cursor position.
+    /// - crate-root
+    ///  - mod foo
+    ///   - mod bar
+    /// Here depth will be 2
+    pub(super) depth_from_crate_root: usize,
 }
 
 impl<'a> CompletionContext<'a> {
@@ -367,6 +393,30 @@ impl<'a> CompletionContext<'a> {
     }
 
     /// Checks if an item is visible and not `doc(hidden)` at the completion site.
+    pub(crate) fn def_is_visible(&self, item: &ScopeDef) -> Visible {
+        match item {
+            ScopeDef::ModuleDef(def) => match def {
+                hir::ModuleDef::Module(it) => self.is_visible(it),
+                hir::ModuleDef::Function(it) => self.is_visible(it),
+                hir::ModuleDef::Adt(it) => self.is_visible(it),
+                hir::ModuleDef::Variant(it) => self.is_visible(it),
+                hir::ModuleDef::Const(it) => self.is_visible(it),
+                hir::ModuleDef::Static(it) => self.is_visible(it),
+                hir::ModuleDef::Trait(it) => self.is_visible(it),
+                hir::ModuleDef::TypeAlias(it) => self.is_visible(it),
+                hir::ModuleDef::Macro(it) => self.is_visible(it),
+                hir::ModuleDef::BuiltinType(_) => Visible::Yes,
+            },
+            ScopeDef::GenericParam(_)
+            | ScopeDef::ImplSelfType(_)
+            | ScopeDef::AdtSelfType(_)
+            | ScopeDef::Local(_)
+            | ScopeDef::Label(_)
+            | ScopeDef::Unknown => Visible::Yes,
+        }
+    }
+
+    /// Checks if an item is visible and not `doc(hidden)` at the completion site.
     pub(crate) fn is_visible<I>(&self, item: &I) -> Visible
     where
         I: hir::HasVisibility + hir::HasAttrs + hir::HasCrate + Copy,
@@ -374,14 +424,6 @@ impl<'a> CompletionContext<'a> {
         let vis = item.visibility(self.db);
         let attrs = item.attrs(self.db);
         self.is_visible_impl(&vis, &attrs, item.krate(self.db))
-    }
-
-    pub(crate) fn is_scope_def_hidden(&self, scope_def: ScopeDef) -> bool {
-        if let (Some(attrs), Some(krate)) = (scope_def.attrs(self.db), scope_def.krate(self.db)) {
-            return self.is_doc_hidden(&attrs, krate);
-        }
-
-        false
     }
 
     /// Check if an item is `#[doc(hidden)]`.
@@ -449,6 +491,14 @@ impl<'a> CompletionContext<'a> {
     pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
         let _p = profile::span("CompletionContext::process_all_names_raw");
         self.scope.process_all_names(&mut |name, def| f(name, def));
+    }
+
+    fn is_scope_def_hidden(&self, scope_def: ScopeDef) -> bool {
+        if let (Some(attrs), Some(krate)) = (scope_def.attrs(self.db), scope_def.krate(self.db)) {
+            return self.is_doc_hidden(&attrs, krate);
+        }
+
+        false
     }
 
     fn is_visible_impl(
@@ -521,6 +571,8 @@ impl<'a> CompletionContext<'a> {
             }
         });
 
+        let depth_from_crate_root = iter::successors(module.parent(db), |m| m.parent(db)).count();
+
         let mut ctx = CompletionContext {
             sema,
             scope,
@@ -535,6 +587,7 @@ impl<'a> CompletionContext<'a> {
             expected_type: None,
             qualifier_ctx: Default::default(),
             locals,
+            depth_from_crate_root,
         };
         let ident_ctx = ctx.expand_and_analyze(
             original_file.syntax().clone(),

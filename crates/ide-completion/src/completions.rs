@@ -91,11 +91,31 @@ impl Completions {
     }
 
     pub(crate) fn add_nameref_keywords_with_colon(&mut self, ctx: &CompletionContext) {
-        ["self::", "super::", "crate::"].into_iter().for_each(|kw| self.add_keyword(ctx, kw));
+        ["self::", "crate::"].into_iter().for_each(|kw| self.add_keyword(ctx, kw));
+
+        if ctx.depth_from_crate_root > 0 {
+            self.add_keyword(ctx, "super::");
+        }
     }
 
     pub(crate) fn add_nameref_keywords(&mut self, ctx: &CompletionContext) {
-        ["self", "super", "crate"].into_iter().for_each(|kw| self.add_keyword(ctx, kw));
+        ["self", "crate"].into_iter().for_each(|kw| self.add_keyword(ctx, kw));
+
+        if ctx.depth_from_crate_root > 0 {
+            self.add_keyword(ctx, "super");
+        }
+    }
+
+    pub(crate) fn add_super_keyword(
+        &mut self,
+        ctx: &CompletionContext,
+        super_chain_len: Option<usize>,
+    ) {
+        if let Some(len) = super_chain_len {
+            if len > 0 && len < ctx.depth_from_crate_root {
+                self.add_keyword(ctx, "super::");
+            }
+        }
     }
 
     pub(crate) fn add_keyword_snippet_expr(
@@ -154,13 +174,19 @@ impl Completions {
         local_name: hir::Name,
         resolution: hir::ScopeDef,
     ) {
-        if ctx.is_scope_def_hidden(resolution) {
-            cov_mark::hit!(qualified_path_doc_hidden);
-            return;
-        }
+        let is_private_editable = match ctx.def_is_visible(&resolution) {
+            Visible::Yes => false,
+            Visible::Editable => true,
+            Visible::No => return,
+        };
         self.add(
-            render_path_resolution(RenderContext::new(ctx), path_ctx, local_name, resolution)
-                .build(),
+            render_path_resolution(
+                RenderContext::new(ctx).private_editable(is_private_editable),
+                path_ctx,
+                local_name,
+                resolution,
+            )
+            .build(),
         );
     }
 
@@ -171,13 +197,19 @@ impl Completions {
         local_name: hir::Name,
         resolution: hir::ScopeDef,
     ) {
-        if ctx.is_scope_def_hidden(resolution) {
-            cov_mark::hit!(qualified_path_doc_hidden);
-            return;
-        }
+        let is_private_editable = match ctx.def_is_visible(&resolution) {
+            Visible::Yes => false,
+            Visible::Editable => true,
+            Visible::No => return,
+        };
         self.add(
-            render_pattern_resolution(RenderContext::new(ctx), pattern_ctx, local_name, resolution)
-                .build(),
+            render_pattern_resolution(
+                RenderContext::new(ctx).private_editable(is_private_editable),
+                pattern_ctx,
+                local_name,
+                resolution,
+            )
+            .build(),
         );
     }
 

@@ -41,6 +41,7 @@ use hir_def::{
     adt::{ReprKind, VariantData},
     body::{BodyDiagnostic, SyntheticSyntax},
     expr::{BindingAnnotation, LabelId, Pat, PatId},
+    generics::{TypeOrConstParamData, TypeParamProvenance},
     item_tree::ItemTreeNode,
     lang_item::LangItemTarget,
     nameres::{self, diagnostics::DefDiagnostic},
@@ -559,7 +560,7 @@ impl Module {
     pub fn legacy_macros(self, db: &dyn HirDatabase) -> Vec<Macro> {
         let def_map = self.id.def_map(db.upcast());
         let scope = &def_map[self.id.local_id].scope;
-        scope.legacy_macros().map(|(_, it)| MacroId::from(it).into()).collect()
+        scope.legacy_macros().flat_map(|(_, it)| it).map(|&it| MacroId::from(it).into()).collect()
     }
 
     pub fn impl_defs(self, db: &dyn HirDatabase) -> Vec<Impl> {
@@ -1706,6 +1707,26 @@ impl Trait {
 
     pub fn is_unsafe(&self, db: &dyn HirDatabase) -> bool {
         db.trait_data(self.id).is_unsafe
+    }
+
+    pub fn type_or_const_param_count(
+        &self,
+        db: &dyn HirDatabase,
+        count_required_only: bool,
+    ) -> usize {
+        db.generic_params(GenericDefId::from(self.id))
+            .type_or_consts
+            .iter()
+            .filter(|(_, ty)| match ty {
+                TypeOrConstParamData::TypeParamData(ty)
+                    if ty.provenance != TypeParamProvenance::TypeParamList =>
+                {
+                    false
+                }
+                _ => true,
+            })
+            .filter(|(_, ty)| !count_required_only || !ty.has_default())
+            .count()
     }
 }
 
@@ -3286,6 +3307,15 @@ impl Type {
         let tys = hir_ty::replace_errors_with_variables(&(self.ty.clone(), to.ty.clone()));
         hir_ty::could_coerce(db, self.env.clone(), &tys)
     }
+
+    pub fn as_type_param(&self, db: &dyn HirDatabase) -> Option<TypeParam> {
+        match self.ty.kind(Interner) {
+            TyKind::Placeholder(p) => Some(TypeParam {
+                id: TypeParamId::from_unchecked(hir_ty::from_placeholder_idx(db, *p)),
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3550,5 +3580,29 @@ impl HasCrate for Type {
 impl HasCrate for Macro {
     fn krate(&self, db: &dyn HirDatabase) -> Crate {
         self.module(db).krate()
+    }
+}
+
+impl HasCrate for Trait {
+    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+        self.module(db).krate()
+    }
+}
+
+impl HasCrate for Static {
+    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+        self.module(db).krate()
+    }
+}
+
+impl HasCrate for Adt {
+    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+        self.module(db).krate()
+    }
+}
+
+impl HasCrate for Module {
+    fn krate(&self, _: &dyn HirDatabase) -> Crate {
+        Module::krate(*self)
     }
 }

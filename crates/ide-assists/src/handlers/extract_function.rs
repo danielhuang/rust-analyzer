@@ -2,7 +2,9 @@ use std::iter;
 
 use ast::make;
 use either::Either;
-use hir::{HirDisplay, InFile, Local, ModuleDef, Semantics, TypeInfo};
+use hir::{
+    HasSource, HirDisplay, InFile, Local, ModuleDef, PathResolution, Semantics, TypeInfo, TypeParam,
+};
 use ide_db::{
     defs::{Definition, NameRefClass},
     famous_defs::FamousDefs,
@@ -18,7 +20,7 @@ use syntax::{
     ast::{
         self,
         edit::{AstNodeEdit, IndentLevel},
-        AstNode,
+        AstNode, HasGenericParams,
     },
     match_ast, ted, SyntaxElement,
     SyntaxKind::{self, COMMENT},
@@ -27,6 +29,7 @@ use syntax::{
 
 use crate::{
     assist_context::{AssistContext, Assists, TreeMutator},
+    utils::generate_impl_text,
     AssistId,
 };
 
@@ -106,6 +109,8 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
             let params =
                 body.extracted_function_params(ctx, &container_info, locals_used.iter().copied());
 
+            let extracted_from_trait_impl = body.extracted_from_trait_impl();
+
             let name = make_function_name(&semantics_scope);
 
             let fun = Function {
@@ -124,8 +129,13 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
 
             builder.replace(target_range, make_call(ctx, &fun, old_indent));
 
-            let fn_def = format_function(ctx, module, &fun, old_indent, new_indent);
-            let insert_offset = insert_after.text_range().end();
+            let fn_def = match fun.self_param_adt(ctx) {
+                Some(adt) if extracted_from_trait_impl => {
+                    let fn_def = format_function(ctx, module, &fun, old_indent, new_indent + 1);
+                    generate_impl_text(&adt, &fn_def).replace("{\n\n", "{")
+                }
+                _ => format_function(ctx, module, &fun, old_indent, new_indent),
+            };
 
             if fn_def.contains("ControlFlow") {
                 let scope = match scope {
@@ -149,6 +159,8 @@ pub(crate) fn extract_function(acc: &mut Assists, ctx: &AssistContext) -> Option
                     }
                 }
             }
+
+            let insert_offset = insert_after.text_range().end();
 
             match ctx.config.snippet_cap {
                 Some(cap) => builder.insert_snippet(cap, insert_offset, fn_def),
@@ -284,6 +296,8 @@ struct ContainerInfo {
     parent_loop: Option<SyntaxNode>,
     /// The function's return type, const's type etc.
     ret_type: Option<hir::Type>,
+    generic_param_lists: Vec<ast::GenericParamList>,
+    where_clauses: Vec<ast::WhereClause>,
 }
 
 /// Control flow that is exported from extracted function
@@ -380,6 +394,14 @@ impl Function {
                 }
             },
         }
+    }
+
+    fn self_param_adt(&self, ctx: &AssistContext) -> Option<ast::Adt> {
+        let self_param = self.self_param.as_ref()?;
+        let def = ctx.sema.to_def(self_param)?;
+        let adt = def.ty(ctx.db()).strip_references().as_adt()?;
+        let InFile { file_id: _, value } = adt.source(ctx.db())?;
+        Some(value)
     }
 }
 
@@ -483,6 +505,38 @@ impl FunctionBody {
             FunctionBody::Expr(expr) => expr.syntax().parent(),
             FunctionBody::Span { parent, .. } => Some(parent.syntax().clone()),
         }
+    }
+
+    fn node(&self) -> &SyntaxNode {
+        match self {
+            FunctionBody::Expr(e) => e.syntax(),
+            FunctionBody::Span { parent, .. } => parent.syntax(),
+        }
+    }
+
+    fn extracted_from_trait_impl(&self) -> bool {
+        match self.node().ancestors().find_map(ast::Impl::cast) {
+            Some(c) => return c.trait_().is_some(),
+            None => false,
+        }
+    }
+
+    fn descendants(&self) -> impl Iterator<Item = SyntaxNode> {
+        match self {
+            FunctionBody::Expr(expr) => expr.syntax().descendants(),
+            FunctionBody::Span { parent, .. } => parent.syntax().descendants(),
+        }
+    }
+
+    fn descendant_paths(&self) -> impl Iterator<Item = ast::Path> {
+        self.descendants().filter_map(|node| {
+            match_ast! {
+                match node {
+                    ast::Path(it) => Some(it),
+                    _ => None
+                }
+            }
+        })
     }
 
     fn from_expr(expr: ast::Expr) -> Option<Self> {
@@ -667,6 +721,11 @@ impl FunctionBody {
             ast::Expr::PathExpr(path_expr) => {
                 cb(path_expr.path().and_then(|it| it.as_single_name_ref()))
             }
+            ast::Expr::ClosureExpr(closure_expr) => {
+                if let Some(body) = closure_expr.body() {
+                    body.syntax().descendants().map(ast::NameRef::cast).for_each(|it| cb(it));
+                }
+            }
             ast::Expr::MacroExpr(expr) => {
                 if let Some(tt) = expr.macro_call().and_then(|call| call.token_tree()) {
                     tt.syntax()
@@ -694,6 +753,7 @@ impl FunctionBody {
                 parent_loop.get_or_insert(loop_.syntax().clone());
             }
         };
+
         let (is_const, expr, ty) = loop {
             let anc = ancestors.next()?;
             break match_ast! {
@@ -761,7 +821,20 @@ impl FunctionBody {
             container_tail.zip(self.tail_expr()).map_or(false, |(container_tail, body_tail)| {
                 container_tail.syntax().text_range().contains_range(body_tail.syntax().text_range())
             });
-        Some(ContainerInfo { is_in_tail, is_const, parent_loop, ret_type: ty })
+
+        let parent = self.parent()?;
+        let parents = generic_parents(&parent);
+        let generic_param_lists = parents.iter().filter_map(|it| it.generic_param_list()).collect();
+        let where_clauses = parents.iter().filter_map(|it| it.where_clause()).collect();
+
+        Some(ContainerInfo {
+            is_in_tail,
+            is_const,
+            parent_loop,
+            ret_type: ty,
+            generic_param_lists,
+            where_clauses,
+        })
     }
 
     fn return_ty(&self, ctx: &AssistContext) -> Option<RetType> {
@@ -918,6 +991,56 @@ impl FunctionBody {
     }
 }
 
+enum GenericParent {
+    Fn(ast::Fn),
+    Impl(ast::Impl),
+    Trait(ast::Trait),
+}
+
+impl GenericParent {
+    fn generic_param_list(&self) -> Option<ast::GenericParamList> {
+        match self {
+            GenericParent::Fn(fn_) => fn_.generic_param_list(),
+            GenericParent::Impl(impl_) => impl_.generic_param_list(),
+            GenericParent::Trait(trait_) => trait_.generic_param_list(),
+        }
+    }
+
+    fn where_clause(&self) -> Option<ast::WhereClause> {
+        match self {
+            GenericParent::Fn(fn_) => fn_.where_clause(),
+            GenericParent::Impl(impl_) => impl_.where_clause(),
+            GenericParent::Trait(trait_) => trait_.where_clause(),
+        }
+    }
+}
+
+/// Search `parent`'s ancestors for items with potentially applicable generic parameters
+fn generic_parents(parent: &SyntaxNode) -> Vec<GenericParent> {
+    let mut list = Vec::new();
+    if let Some(parent_item) = parent.ancestors().find_map(ast::Item::cast) {
+        match parent_item {
+            ast::Item::Fn(ref fn_) => {
+                if let Some(parent_parent) = parent_item
+                    .syntax()
+                    .parent()
+                    .and_then(|it| it.parent())
+                    .and_then(ast::Item::cast)
+                {
+                    match parent_parent {
+                        ast::Item::Impl(impl_) => list.push(GenericParent::Impl(impl_)),
+                        ast::Item::Trait(trait_) => list.push(GenericParent::Trait(trait_)),
+                        _ => (),
+                    }
+                }
+                list.push(GenericParent::Fn(fn_.clone()));
+            }
+            _ => (),
+        }
+    }
+    list
+}
+
 /// checks if relevant var is used with `&mut` access inside body
 fn has_exclusive_usages(ctx: &AssistContext, usages: &LocalUsages, body: &FunctionBody) -> bool {
     usages
@@ -1053,7 +1176,7 @@ fn locals_defined_in_body(
     body: &FunctionBody,
 ) -> FxIndexSet<Local> {
     // FIXME: this doesn't work well with macros
-    //        see https://github.com/rust-analyzer/rust-analyzer/pull/7535#discussion_r570048550
+    //        see https://github.com/rust-lang/rust-analyzer/pull/7535#discussion_r570048550
     let mut res = FxIndexSet::default();
     body.walk_pat(&mut |pat| {
         if let ast::Pat::IdentPat(pat) = pat {
@@ -1111,10 +1234,7 @@ fn either_syntax(value: &Either<ast::IdentPat, ast::SelfParam>) -> &SyntaxNode {
 ///
 /// Function should be put right after returned node
 fn node_to_insert_after(body: &FunctionBody, anchor: Anchor) -> Option<SyntaxNode> {
-    let node = match body {
-        FunctionBody::Expr(e) => e.syntax(),
-        FunctionBody::Span { parent, .. } => parent.syntax(),
-    };
+    let node = body.node();
     let mut ancestors = node.ancestors().peekable();
     let mut last_ancestor = None;
     while let Some(next_ancestor) = ancestors.next() {
@@ -1126,9 +1246,8 @@ fn node_to_insert_after(body: &FunctionBody, anchor: Anchor) -> Option<SyntaxNod
                     break;
                 }
             }
-            SyntaxKind::ASSOC_ITEM_LIST if !matches!(anchor, Anchor::Method) => {
-                continue;
-            }
+            SyntaxKind::ASSOC_ITEM_LIST if !matches!(anchor, Anchor::Method) => continue,
+            SyntaxKind::ASSOC_ITEM_LIST if body.extracted_from_trait_impl() => continue,
             SyntaxKind::ASSOC_ITEM_LIST => {
                 if ancestors.peek().map(SyntaxNode::kind) == Some(SyntaxKind::IMPL) {
                     break;
@@ -1329,37 +1448,154 @@ fn format_function(
     let const_kw = if fun.mods.is_const { "const " } else { "" };
     let async_kw = if fun.control_flow.is_async { "async " } else { "" };
     let unsafe_kw = if fun.control_flow.is_unsafe { "unsafe " } else { "" };
+    let (generic_params, where_clause) = make_generic_params_and_where_clause(ctx, fun);
     match ctx.config.snippet_cap {
         Some(_) => format_to!(
             fn_def,
-            "\n\n{}{}{}{}fn $0{}{}",
+            "\n\n{}{}{}{}fn $0{}",
             new_indent,
             const_kw,
             async_kw,
             unsafe_kw,
             fun.name,
-            params
         ),
         None => format_to!(
             fn_def,
-            "\n\n{}{}{}{}fn {}{}",
+            "\n\n{}{}{}{}fn {}",
             new_indent,
             const_kw,
             async_kw,
             unsafe_kw,
             fun.name,
-            params
         ),
     }
+
+    if let Some(generic_params) = generic_params {
+        format_to!(fn_def, "{}", generic_params);
+    }
+
+    format_to!(fn_def, "{}", params);
+
     if let Some(ret_ty) = ret_ty {
         format_to!(fn_def, " {}", ret_ty);
     }
+
+    if let Some(where_clause) = where_clause {
+        format_to!(fn_def, " {}", where_clause);
+    }
+
     format_to!(fn_def, " {}", body);
 
     fn_def
 }
 
+fn make_generic_params_and_where_clause(
+    ctx: &AssistContext,
+    fun: &Function,
+) -> (Option<ast::GenericParamList>, Option<ast::WhereClause>) {
+    let used_type_params = fun.type_params(ctx);
+
+    let generic_param_list = make_generic_param_list(ctx, fun, &used_type_params);
+    let where_clause = make_where_clause(ctx, fun, &used_type_params);
+
+    (generic_param_list, where_clause)
+}
+
+fn make_generic_param_list(
+    ctx: &AssistContext,
+    fun: &Function,
+    used_type_params: &[TypeParam],
+) -> Option<ast::GenericParamList> {
+    let mut generic_params = fun
+        .mods
+        .generic_param_lists
+        .iter()
+        .flat_map(|parent_params| {
+            parent_params
+                .generic_params()
+                .filter(|param| param_is_required(ctx, param, used_type_params))
+        })
+        .peekable();
+
+    if generic_params.peek().is_some() {
+        Some(make::generic_param_list(generic_params))
+    } else {
+        None
+    }
+}
+
+fn param_is_required(
+    ctx: &AssistContext,
+    param: &ast::GenericParam,
+    used_type_params: &[TypeParam],
+) -> bool {
+    match param {
+        ast::GenericParam::ConstParam(_) | ast::GenericParam::LifetimeParam(_) => false,
+        ast::GenericParam::TypeParam(type_param) => match &ctx.sema.to_def(type_param) {
+            Some(def) => used_type_params.contains(def),
+            _ => false,
+        },
+    }
+}
+
+fn make_where_clause(
+    ctx: &AssistContext,
+    fun: &Function,
+    used_type_params: &[TypeParam],
+) -> Option<ast::WhereClause> {
+    let mut predicates = fun
+        .mods
+        .where_clauses
+        .iter()
+        .flat_map(|parent_where_clause| {
+            parent_where_clause
+                .predicates()
+                .filter(|pred| pred_is_required(ctx, pred, used_type_params))
+        })
+        .peekable();
+
+    if predicates.peek().is_some() {
+        Some(make::where_clause(predicates))
+    } else {
+        None
+    }
+}
+
+fn pred_is_required(
+    ctx: &AssistContext,
+    pred: &ast::WherePred,
+    used_type_params: &[TypeParam],
+) -> bool {
+    match resolved_type_param(ctx, pred) {
+        Some(it) => used_type_params.contains(&it),
+        None => false,
+    }
+}
+
+fn resolved_type_param(ctx: &AssistContext, pred: &ast::WherePred) -> Option<TypeParam> {
+    let path = match pred.ty()? {
+        ast::Type::PathType(path_type) => path_type.path(),
+        _ => None,
+    }?;
+
+    match ctx.sema.resolve_path(&path)? {
+        PathResolution::TypeParam(type_param) => Some(type_param),
+        _ => None,
+    }
+}
+
 impl Function {
+    /// Collect all the `TypeParam`s used in the `body` and `params`.
+    fn type_params(&self, ctx: &AssistContext) -> Vec<TypeParam> {
+        let type_params_in_descendant_paths =
+            self.body.descendant_paths().filter_map(|it| match ctx.sema.resolve_path(&it) {
+                Some(PathResolution::TypeParam(type_param)) => Some(type_param),
+                _ => None,
+            });
+        let type_params_in_params = self.params.iter().filter_map(|p| p.ty.as_type_param(ctx.db()));
+        type_params_in_descendant_paths.chain(type_params_in_params).collect()
+    }
+
     fn make_param_list(&self, ctx: &AssistContext, module: hir::Module) -> ast::ParamList {
         let self_param = self.self_param.clone();
         let params = self.params.iter().map(|param| param.to_param(ctx, module));
@@ -4776,6 +5012,316 @@ fn fun_name() {
 
 fn $0fun_name2() {
     let x = 0;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn extract_method_from_trait_impl() {
+        check_assist(
+            extract_function,
+            r#"
+struct Struct(i32);
+trait Trait {
+    fn bar(&self) -> i32;
+}
+
+impl Trait for Struct {
+    fn bar(&self) -> i32 {
+        $0self.0 + 2$0
+    }
+}
+"#,
+            r#"
+struct Struct(i32);
+trait Trait {
+    fn bar(&self) -> i32;
+}
+
+impl Trait for Struct {
+    fn bar(&self) -> i32 {
+        self.fun_name()
+    }
+}
+
+impl Struct {
+    fn $0fun_name(&self) -> i32 {
+        self.0 + 2
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn closure_arguments() {
+        check_assist(
+            extract_function,
+            r#"
+fn parent(factor: i32) {
+    let v = &[1, 2, 3];
+
+    $0v.iter().map(|it| it * factor);$0
+}
+"#,
+            r#"
+fn parent(factor: i32) {
+    let v = &[1, 2, 3];
+
+    fun_name(v, factor);
+}
+
+fn $0fun_name(v: &[i32; 3], factor: i32) {
+    v.iter().map(|it| it * factor);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn preserve_generics() {
+        check_assist(
+            extract_function,
+            r#"
+fn func<T: Debug>(i: T) {
+    $0foo(i);$0
+}
+"#,
+            r#"
+fn func<T: Debug>(i: T) {
+    fun_name(i);
+}
+
+fn $0fun_name<T: Debug>(i: T) {
+    foo(i);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn preserve_generics_from_body() {
+        check_assist(
+            extract_function,
+            r#"
+fn func<T: Default>() -> T {
+    $0T::default()$0
+}
+"#,
+            r#"
+fn func<T: Default>() -> T {
+    fun_name()
+}
+
+fn $0fun_name<T: Default>() -> T {
+    T::default()
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn filter_unused_generics() {
+        check_assist(
+            extract_function,
+            r#"
+fn func<T: Debug, U: Copy>(i: T, u: U) {
+    bar(u);
+    $0foo(i);$0
+}
+"#,
+            r#"
+fn func<T: Debug, U: Copy>(i: T, u: U) {
+    bar(u);
+    fun_name(i);
+}
+
+fn $0fun_name<T: Debug>(i: T) {
+    foo(i);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn empty_generic_param_list() {
+        check_assist(
+            extract_function,
+            r#"
+fn func<T: Debug>(t: T, i: u32) {
+    bar(t);
+    $0foo(i);$0
+}
+"#,
+            r#"
+fn func<T: Debug>(t: T, i: u32) {
+    bar(t);
+    fun_name(i);
+}
+
+fn $0fun_name(i: u32) {
+    foo(i);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn preserve_where_clause() {
+        check_assist(
+            extract_function,
+            r#"
+fn func<T>(i: T) where T: Debug {
+    $0foo(i);$0
+}
+"#,
+            r#"
+fn func<T>(i: T) where T: Debug {
+    fun_name(i);
+}
+
+fn $0fun_name<T>(i: T) where T: Debug {
+    foo(i);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn filter_unused_where_clause() {
+        check_assist(
+            extract_function,
+            r#"
+fn func<T, U>(i: T, u: U) where T: Debug, U: Copy {
+    bar(u);
+    $0foo(i);$0
+}
+"#,
+            r#"
+fn func<T, U>(i: T, u: U) where T: Debug, U: Copy {
+    bar(u);
+    fun_name(i);
+}
+
+fn $0fun_name<T>(i: T) where T: Debug {
+    foo(i);
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn nested_generics() {
+        check_assist(
+            extract_function,
+            r#"
+struct Struct<T: Into<i32>>(T);
+impl <T: Into<i32> + Copy> Struct<T> {
+    fn func<V: Into<i32>>(&self, v: V) -> i32 {
+        let t = self.0;
+        $0t.into() + v.into()$0
+    }
+}
+"#,
+            r#"
+struct Struct<T: Into<i32>>(T);
+impl <T: Into<i32> + Copy> Struct<T> {
+    fn func<V: Into<i32>>(&self, v: V) -> i32 {
+        let t = self.0;
+        fun_name(t, v)
+    }
+}
+
+fn $0fun_name<T: Into<i32> + Copy, V: Into<i32>>(t: T, v: V) -> i32 {
+    t.into() + v.into()
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn filters_unused_nested_generics() {
+        check_assist(
+            extract_function,
+            r#"
+struct Struct<T: Into<i32>, U: Debug>(T, U);
+impl <T: Into<i32> + Copy, U: Debug> Struct<T, U> {
+    fn func<V: Into<i32>>(&self, v: V) -> i32 {
+        let t = self.0;
+        $0t.into() + v.into()$0
+    }
+}
+"#,
+            r#"
+struct Struct<T: Into<i32>, U: Debug>(T, U);
+impl <T: Into<i32> + Copy, U: Debug> Struct<T, U> {
+    fn func<V: Into<i32>>(&self, v: V) -> i32 {
+        let t = self.0;
+        fun_name(t, v)
+    }
+}
+
+fn $0fun_name<T: Into<i32> + Copy, V: Into<i32>>(t: T, v: V) -> i32 {
+    t.into() + v.into()
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn nested_where_clauses() {
+        check_assist(
+            extract_function,
+            r#"
+struct Struct<T>(T) where T: Into<i32>;
+impl <T> Struct<T> where T: Into<i32> + Copy {
+    fn func<V>(&self, v: V) -> i32 where V: Into<i32> {
+        let t = self.0;
+        $0t.into() + v.into()$0
+    }
+}
+"#,
+            r#"
+struct Struct<T>(T) where T: Into<i32>;
+impl <T> Struct<T> where T: Into<i32> + Copy {
+    fn func<V>(&self, v: V) -> i32 where V: Into<i32> {
+        let t = self.0;
+        fun_name(t, v)
+    }
+}
+
+fn $0fun_name<T, V>(t: T, v: V) -> i32 where T: Into<i32> + Copy, V: Into<i32> {
+    t.into() + v.into()
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn filters_unused_nested_where_clauses() {
+        check_assist(
+            extract_function,
+            r#"
+struct Struct<T, U>(T, U) where T: Into<i32>, U: Debug;
+impl <T, U> Struct<T, U> where T: Into<i32> + Copy, U: Debug {
+    fn func<V>(&self, v: V) -> i32 where V: Into<i32> {
+        let t = self.0;
+        $0t.into() + v.into()$0
+    }
+}
+"#,
+            r#"
+struct Struct<T, U>(T, U) where T: Into<i32>, U: Debug;
+impl <T, U> Struct<T, U> where T: Into<i32> + Copy, U: Debug {
+    fn func<V>(&self, v: V) -> i32 where V: Into<i32> {
+        let t = self.0;
+        fun_name(t, v)
+    }
+}
+
+fn $0fun_name<T, V>(t: T, v: V) -> i32 where T: Into<i32> + Copy, V: Into<i32> {
+    t.into() + v.into()
 }
 "#,
         );

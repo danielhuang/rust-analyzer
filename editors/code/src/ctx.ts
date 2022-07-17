@@ -42,8 +42,7 @@ export class Ctx {
 
         const res = new Ctx(config, extCtx, client, serverPath, statusBar);
 
-        res.pushCleanup(client.start());
-        await client.onReady();
+        await client.start();
         client.onNotification(ra.serverStatus, (params) => res.setServerStatus(params));
         return res;
     }
@@ -78,34 +77,35 @@ export class Ctx {
 
     setServerStatus(status: ServerStatusParams) {
         let icon = "";
+        const statusBar = this.statusBar;
         switch (status.health) {
             case "ok":
-                this.statusBar.tooltip = status.message ?? "Ready";
-                this.statusBar.command = undefined;
-                this.statusBar.color = undefined;
-                this.statusBar.backgroundColor = undefined;
+                statusBar.tooltip = status.message ?? "Ready";
+                statusBar.command = undefined;
+                statusBar.color = undefined;
+                statusBar.backgroundColor = undefined;
                 break;
             case "warning":
-                this.statusBar.tooltip += "\nClick to reload.";
-                this.statusBar.command = "rust-analyzer.reloadWorkspace";
-                this.statusBar.color = new vscode.ThemeColor("statusBarItem.warningForeground");
-                this.statusBar.backgroundColor = new vscode.ThemeColor(
+                statusBar.tooltip =
+                    (status.message ? status.message + "\n" : "") + "Click to reload.";
+
+                statusBar.command = "rust-analyzer.reloadWorkspace";
+                statusBar.color = new vscode.ThemeColor("statusBarItem.warningForeground");
+                statusBar.backgroundColor = new vscode.ThemeColor(
                     "statusBarItem.warningBackground"
                 );
                 icon = "$(warning) ";
                 break;
             case "error":
-                this.statusBar.tooltip += "\nClick to reload.";
-                this.statusBar.command = "rust-analyzer.reloadWorkspace";
-                this.statusBar.color = new vscode.ThemeColor("statusBarItem.errorForeground");
-                this.statusBar.backgroundColor = new vscode.ThemeColor(
-                    "statusBarItem.errorBackground"
-                );
+                statusBar.tooltip += "\nClick to reload.";
+                statusBar.command = "rust-analyzer.reloadWorkspace";
+                statusBar.color = new vscode.ThemeColor("statusBarItem.errorForeground");
+                statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
                 icon = "$(error) ";
                 break;
         }
         if (!status.quiescent) icon = "$(sync~spin) ";
-        this.statusBar.text = `${icon}rust-analyzer`;
+        statusBar.text = `${icon}rust-analyzer`;
     }
 
     pushCleanup(d: Disposable) {

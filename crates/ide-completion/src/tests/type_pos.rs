@@ -31,7 +31,6 @@ struct Foo<'lt, T, const C: usize> {
             bt u32
             kw crate::
             kw self::
-            kw super::
         "#]],
     )
 }
@@ -60,7 +59,6 @@ struct Foo<'lt, T, const C: usize>(f$0);
             kw pub(crate)
             kw pub(super)
             kw self::
-            kw super::
         "#]],
     )
 }
@@ -84,7 +82,6 @@ fn x<'lt, T, const C: usize>() -> $0
             bt u32
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -115,7 +112,6 @@ fn foo() -> B$0 {
         it ()
         kw crate::
         kw self::
-        kw super::
     "#]],
     )
 }
@@ -141,7 +137,6 @@ const FOO: $0 = Foo(2);
             it Foo<i32>
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -168,7 +163,6 @@ fn f2() {
             it i32
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -197,7 +191,6 @@ fn f2() {
             it u64
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -223,7 +216,6 @@ fn f2(x: u64) -> $0 {
             it u64
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -250,7 +242,6 @@ fn f2(x: $0) {
             it i32
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -285,7 +276,6 @@ fn foo<'lt, T, const C: usize>() {
             it a::Foo<a::Foo<i32>>
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -315,7 +305,6 @@ fn foo<'lt, T, const C: usize>() {
             it Foo<i32>
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -342,7 +331,6 @@ fn foo<'lt, T, const C: usize>() {
             bt u32
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
     check(
@@ -380,10 +368,26 @@ trait Trait2: Trait1 {
 fn foo<'lt, T: Trait2<$0>, const CONST_PARAM: usize>(_: T) {}
 "#,
         expect![[r#"
+            ta Foo =  (as Trait2)   type Foo
+            ta Super =  (as Trait1) type Super
+        "#]],
+    );
+    check(
+        r#"
+trait Trait1 {
+    type Super;
+}
+trait Trait2<T>: Trait1 {
+    type Foo;
+}
+
+fn foo<'lt, T: Trait2<$0>, const CONST_PARAM: usize>(_: T) {}
+"#,
+        expect![[r#"
             ct CONST
             cp CONST_PARAM
             en Enum
-            ma makro!(…)            macro_rules! makro
+            ma makro!(…)   macro_rules! makro
             md module
             st Record
             st Tuple
@@ -391,14 +395,11 @@ fn foo<'lt, T: Trait2<$0>, const CONST_PARAM: usize>(_: T) {}
             tt Trait
             tt Trait1
             tt Trait2
-            ta Foo =  (as Trait2)   type Foo
-            ta Super =  (as Trait1) type Super
             tp T
             un Union
             bt u32
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
     check(
@@ -451,7 +452,6 @@ impl Tr<$0
             bt u32
             kw crate::
             kw self::
-            kw super::
         "#]],
     );
 }
@@ -469,6 +469,203 @@ fn func(_: Enum::$0) {}
 "#,
         expect![[r#"
             ta AssocType type AssocType = ()
+        "#]],
+    );
+}
+
+#[test]
+fn completes_type_parameter_or_associated_type() {
+    check(
+        r#"
+trait MyTrait<T, U> {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<u$0
+"#,
+        expect![[r#"
+            ct CONST
+            en Enum
+            ma makro!(…) macro_rules! makro
+            md module
+            st Record
+            st Tuple
+            st Unit
+            tt MyTrait
+            tt Trait
+            un Union
+            bt u32
+            kw crate::
+            kw self::
+        "#]],
+    );
+
+    check(
+        r#"
+trait MyTrait<T, U> {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<u8, u$0
+"#,
+        expect![[r#"
+            ct CONST
+            en Enum
+            ma makro!(…) macro_rules! makro
+            md module
+            st Record
+            st Tuple
+            st Unit
+            tt MyTrait
+            tt Trait
+            un Union
+            bt u32
+            kw crate::
+            kw self::
+        "#]],
+    );
+
+    check(
+        r#"
+trait MyTrait<T, U> {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<u8, u8, I$0
+"#,
+        expect![[r#"
+            ta Item1 =  (as MyTrait) type Item1
+            ta Item2 =  (as MyTrait) type Item2
+        "#]],
+    );
+}
+
+#[test]
+fn completes_type_parameter_or_associated_type_with_default_value() {
+    check(
+        r#"
+trait MyTrait<T, U = u8> {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<u$0
+"#,
+        expect![[r#"
+            ct CONST
+            en Enum
+            ma makro!(…) macro_rules! makro
+            md module
+            st Record
+            st Tuple
+            st Unit
+            tt MyTrait
+            tt Trait
+            un Union
+            bt u32
+            kw crate::
+            kw self::
+        "#]],
+    );
+
+    check(
+        r#"
+trait MyTrait<T, U = u8> {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<u8, u$0
+"#,
+        expect![[r#"
+            ct CONST
+            en Enum
+            ma makro!(…)             macro_rules! makro
+            md module
+            st Record
+            st Tuple
+            st Unit
+            tt MyTrait
+            tt Trait
+            ta Item1 =  (as MyTrait) type Item1
+            ta Item2 =  (as MyTrait) type Item2
+            un Union
+            bt u32
+            kw crate::
+            kw self::
+        "#]],
+    );
+
+    check(
+        r#"
+trait MyTrait<T, U = u8> {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<u8, u8, I$0
+"#,
+        expect![[r#"
+            ta Item1 =  (as MyTrait) type Item1
+            ta Item2 =  (as MyTrait) type Item2
+        "#]],
+    );
+}
+
+#[test]
+fn completes_types_after_associated_type() {
+    check(
+        r#"
+trait MyTrait {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<Item1 = $0
+"#,
+        expect![[r#"
+            ct CONST
+            en Enum
+            ma makro!(…) macro_rules! makro
+            md module
+            st Record
+            st Tuple
+            st Unit
+            tt MyTrait
+            tt Trait
+            un Union
+            bt u32
+            kw crate::
+            kw self::
+        "#]],
+    );
+
+    check(
+        r#"
+trait MyTrait {
+    type Item1;
+    type Item2;
+};
+
+fn f(t: impl MyTrait<Item1 = u8, Item2 = $0
+"#,
+        expect![[r#"
+            ct CONST
+            en Enum
+            ma makro!(…) macro_rules! makro
+            md module
+            st Record
+            st Tuple
+            st Unit
+            tt MyTrait
+            tt Trait
+            un Union
+            bt u32
+            kw crate::
+            kw self::
         "#]],
     );
 }

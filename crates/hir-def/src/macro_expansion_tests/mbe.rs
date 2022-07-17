@@ -1178,7 +1178,7 @@ abs!( = > #);
 #[test]
 fn test_tt_with_composite_without_space() {
     // Test macro input without any spaces
-    // See https://github.com/rust-analyzer/rust-analyzer/issues/6692
+    // See https://github.com/rust-lang/rust-analyzer/issues/6692
     check(
         r#"
 macro_rules! m { ($ op:tt, $j:path) => ( ok!(); ) }
@@ -1611,4 +1611,22 @@ impl Foo {
 }
 "#]],
     )
+}
+
+#[test]
+fn test_metavar_exprs() {
+    check(
+        r#"
+macro_rules! m {
+    ( $( $t:tt )* ) => ( $( ${ignore(t)} -${index()} )-* );
+}
+const _: i32 = m!(a b c);
+    "#,
+        expect![[r#"
+macro_rules! m {
+    ( $( $t:tt )* ) => ( $( ${ignore(t)} -${index()} )-* );
+}
+const _: i32 = -0--1--2;
+    "#]],
+    );
 }

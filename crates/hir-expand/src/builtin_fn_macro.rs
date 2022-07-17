@@ -261,13 +261,7 @@ fn format_args_expand(
         quote! { std::fmt::ArgumentV1::new(&(#arg), std::fmt::Display::fmt), }
     }.token_trees);
     let expanded = quote! {
-        // It's unsafe since https://github.com/rust-lang/rust/pull/83302
-        // Wrap an unsafe block to avoid false-positive `missing-unsafe` lint.
-        // FIXME: Currently we don't have `unused_unsafe` lint so an extra unsafe block won't cause issues on early
-        // stable rust-src.
-        unsafe {
-            std::fmt::Arguments::new_v1(&[], &[##arg_tts])
-        }
+        std::fmt::Arguments::new_v1(&[], &[##arg_tts])
     };
     ExpandResult::ok(expanded)
 }
@@ -400,7 +394,7 @@ fn concat_expand(
     for (i, mut t) in tt.token_trees.iter().enumerate() {
         // FIXME: hack on top of a hack: `$e:expr` captures get surrounded in parentheses
         // to ensure the right parsing order, so skip the parentheses here. Ideally we'd
-        // implement rustc's model. cc https://github.com/rust-analyzer/rust-analyzer/pull/10623
+        // implement rustc's model. cc https://github.com/rust-lang/rust-analyzer/pull/10623
         if let tt::TokenTree::Subtree(tt::Subtree { delimiter: Some(delim), token_trees }) = t {
             if let [tt] = &**token_trees {
                 if delim.kind == tt::DelimiterKind::Parenthesis {

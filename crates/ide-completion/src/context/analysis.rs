@@ -13,8 +13,9 @@ use syntax::{
 use crate::context::{
     AttrCtx, CompletionAnalysis, CompletionContext, DotAccess, DotAccessKind, ExprCtx,
     ItemListKind, LifetimeContext, LifetimeKind, NameContext, NameKind, NameRefContext,
-    NameRefKind, ParamKind, PathCompletionCtx, PathKind, PatternContext, PatternRefutability,
-    Qualified, QualifierCtx, TypeAscriptionTarget, TypeLocation, COMPLETION_MARKER,
+    NameRefKind, ParamContext, ParamKind, PathCompletionCtx, PathKind, PatternContext,
+    PatternRefutability, Qualified, QualifierCtx, TypeAscriptionTarget, TypeLocation,
+    COMPLETION_MARKER,
 };
 
 impl<'a> CompletionContext<'a> {
@@ -899,10 +900,25 @@ impl<'a> CompletionContext<'a> {
                         Qualified::Infer
                     } else {
                         let res = sema.resolve_path(&path);
-                        let is_super_chain =
-                            iter::successors(Some(path.clone()), |p| p.qualifier())
-                                .all(|p| p.segment().and_then(|s| s.super_token()).is_some());
-                        Qualified::With { path, resolution: res, is_super_chain }
+
+                        // For understanding how and why super_chain_len is calculated the way it
+                        // is check the documentation at it's definition
+                        let mut segment_count = 0;
+                        let super_count = iter::successors(Some(path.clone()), |p| p.qualifier())
+                            .take_while(|p| {
+                                p.segment()
+                                    .and_then(|s| {
+                                        segment_count += 1;
+                                        s.super_token()
+                                    })
+                                    .is_some()
+                            })
+                            .count();
+
+                        let super_chain_len =
+                            if segment_count > super_count { None } else { Some(super_count) };
+
+                        Qualified::With { path, resolution: res, super_chain_len }
                     }
                 };
             }
@@ -975,7 +991,7 @@ fn pattern_context_for(
     original_file: &SyntaxNode,
     pat: ast::Pat,
 ) -> PatternContext {
-    let mut is_param = None;
+    let mut param_ctx = None;
     let (refutability, has_type_ascription) =
     pat
         .syntax()
@@ -988,7 +1004,7 @@ fn pattern_context_for(
                     ast::LetStmt(let_) => return (PatternRefutability::Irrefutable, let_.ty().is_some()),
                     ast::Param(param) => {
                         let has_type_ascription = param.ty().is_some();
-                        is_param = (|| {
+                        param_ctx = (|| {
                             let fake_param_list = param.syntax().parent().and_then(ast::ParamList::cast)?;
                             let param_list = find_node_in_file_compensated(sema, original_file, &fake_param_list)?;
                             let param_list_owner = param_list.syntax().parent()?;
@@ -999,7 +1015,9 @@ fn pattern_context_for(
                                     _ => return None,
                                 }
                             };
-                            Some((param_list, param, kind))
+                            Some(ParamContext {
+                                param_list, param, kind
+                            })
                         })();
                         return (PatternRefutability::Irrefutable, has_type_ascription)
                     },
@@ -1018,7 +1036,7 @@ fn pattern_context_for(
 
     PatternContext {
         refutability,
-        param_ctx: is_param,
+        param_ctx,
         has_type_ascription,
         parent_pat: pat.syntax().parent().and_then(ast::Pat::cast),
         mut_token,
