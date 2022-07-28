@@ -16,23 +16,22 @@ use hir_expand::{
     name::{known, AsName},
     ExpansionInfo, MacroCallId,
 };
-use hir_ty::Interner;
 use itertools::Itertools;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{smallvec, SmallVec};
 use syntax::{
     algo::skip_trivia_token,
     ast::{self, HasAttrs as _, HasGenericParams, HasLoopBody},
-    match_ast, AstNode, Direction, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextSize,
+    match_ast, AstNode, Direction, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextSize,
 };
 
 use crate::{
     db::HirDatabase,
     semantics::source_to_def::{ChildContainer, SourceToDefCache, SourceToDefCtx},
     source_analyzer::{resolve_hir_path, SourceAnalyzer},
-    Access, BindingMode, BuiltinAttr, Callable, ConstParam, Crate, Field, Function, HasSource,
-    HirFileId, Impl, InFile, Label, LifetimeParam, Local, Macro, Module, ModuleDef, Name, Path,
-    ScopeDef, ToolModule, Trait, Type, TypeAlias, TypeParam, VariantDef,
+    Access, BindingMode, BuiltinAttr, Callable, ConstParam, Crate, DeriveHelper, Field, Function,
+    HasSource, HirFileId, Impl, InFile, Label, LifetimeParam, Local, Macro, Module, ModuleDef,
+    Name, Path, ScopeDef, ToolModule, Trait, Type, TypeAlias, TypeParam, VariantDef,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +47,7 @@ pub enum PathResolution {
     SelfType(Impl),
     BuiltinAttr(BuiltinAttr),
     ToolModule(ToolModule),
+    DeriveHelper(DeriveHelper),
 }
 
 impl PathResolution {
@@ -72,6 +72,7 @@ impl PathResolution {
             PathResolution::BuiltinAttr(_)
             | PathResolution::ToolModule(_)
             | PathResolution::Local(_)
+            | PathResolution::DeriveHelper(_)
             | PathResolution::ConstParam(_) => None,
             PathResolution::TypeParam(param) => Some(TypeNs::GenericParam((*param).into())),
             PathResolution::SelfType(impl_def) => Some(TypeNs::SelfType((*impl_def).into())),
@@ -125,7 +126,7 @@ impl<DB> fmt::Debug for Semantics<'_, DB> {
 }
 
 impl<'db, DB: HirDatabase> Semantics<'db, DB> {
-    pub fn new(db: &DB) -> Semantics<DB> {
+    pub fn new(db: &DB) -> Semantics<'_, DB> {
         let impl_ = SemanticsImpl::new(db);
         Semantics { db, imp: impl_ }
     }
@@ -216,6 +217,10 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
         token: SyntaxToken,
     ) -> SmallVec<[SyntaxToken; 1]> {
         self.imp.descend_into_macros_with_same_text(token)
+    }
+
+    pub fn descend_into_macros_with_kind_preference(&self, token: SyntaxToken) -> SyntaxToken {
+        self.imp.descend_into_macros_with_kind_preference(token)
     }
 
     /// Maps a node down by mapping its first and last token down.
@@ -317,6 +322,10 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
 
     pub fn resolve_type(&self, ty: &ast::Type) -> Option<Type> {
         self.imp.resolve_type(ty)
+    }
+
+    pub fn resolve_trait(&self, trait_: &ast::Path) -> Option<Trait> {
+        self.imp.resolve_trait(trait_)
     }
 
     // FIXME: Figure out a nice interface to inspect adjustments
@@ -681,6 +690,32 @@ impl<'db> SemanticsImpl<'db> {
         res
     }
 
+    fn descend_into_macros_with_kind_preference(&self, token: SyntaxToken) -> SyntaxToken {
+        let fetch_kind = |token: &SyntaxToken| match token.parent() {
+            Some(node) => match node.kind() {
+                kind @ (SyntaxKind::NAME | SyntaxKind::NAME_REF) => {
+                    node.parent().map_or(kind, |it| it.kind())
+                }
+                _ => token.kind(),
+            },
+            None => token.kind(),
+        };
+        let preferred_kind = fetch_kind(&token);
+        let mut res = None;
+        self.descend_into_macros_impl(token.clone(), &mut |InFile { value, .. }| {
+            if fetch_kind(&value) == preferred_kind {
+                res = Some(value);
+                true
+            } else {
+                if let None = res {
+                    res = Some(value)
+                }
+                false
+            }
+        });
+        res.unwrap_or(token)
+    }
+
     fn descend_into_macros_single(&self, token: SyntaxToken) -> SyntaxToken {
         let mut res = token.clone();
         self.descend_into_macros_impl(token, &mut |InFile { value, .. }| {
@@ -704,6 +739,8 @@ impl<'db> SemanticsImpl<'db> {
             Some(it) => it,
             None => return,
         };
+        let def_map = sa.resolver.def_map();
+
         let mut stack: SmallVec<[_; 4]> = smallvec![InFile::new(sa.file_id, token)];
         let mut cache = self.expansion_info_cache.borrow_mut();
         let mut mcache = self.macro_call_cache.borrow_mut();
@@ -735,7 +772,7 @@ impl<'db> SemanticsImpl<'db> {
         while let Some(token) = stack.pop() {
             self.db.unwind_if_cancelled();
             let was_not_remapped = (|| {
-                // are we inside an attribute macro call
+                // First expand into attribute invocations
                 let containing_attribute_macro_call = self.with_ctx(|ctx| {
                     token.value.parent_ancestors().filter_map(ast::Item::cast).find_map(|item| {
                         if item.attrs().next().is_none() {
@@ -755,53 +792,19 @@ impl<'db> SemanticsImpl<'db> {
                     );
                 }
 
-                // or are we inside a function-like macro call
-                if let Some(tt) =
-                    // FIXME replace map.while_some with take_while once stable
-                    token
-                        .value
-                        .parent_ancestors()
-                        .map(ast::TokenTree::cast)
-                        .while_some()
-                        .last()
-                {
-                    let parent = tt.syntax().parent()?;
-                    // check for derive attribute here
-                    let macro_call = match_ast! {
-                        match parent {
-                            ast::MacroCall(mcall) => mcall,
-                            // attribute we failed expansion for earlier, this might be a derive invocation
-                            // so try downmapping the token into the pseudo derive expansion
-                            // see [hir_expand::builtin_attr_macro] for how the pseudo derive expansion works
-                            ast::Meta(meta) => {
-                                let attr = meta.parent_attr()?;
-                                let adt = attr.syntax().parent().and_then(ast::Adt::cast)?;
-                                let call_id = self.with_ctx(|ctx| {
-                                    let (_, call_id, _) = ctx.attr_to_derive_macro_call(
-                                        token.with_value(&adt),
-                                        token.with_value(attr),
-                                    )?;
-                                    Some(call_id)
-                                })?;
-                                let file_id = call_id.as_file();
-                                return process_expansion_for_token(
-                                    &mut stack,
-                                    file_id,
-                                    Some(adt.into()),
-                                    token.as_ref(),
-                                );
-                            },
-                            _ => return None,
-                        }
-                    };
+                // Then check for token trees, that means we are either in a function-like macro or
+                // secondary attribute inputs
+                let tt = token.value.parent_ancestors().map_while(ast::TokenTree::cast).last()?;
+                let parent = tt.syntax().parent()?;
 
-                    if tt.left_delimiter_token().map_or(false, |it| it == token.value) {
-                        return None;
-                    }
-                    if tt.right_delimiter_token().map_or(false, |it| it == token.value) {
-                        return None;
-                    }
+                if tt.left_delimiter_token().map_or(false, |it| it == token.value) {
+                    return None;
+                }
+                if tt.right_delimiter_token().map_or(false, |it| it == token.value) {
+                    return None;
+                }
 
+                if let Some(macro_call) = ast::MacroCall::cast(parent.clone()) {
                     let mcall = token.with_value(macro_call);
                     let file_id = match mcache.get(&mcall) {
                         Some(&it) => it,
@@ -811,11 +814,77 @@ impl<'db> SemanticsImpl<'db> {
                             it
                         }
                     };
-                    return process_expansion_for_token(&mut stack, file_id, None, token.as_ref());
-                }
+                    process_expansion_for_token(&mut stack, file_id, None, token.as_ref())
+                } else if let Some(meta) = ast::Meta::cast(parent.clone()) {
+                    // attribute we failed expansion for earlier, this might be a derive invocation
+                    // or derive helper attribute
+                    let attr = meta.parent_attr()?;
 
-                // outside of a macro invocation so this is a "final" token
-                None
+                    let adt = if let Some(adt) = attr.syntax().parent().and_then(ast::Adt::cast) {
+                        // this might be a derive, or a derive helper on an ADT
+                        let derive_call = self.with_ctx(|ctx| {
+                            // so try downmapping the token into the pseudo derive expansion
+                            // see [hir_expand::builtin_attr_macro] for how the pseudo derive expansion works
+                            ctx.attr_to_derive_macro_call(
+                                token.with_value(&adt),
+                                token.with_value(attr.clone()),
+                            )
+                            .map(|(_, call_id, _)| call_id)
+                        });
+
+                        match derive_call {
+                            Some(call_id) => {
+                                // resolved to a derive
+                                let file_id = call_id.as_file();
+                                return process_expansion_for_token(
+                                    &mut stack,
+                                    file_id,
+                                    Some(adt.into()),
+                                    token.as_ref(),
+                                );
+                            }
+                            None => Some(adt),
+                        }
+                    } else {
+                        // Otherwise this could be a derive helper on a variant or field
+                        if let Some(field) = attr.syntax().parent().and_then(ast::RecordField::cast)
+                        {
+                            field.syntax().ancestors().take(4).find_map(ast::Adt::cast)
+                        } else if let Some(field) =
+                            attr.syntax().parent().and_then(ast::TupleField::cast)
+                        {
+                            field.syntax().ancestors().take(4).find_map(ast::Adt::cast)
+                        } else if let Some(variant) =
+                            attr.syntax().parent().and_then(ast::Variant::cast)
+                        {
+                            variant.syntax().ancestors().nth(2).and_then(ast::Adt::cast)
+                        } else {
+                            None
+                        }
+                    }?;
+                    if !self.with_ctx(|ctx| ctx.has_derives(InFile::new(token.file_id, &adt))) {
+                        return None;
+                    }
+                    // Not an attribute, nor a derive, so it's either a builtin or a derive helper
+                    // Try to resolve to a derive helper and downmap
+                    let attr_name = attr.path().and_then(|it| it.as_single_name_ref())?.as_name();
+                    let id = self.db.ast_id_map(token.file_id).ast_id(&adt);
+                    let helpers =
+                        def_map.derive_helpers_in_scope(InFile::new(token.file_id, id))?;
+                    let item = Some(adt.into());
+                    let mut res = None;
+                    for (.., derive) in helpers.iter().filter(|(helper, ..)| *helper == attr_name) {
+                        res = res.or(process_expansion_for_token(
+                            &mut stack,
+                            derive.as_file(),
+                            item.clone(),
+                            token.as_ref(),
+                        ));
+                    }
+                    res
+                } else {
+                    None
+                }
             })()
             .is_none();
 
@@ -859,7 +928,12 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn original_ast_node<N: AstNode>(&self, node: N) -> Option<N> {
-        self.wrap_node_infile(node).original_ast_node(self.db.upcast()).map(|it| it.value)
+        self.wrap_node_infile(node).original_ast_node(self.db.upcast()).map(
+            |InFile { file_id, value }| {
+                self.cache(find_root(value.syntax()), file_id);
+                value
+            },
+        )
     }
 
     fn diagnostics_display_range(&self, src: InFile<SyntaxNodePtr>) -> FileRange {
@@ -944,6 +1018,20 @@ impl<'db> SemanticsImpl<'db> {
         Some(Type::new_with_resolver(self.db, &analyze.resolver, ty))
     }
 
+    fn resolve_trait(&self, path: &ast::Path) -> Option<Trait> {
+        let analyze = self.analyze(path.syntax())?;
+        let hygiene = hir_expand::hygiene::Hygiene::new(self.db.upcast(), analyze.file_id);
+        let ctx = body::LowerCtx::with_hygiene(self.db.upcast(), &hygiene);
+        let hir_path = Path::from_src(path.clone(), &ctx)?;
+        match analyze
+            .resolver
+            .resolve_path_in_type_ns_fully(self.db.upcast(), hir_path.mod_path())?
+        {
+            TypeNs::TraitId(id) => Some(Trait { id }),
+            _ => None,
+        }
+    }
+
     fn is_implicit_reborrow(&self, expr: &ast::Expr) -> Option<Mutability> {
         self.analyze(expr.syntax())?.is_implicit_reborrow(self.db, expr)
     }
@@ -975,18 +1063,11 @@ impl<'db> SemanticsImpl<'db> {
     }
 
     fn resolve_method_call(&self, call: &ast::MethodCallExpr) -> Option<FunctionId> {
-        self.analyze(call.syntax())?.resolve_method_call(self.db, call).map(|(id, _)| id)
+        self.analyze(call.syntax())?.resolve_method_call(self.db, call)
     }
 
     fn resolve_method_call_as_callable(&self, call: &ast::MethodCallExpr) -> Option<Callable> {
-        let source_analyzer = self.analyze(call.syntax())?;
-        let (func, subst) = source_analyzer.resolve_method_call(self.db, call)?;
-        let ty = self.db.value_ty(func.into()).substitute(Interner, &subst);
-        let resolver = source_analyzer.resolver;
-        let ty = Type::new_with_resolver(self.db, &resolver, ty);
-        let mut res = ty.as_callable(self.db)?;
-        res.is_bound_method = true;
-        Some(res)
+        self.analyze(call.syntax())?.resolve_method_call_as_callable(self.db, call)
     }
 
     fn resolve_field(&self, field: &ast::FieldExpr) -> Option<Field> {
@@ -1064,7 +1145,7 @@ impl<'db> SemanticsImpl<'db> {
             .unwrap_or_default()
     }
 
-    fn with_ctx<F: FnOnce(&mut SourceToDefCtx) -> T, T>(&self, f: F) -> T {
+    fn with_ctx<F: FnOnce(&mut SourceToDefCtx<'_, '_>) -> T, T>(&self, f: F) -> T {
         let mut cache = self.s2d_cache.borrow_mut();
         let mut ctx = SourceToDefCtx { db: self.db, cache: &mut *cache };
         f(&mut ctx)
@@ -1288,7 +1369,7 @@ impl<'db> SemanticsImpl<'db> {
 }
 
 fn macro_call_to_macro_id(
-    ctx: &mut SourceToDefCtx,
+    ctx: &mut SourceToDefCtx<'_, '_>,
     db: &dyn AstDatabase,
     macro_call_id: MacroCallId,
 ) -> Option<MacroId> {
@@ -1310,14 +1391,14 @@ fn macro_call_to_macro_id(
 pub trait ToDef: AstNode + Clone {
     type Def;
 
-    fn to_def(sema: &SemanticsImpl, src: InFile<Self>) -> Option<Self::Def>;
+    fn to_def(sema: &SemanticsImpl<'_>, src: InFile<Self>) -> Option<Self::Def>;
 }
 
 macro_rules! to_def_impls {
     ($(($def:path, $ast:path, $meth:ident)),* ,) => {$(
         impl ToDef for $ast {
             type Def = $def;
-            fn to_def(sema: &SemanticsImpl, src: InFile<Self>) -> Option<Self::Def> {
+            fn to_def(sema: &SemanticsImpl<'_>, src: InFile<Self>) -> Option<Self::Def> {
                 sema.with_ctx(|ctx| ctx.$meth(src)).map(<$def>::from)
             }
         }

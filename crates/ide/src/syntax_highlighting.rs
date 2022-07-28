@@ -107,6 +107,7 @@ pub struct HlRange {
 // builtinType:: Emitted for builtin types like `u32`, `str` and `f32`.
 // comment:: Emitted for comments.
 // constParameter:: Emitted for const parameters.
+// deriveHelper:: Emitted for derive helper attributes.
 // enumMember:: Emitted for enum variants.
 // generic:: Emitted for generic tokens that have no mapping.
 // keyword:: Emitted for keywords.
@@ -196,7 +197,7 @@ pub(crate) fn highlight(
 
 fn traverse(
     hl: &mut Highlights,
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     file_id: FileId,
     root: &SyntaxNode,
     krate: hir::Crate,
@@ -205,6 +206,19 @@ fn traverse(
 ) {
     let is_unlinked = sema.to_module_def(file_id).is_none();
     let mut bindings_shadow_count: FxHashMap<Name, u32> = FxHashMap::default();
+
+    enum AttrOrDerive {
+        Attr(ast::Item),
+        Derive(ast::Item),
+    }
+
+    impl AttrOrDerive {
+        fn item(&self) -> &ast::Item {
+            match self {
+                AttrOrDerive::Attr(item) | AttrOrDerive::Derive(item) => item,
+            }
+        }
+    }
 
     let mut tt_level = 0;
     let mut attr_or_derive_item = None;
@@ -260,7 +274,7 @@ fn traverse(
 
                         if attr_or_derive_item.is_none() {
                             if sema.is_attr_macro_call(&item) {
-                                attr_or_derive_item = Some(item);
+                                attr_or_derive_item = Some(AttrOrDerive::Attr(item));
                             } else {
                                 let adt = match item {
                                     ast::Item::Enum(it) => Some(ast::Adt::Enum(it)),
@@ -270,7 +284,8 @@ fn traverse(
                                 };
                                 match adt {
                                     Some(adt) if sema.is_derive_annotated(&adt) => {
-                                        attr_or_derive_item = Some(ast::Item::from(adt));
+                                        attr_or_derive_item =
+                                            Some(AttrOrDerive::Derive(ast::Item::from(adt)));
                                     }
                                     _ => (),
                                 }
@@ -292,7 +307,9 @@ fn traverse(
                         current_macro = None;
                         macro_highlighter = MacroHighlighter::default();
                     }
-                    Some(item) if attr_or_derive_item.as_ref().map_or(false, |it| *it == item) => {
+                    Some(item)
+                        if attr_or_derive_item.as_ref().map_or(false, |it| *it.item() == item) =>
+                    {
                         attr_or_derive_item = None;
                     }
                     _ => (),
@@ -330,15 +347,26 @@ fn traverse(
 
         // Descending tokens into macros is expensive even if no descending occurs, so make sure
         // that we actually are in a position where descending is possible.
-        let in_macro = tt_level > 0 || attr_or_derive_item.is_some();
+        let in_macro = tt_level > 0
+            || match attr_or_derive_item {
+                Some(AttrOrDerive::Attr(_)) => true,
+                Some(AttrOrDerive::Derive(_)) => inside_attribute,
+                None => false,
+            };
         let descended_element = if in_macro {
             // Attempt to descend tokens into macro-calls.
             match element {
                 NodeOrToken::Token(token) if token.kind() != COMMENT => {
-                    let token = sema.descend_into_macros_single(token);
+                    let token = match attr_or_derive_item {
+                        Some(AttrOrDerive::Attr(_)) => {
+                            sema.descend_into_macros_with_kind_preference(token)
+                        }
+                        Some(AttrOrDerive::Derive(_)) | None => {
+                            sema.descend_into_macros_single(token)
+                        }
+                    };
                     match token.parent().and_then(ast::NameLike::cast) {
                         // Remap the token into the wrapping single token nodes
-                        // FIXME: if the node doesn't resolve, we also won't do token based highlighting!
                         Some(parent) => match (token.kind(), parent.syntax().kind()) {
                             (T![self] | T![ident], NAME | NAME_REF) => NodeOrToken::Node(parent),
                             (T![self] | T![super] | T![crate] | T![Self], NAME_REF) => {
@@ -402,6 +430,13 @@ fn traverse(
             if is_unlinked && highlight.tag == HlTag::UnresolvedReference {
                 // do not emit unresolved references if the file is unlinked
                 // let the editor do its highlighting for these tokens instead
+                continue;
+            }
+            if highlight.tag == HlTag::UnresolvedReference
+                && matches!(attr_or_derive_item, Some(AttrOrDerive::Derive(_)) if inside_attribute)
+            {
+                // do not emit unresolved references in derive helpers if the token mapping maps to
+                // something unresolvable. FIXME: There should be a way to prevent that
                 continue;
             }
             if inside_attribute {

@@ -19,7 +19,7 @@ use syntax::{
         make, HasName, HasVisibility,
     },
     match_ast, ted, AstNode, SourceFile,
-    SyntaxKind::WHITESPACE,
+    SyntaxKind::{self, WHITESPACE},
     SyntaxNode, TextRange,
 };
 
@@ -53,7 +53,7 @@ use super::remove_unused_param::range_to_remove;
 //     name + 2
 // }
 // ```
-pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
+pub(crate) fn extract_module(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     if ctx.has_empty_selection() {
         return None;
     }
@@ -234,7 +234,7 @@ fn extract_target(node: &SyntaxNode, selection_range: TextRange) -> Option<Modul
 impl Module {
     fn get_usages_and_record_fields(
         &self,
-        ctx: &AssistContext,
+        ctx: &AssistContext<'_>,
     ) -> (HashMap<FileId, Vec<(TextRange, String)>>, Vec<SyntaxNode>) {
         let mut adt_fields = Vec::new();
         let mut refs: HashMap<FileId, Vec<(TextRange, String)>> = HashMap::new();
@@ -318,7 +318,7 @@ impl Module {
 
     fn expand_and_group_usages_file_wise(
         &self,
-        ctx: &AssistContext,
+        ctx: &AssistContext<'_>,
         node_def: Definition,
         refs_in_files: &mut HashMap<FileId, Vec<(TextRange, String)>>,
     ) {
@@ -380,14 +380,23 @@ impl Module {
         }
 
         for (vis, syntax) in replacements {
-            add_change_vis(vis, syntax.first_child_or_token());
+            let item = syntax.children_with_tokens().find(|node_or_token| {
+                match node_or_token.kind() {
+                    // We're skipping comments, doc comments, and attribute macros that may precede the keyword
+                    // that the visibility should be placed before.
+                    SyntaxKind::COMMENT | SyntaxKind::ATTR | SyntaxKind::WHITESPACE => false,
+                    _ => true,
+                }
+            });
+
+            add_change_vis(vis, item);
         }
     }
 
     fn resolve_imports(
         &mut self,
         curr_parent_module: Option<ast::Module>,
-        ctx: &AssistContext,
+        ctx: &AssistContext<'_>,
     ) -> Vec<TextRange> {
         let mut import_paths_to_be_removed: Vec<TextRange> = vec![];
         let mut node_set: HashSet<String> = HashSet::new();
@@ -462,7 +471,7 @@ impl Module {
         def: Definition,
         node_syntax: &SyntaxNode,
         curr_parent_module: &Option<ast::Module>,
-        ctx: &AssistContext,
+        ctx: &AssistContext<'_>,
     ) -> Option<TextRange> {
         //We only need to find in the current file
         let selection_range = ctx.selection_trimmed();
@@ -675,7 +684,7 @@ fn check_intersection_and_push(
 
 fn does_source_exists_outside_sel_in_same_mod(
     def: Definition,
-    ctx: &AssistContext,
+    ctx: &AssistContext<'_>,
     curr_parent_module: &Option<ast::Module>,
     selection_range: TextRange,
     curr_file_id: FileId,
@@ -895,7 +904,7 @@ fn add_change_vis(vis: Option<ast::Visibility>, node_or_token_opt: Option<syntax
 fn compare_hir_and_ast_module(
     ast_module: &ast::Module,
     hir_module: hir::Module,
-    ctx: &AssistContext,
+    ctx: &AssistContext<'_>,
 ) -> Option<()> {
     let hir_mod_name = hir_module.name(ctx.db())?;
     let ast_mod_name = ast_module.name()?;
@@ -1577,6 +1586,183 @@ mod modname {
                 use super::x::Foo;
 
                 pub(crate) type A = (Foo, Bar);
+            }
+        ",
+        )
+    }
+
+    #[test]
+    fn test_issue_12790() {
+        check_assist(
+            extract_module,
+            r"
+            $0/// A documented function
+            fn documented_fn() {}
+
+            // A commented function with a #[] attribute macro
+            #[cfg(test)]
+            fn attribute_fn() {}
+
+            // A normally commented function
+            fn normal_fn() {}
+
+            /// A documented Struct
+            struct DocumentedStruct {
+                // Normal field
+                x: i32,
+
+                /// Documented field
+                y: i32,
+
+                // Macroed field
+                #[cfg(test)]
+                z: i32,
+            }
+
+            // A macroed Struct
+            #[cfg(test)]
+            struct MacroedStruct {
+                // Normal field
+                x: i32,
+
+                /// Documented field
+                y: i32,
+
+                // Macroed field
+                #[cfg(test)]
+                z: i32,
+            }
+
+            // A normal Struct
+            struct NormalStruct {
+                // Normal field
+                x: i32,
+
+                /// Documented field
+                y: i32,
+
+                // Macroed field
+                #[cfg(test)]
+                z: i32,
+            }
+
+            /// A documented type
+            type DocumentedType = i32;
+
+            // A macroed type
+            #[cfg(test)]
+            type MacroedType = i32;
+
+            /// A module to move
+            mod module {}
+
+            /// An impl to move
+            impl NormalStruct {
+                /// A method
+                fn new() {}
+            }
+
+            /// A documented trait
+            trait DocTrait {
+                /// Inner function
+                fn doc() {}
+            }
+
+            /// An enum
+            enum DocumentedEnum {
+                /// A variant
+                A,
+                /// Another variant
+                B { x: i32, y: i32 }
+            }
+
+            /// Documented const
+            const MY_CONST: i32 = 0;$0
+        ",
+            r"
+            mod modname {
+                /// A documented function
+                pub(crate) fn documented_fn() {}
+
+                // A commented function with a #[] attribute macro
+                #[cfg(test)]
+                pub(crate) fn attribute_fn() {}
+
+                // A normally commented function
+                pub(crate) fn normal_fn() {}
+
+                /// A documented Struct
+                pub(crate) struct DocumentedStruct {
+                    // Normal field
+                    pub(crate) x: i32,
+
+                    /// Documented field
+                    pub(crate) y: i32,
+
+                    // Macroed field
+                    #[cfg(test)]
+                    pub(crate) z: i32,
+                }
+
+                // A macroed Struct
+                #[cfg(test)]
+                pub(crate) struct MacroedStruct {
+                    // Normal field
+                    pub(crate) x: i32,
+
+                    /// Documented field
+                    pub(crate) y: i32,
+
+                    // Macroed field
+                    #[cfg(test)]
+                    pub(crate) z: i32,
+                }
+
+                // A normal Struct
+                pub(crate) struct NormalStruct {
+                    // Normal field
+                    pub(crate) x: i32,
+
+                    /// Documented field
+                    pub(crate) y: i32,
+
+                    // Macroed field
+                    #[cfg(test)]
+                    pub(crate) z: i32,
+                }
+
+                /// A documented type
+                pub(crate) type DocumentedType = i32;
+
+                // A macroed type
+                #[cfg(test)]
+                pub(crate) type MacroedType = i32;
+
+                /// A module to move
+                pub(crate) mod module {}
+
+                /// An impl to move
+                impl NormalStruct {
+                    /// A method
+                    pub(crate) fn new() {}
+                }
+
+                /// A documented trait
+                pub(crate) trait DocTrait {
+                    /// Inner function
+                    fn doc() {}
+                }
+
+                /// An enum
+                pub(crate) enum DocumentedEnum {
+                    /// A variant
+                    A,
+                    /// Another variant
+                    B { x: i32, y: i32 }
+                }
+
+                /// Documented const
+                pub(crate) const MY_CONST: i32 = 0;
             }
         ",
         )

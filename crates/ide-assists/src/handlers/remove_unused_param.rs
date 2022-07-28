@@ -30,7 +30,7 @@ use crate::{
 //     frobnicate();
 // }
 // ```
-pub(crate) fn remove_unused_param(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
+pub(crate) fn remove_unused_param(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let param: ast::Param = ctx.find_node_at_offset()?;
     let ident_pat = match param.pat()? {
         ast::Pat::IdentPat(it) => it,
@@ -87,7 +87,7 @@ pub(crate) fn remove_unused_param(acc: &mut Assists, ctx: &AssistContext) -> Opt
 }
 
 fn process_usages(
-    ctx: &AssistContext,
+    ctx: &AssistContext<'_>,
     builder: &mut AssistBuilder,
     file_id: FileId,
     references: Vec<FileReference>,
@@ -96,11 +96,19 @@ fn process_usages(
 ) {
     let source_file = ctx.sema.parse(file_id);
     builder.edit_file(file_id);
-    for usage in references {
-        if let Some(text_range) = process_usage(&source_file, usage, arg_to_remove, is_self_present)
-        {
-            builder.delete(text_range);
+    let possible_ranges = references
+        .into_iter()
+        .filter_map(|usage| process_usage(&source_file, usage, arg_to_remove, is_self_present));
+
+    let mut ranges_to_delete: Vec<TextRange> = vec![];
+    for range in possible_ranges {
+        if !ranges_to_delete.iter().any(|it| it.contains_range(range)) {
+            ranges_to_delete.push(range)
         }
+    }
+
+    for range in ranges_to_delete {
+        builder.delete(range)
     }
 }
 
@@ -369,6 +377,31 @@ fn main() {
     S.f();
     S.f(92);
     S::f(&S);
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn nested_call() {
+        check_assist(
+            remove_unused_param,
+            r#"
+fn foo(x: i32, $0y: i32) -> i32 {
+    x
+}
+
+fn bar() {
+    foo(1, foo(2, 3));
+}
+"#,
+            r#"
+fn foo(x: i32) -> i32 {
+    x
+}
+
+fn bar() {
+    foo(1);
 }
 "#,
         )

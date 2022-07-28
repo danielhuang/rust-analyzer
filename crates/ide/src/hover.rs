@@ -115,7 +115,12 @@ pub(crate) fn hover(
         });
     }
 
-    let descended = sema.descend_into_macros_with_same_text(original_token.clone());
+    let in_attr = matches!(original_token.parent().and_then(ast::TokenTree::cast), Some(tt) if tt.syntax().ancestors().any(|it| ast::Meta::can_cast(it.kind())));
+    let descended = if in_attr {
+        [sema.descend_into_macros_with_kind_preference(original_token.clone())].into()
+    } else {
+        sema.descend_into_macros_with_same_text(original_token.clone())
+    };
 
     // FIXME: Definition should include known lints and the like instead of having this special case here
     let hovered_lint = descended.iter().find_map(|token| {
@@ -163,7 +168,7 @@ pub(crate) fn hover(
 }
 
 pub(crate) fn hover_for_definition(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     file_id: FileId,
     definition: Definition,
     node: &SyntaxNode,
@@ -173,33 +178,23 @@ pub(crate) fn hover_for_definition(
         Definition::BuiltinType(_) => Some(FamousDefs(sema, sema.scope(node)?.krate())),
         _ => None,
     };
-    if let Some(markup) = render::definition(sema.db, definition, famous_defs.as_ref(), config) {
-        let mut res = HoverResult::default();
-        res.markup = render::process_markup(sema.db, definition, &markup, config);
-        if let Some(action) = show_implementations_action(sema.db, definition) {
-            res.actions.push(action);
+    render::definition(sema.db, definition, famous_defs.as_ref(), config).map(|markup| {
+        HoverResult {
+            markup: render::process_markup(sema.db, definition, &markup, config),
+            actions: show_implementations_action(sema.db, definition)
+                .into_iter()
+                .chain(show_fn_references_action(sema.db, definition))
+                .chain(runnable_action(sema, definition, file_id))
+                .chain(goto_type_action_for_def(sema.db, definition))
+                .collect(),
         }
-
-        if let Some(action) = show_fn_references_action(sema.db, definition) {
-            res.actions.push(action);
-        }
-
-        if let Some(action) = runnable_action(sema, definition, file_id) {
-            res.actions.push(action);
-        }
-
-        if let Some(action) = goto_type_action_for_def(sema.db, definition) {
-            res.actions.push(action);
-        }
-        return Some(res);
-    }
-    None
+    })
 }
 
 fn hover_ranged(
     file: &SyntaxNode,
     range: syntax::TextRange,
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     config: &HoverConfig,
 ) -> Option<RangeInfo<HoverResult>> {
     // FIXME: make this work in attributes
@@ -232,7 +227,7 @@ fn hover_ranged(
 }
 
 fn hover_type_fallback(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     config: &HoverConfig,
     token: &SyntaxToken,
     original_token: &SyntaxToken,
@@ -291,7 +286,7 @@ fn show_fn_references_action(db: &RootDatabase, def: Definition) -> Option<Hover
 }
 
 fn runnable_action(
-    sema: &hir::Semantics<RootDatabase>,
+    sema: &hir::Semantics<'_, RootDatabase>,
     def: Definition,
     file_id: FileId,
 ) -> Option<HoverAction> {

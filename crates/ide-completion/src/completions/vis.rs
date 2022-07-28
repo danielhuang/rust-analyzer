@@ -7,7 +7,7 @@ use crate::{
 
 pub(crate) fn complete_vis_path(
     acc: &mut Completions,
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
     &has_in_token: &bool,
 ) {
@@ -29,7 +29,7 @@ pub(crate) fn complete_vis_path(
 
             acc.add_super_keyword(ctx, *super_chain_len);
         }
-        Qualified::Absolute | Qualified::Infer | Qualified::With { .. } => {}
+        Qualified::Absolute | Qualified::TypeAnchor { .. } | Qualified::With { .. } => {}
         Qualified::No => {
             if !has_in_token {
                 cov_mark::hit!(kw_completion_in);

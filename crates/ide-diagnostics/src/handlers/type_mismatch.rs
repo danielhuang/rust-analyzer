@@ -1,18 +1,28 @@
 use hir::{db::AstDatabase, HirDisplay, Type};
 use ide_db::{famous_defs::FamousDefs, source_change::SourceChange};
 use syntax::{
-    ast::{BlockExpr, ExprStmt},
+    ast::{self, BlockExpr, ExprStmt},
     AstNode,
 };
 use text_edit::TextEdit;
 
-use crate::{fix, Assist, Diagnostic, DiagnosticsContext};
+use crate::{adjusted_display_range, fix, Assist, Diagnostic, DiagnosticsContext};
 
 // Diagnostic: type-mismatch
 //
 // This diagnostic is triggered when the type of an expression does not match
 // the expected type.
 pub(crate) fn type_mismatch(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch) -> Diagnostic {
+    let display_range = adjusted_display_range::<ast::BlockExpr>(
+        ctx,
+        d.expr.clone().map(|it| it.into()),
+        &|block| {
+            let r_curly_range = block.stmt_list()?.r_curly_token()?.text_range();
+            cov_mark::hit!(type_mismatch_on_block);
+            Some(r_curly_range)
+        },
+    );
+
     let mut diag = Diagnostic::new(
         "type-mismatch",
         format!(
@@ -20,7 +30,7 @@ pub(crate) fn type_mismatch(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch)
             d.expected.display(ctx.sema.db),
             d.actual.display(ctx.sema.db)
         ),
-        ctx.sema.diagnostics_display_range(d.expr.clone().map(|it| it.into())).range,
+        display_range,
     )
     .with_fixes(fixes(ctx, d));
     if diag.fixes.is_none() {
@@ -35,7 +45,7 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch) -> Option<Vec<Assi
     add_reference(ctx, d, &mut fixes);
     add_missing_ok_or_some(ctx, d, &mut fixes);
     remove_semicolon(ctx, d, &mut fixes);
-    str_ref_to_string(ctx, d, &mut fixes);
+    str_ref_to_owned(ctx, d, &mut fixes);
 
     if fixes.is_empty() {
         None
@@ -135,7 +145,7 @@ fn remove_semicolon(
     Some(())
 }
 
-fn str_ref_to_string(
+fn str_ref_to_owned(
     ctx: &DiagnosticsContext<'_>,
     d: &hir::TypeMismatch,
     acc: &mut Vec<Assist>,
@@ -151,12 +161,12 @@ fn str_ref_to_string(
     let expr = d.expr.value.to_node(&root);
     let expr_range = expr.syntax().text_range();
 
-    let to_string = format!(".to_string()");
+    let to_owned = format!(".to_owned()");
 
-    let edit = TextEdit::insert(expr.syntax().text_range().end(), to_string);
+    let edit = TextEdit::insert(expr.syntax().text_range().end(), to_owned);
     let source_change =
         SourceChange::from_text_edit(d.expr.file_id.original_file(ctx.sema.db), edit);
-    acc.push(fix("str_ref_to_string", "Add .to_string() here", source_change, expr_range));
+    acc.push(fix("str_ref_to_owned", "Add .to_owned() here", source_change, expr_range));
 
     Some(())
 }
@@ -527,7 +537,7 @@ fn foo() -> SomeOtherEnum { 0$0 }
     }
 
     #[test]
-    fn str_ref_to_string() {
+    fn str_ref_to_owned() {
         check_fix(
             r#"
 struct String;
@@ -540,9 +550,24 @@ fn test() -> String {
 struct String;
 
 fn test() -> String {
-    "a".to_string()
+    "a".to_owned()
 }
             "#,
+        );
+    }
+
+    #[test]
+    fn type_mismatch_on_block() {
+        cov_mark::check!(type_mismatch_on_block);
+        check_diagnostics(
+            r#"
+fn f() -> i32 {
+    let x = 1;
+    let y = 2;
+    let _ = x + y;
+  }
+//^ error: expected i32, found ()
+"#,
         );
     }
 }

@@ -138,6 +138,9 @@ pub(crate) struct ExprCtx {
     pub(crate) self_param: Option<hir::SelfParam>,
     pub(crate) innermost_ret_ty: Option<hir::Type>,
     pub(crate) impl_: Option<ast::Impl>,
+    /// Whether this expression occurs in match arm guard position: before the
+    /// fat arrow token
+    pub(crate) in_match_guard: bool,
 }
 
 /// Original file ast nodes
@@ -190,7 +193,10 @@ pub(super) enum Qualified {
         super_chain_len: Option<usize>,
     },
     /// <_>::
-    Infer,
+    TypeAnchor {
+        ty: Option<hir::Type>,
+        trait_: Option<hir::Trait>,
+    },
     /// Whether the path is an absolute path
     Absolute,
 }
@@ -388,7 +394,7 @@ impl<'a> CompletionContext<'a> {
         }
     }
 
-    pub(crate) fn famous_defs(&self) -> FamousDefs {
+    pub(crate) fn famous_defs(&self) -> FamousDefs<'_, '_> {
         FamousDefs(&self.sema, self.krate)
     }
 

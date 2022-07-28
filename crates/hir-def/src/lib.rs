@@ -7,6 +7,8 @@
 //! Note that `hir_def` is a work in progress, so not all of the above is
 //! actually true.
 
+#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+
 #[allow(unused)]
 macro_rules! eprintln {
     ($($tt:tt)*) => { stdx::eprintln!($($tt)*) };
@@ -932,11 +934,11 @@ fn derive_macro_as_call_id(
     derive_attr: AttrId,
     derive_pos: u32,
     krate: CrateId,
-    resolver: impl Fn(path::ModPath) -> Option<MacroDefId>,
-) -> Result<MacroCallId, UnresolvedMacro> {
-    let def: MacroDefId = resolver(item_attr.path.clone())
+    resolver: impl Fn(path::ModPath) -> Option<(MacroId, MacroDefId)>,
+) -> Result<(MacroId, MacroDefId, MacroCallId), UnresolvedMacro> {
+    let (macro_id, def_id) = resolver(item_attr.path.clone())
         .ok_or_else(|| UnresolvedMacro { path: item_attr.path.clone() })?;
-    let res = def.as_lazy_macro(
+    let call_id = def_id.as_lazy_macro(
         db.upcast(),
         krate,
         MacroCallKind::Derive {
@@ -945,7 +947,7 @@ fn derive_macro_as_call_id(
             derive_attr_index: derive_attr.ast_index,
         },
     );
-    Ok(res)
+    Ok((macro_id, def_id, call_id))
 }
 
 fn attr_macro_as_call_id(

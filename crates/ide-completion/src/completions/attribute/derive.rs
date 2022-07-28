@@ -12,7 +12,7 @@ use crate::{
 
 pub(crate) fn complete_derive_path(
     acc: &mut Completions,
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
     existing_derives: &ExistingDerives,
 ) {
@@ -97,7 +97,7 @@ pub(crate) fn complete_derive_path(
             });
             acc.add_nameref_keywords_with_colon(ctx);
         }
-        Qualified::Infer | Qualified::With { .. } => {}
+        Qualified::TypeAnchor { .. } | Qualified::With { .. } => {}
     }
 }
 

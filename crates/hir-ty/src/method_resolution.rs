@@ -8,8 +8,9 @@ use arrayvec::ArrayVec;
 use base_db::{CrateId, Edition};
 use chalk_ir::{cast::Cast, Mutability, UniverseIndex};
 use hir_def::{
-    item_scope::ItemScope, nameres::DefMap, AssocItemId, BlockId, ConstId, FunctionId,
-    GenericDefId, HasModule, ImplId, ItemContainerId, Lookup, ModuleDefId, ModuleId, TraitId,
+    data::ImplData, item_scope::ItemScope, nameres::DefMap, AssocItemId, BlockId, ConstId,
+    FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, Lookup, ModuleDefId, ModuleId,
+    TraitId,
 };
 use hir_expand::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -136,7 +137,7 @@ pub struct TraitImpls {
 
 impl TraitImpls {
     pub(crate) fn trait_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
-        let _p = profile::span("trait_impls_in_crate_query");
+        let _p = profile::span("trait_impls_in_crate_query").detail(|| format!("{krate:?}"));
         let mut impls = Self { map: FxHashMap::default() };
 
         let crate_def_map = db.crate_def_map(krate);
@@ -161,7 +162,7 @@ impl TraitImpls {
     }
 
     pub(crate) fn trait_impls_in_deps_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
-        let _p = profile::span("trait_impls_in_deps_query");
+        let _p = profile::span("trait_impls_in_deps_query").detail(|| format!("{krate:?}"));
         let crate_graph = db.crate_graph();
         let mut res = Self { map: FxHashMap::default() };
 
@@ -213,8 +214,7 @@ impl TraitImpls {
         for (trait_, other_map) in &other.map {
             let map = self.map.entry(*trait_).or_default();
             for (fp, impls) in other_map {
-                let vec = map.entry(*fp).or_default();
-                vec.extend(impls);
+                map.entry(*fp).or_default().extend(impls);
             }
         }
     }
@@ -247,7 +247,7 @@ impl TraitImpls {
         self.map
             .get(&trait_)
             .into_iter()
-            .flat_map(move |map| map.get(&None).into_iter().chain(map.get(&Some(self_ty))))
+            .flat_map(move |map| map.get(&Some(self_ty)).into_iter().chain(map.get(&None)))
             .flat_map(|v| v.iter().copied())
     }
 
@@ -491,7 +491,7 @@ pub struct ReceiverAdjustments {
 }
 
 impl ReceiverAdjustments {
-    pub(crate) fn apply(&self, table: &mut InferenceTable, ty: Ty) -> (Ty, Vec<Adjustment>) {
+    pub(crate) fn apply(&self, table: &mut InferenceTable<'_>, ty: Ty) -> (Ty, Vec<Adjustment>) {
         let mut ty = ty;
         let mut adjust = Vec::new();
         for _ in 0..self.autoderefs {
@@ -573,6 +573,59 @@ pub(crate) fn iterate_method_candidates<T>(
         },
     );
     slot
+}
+
+pub fn lookup_impl_method(
+    self_ty: &Ty,
+    db: &dyn HirDatabase,
+    env: Arc<TraitEnvironment>,
+    trait_: TraitId,
+    name: &Name,
+) -> Option<FunctionId> {
+    let self_ty_fp = TyFingerprint::for_trait_impl(self_ty)?;
+    let trait_impls = db.trait_impls_in_deps(env.krate);
+    let impls = trait_impls.for_trait_and_self_ty(trait_, self_ty_fp);
+    let mut table = InferenceTable::new(db, env.clone());
+    find_matching_impl(impls, &mut table, &self_ty).and_then(|data| {
+        data.items.iter().find_map(|it| match it {
+            AssocItemId::FunctionId(f) => (db.function_data(*f).name == *name).then(|| *f),
+            _ => None,
+        })
+    })
+}
+
+fn find_matching_impl(
+    mut impls: impl Iterator<Item = ImplId>,
+    table: &mut InferenceTable<'_>,
+    self_ty: &Ty,
+) -> Option<Arc<ImplData>> {
+    let db = table.db;
+    loop {
+        let impl_ = impls.next()?;
+        let r = table.run_in_snapshot(|table| {
+            let impl_data = db.impl_data(impl_);
+            let substs =
+                TyBuilder::subst_for_def(db, impl_).fill_with_inference_vars(table).build();
+            let impl_ty = db.impl_self_ty(impl_).substitute(Interner, &substs);
+
+            table
+                .unify(self_ty, &impl_ty)
+                .then(|| {
+                    let wh_goals =
+                        crate::chalk_db::convert_where_clauses(db, impl_.into(), &substs)
+                            .into_iter()
+                            .map(|b| b.cast(Interner));
+
+                    let goal = crate::Goal::all(Interner, wh_goals);
+
+                    table.try_obligation(goal).map(|_| impl_data)
+                })
+                .flatten()
+        });
+        if r.is_some() {
+            break r;
+        }
+    }
 }
 
 pub fn iterate_path_candidates(
@@ -802,7 +855,7 @@ fn iterate_method_candidates_for_self_ty(
 
 fn iterate_trait_method_candidates(
     self_ty: &Ty,
-    table: &mut InferenceTable,
+    table: &mut InferenceTable<'_>,
     traits_in_scope: &FxHashSet<TraitId>,
     name: Option<&Name>,
     receiver_ty: Option<&Ty>,
@@ -868,7 +921,7 @@ fn iterate_trait_method_candidates(
 
 fn iterate_inherent_methods(
     self_ty: &Ty,
-    table: &mut InferenceTable,
+    table: &mut InferenceTable<'_>,
     name: Option<&Name>,
     receiver_ty: Option<&Ty>,
     receiver_adjustments: Option<ReceiverAdjustments>,
@@ -921,7 +974,7 @@ fn iterate_inherent_methods(
     fn impls_for_self_ty(
         impls: &InherentImpls,
         self_ty: &Ty,
-        table: &mut InferenceTable,
+        table: &mut InferenceTable<'_>,
         name: Option<&Name>,
         receiver_ty: Option<&Ty>,
         receiver_adjustments: Option<ReceiverAdjustments>,
@@ -963,25 +1016,38 @@ pub fn resolve_indexing_op(
 }
 
 fn is_valid_candidate(
-    table: &mut InferenceTable,
+    table: &mut InferenceTable<'_>,
     name: Option<&Name>,
     receiver_ty: Option<&Ty>,
     item: AssocItemId,
     self_ty: &Ty,
     visible_from_module: Option<ModuleId>,
 ) -> bool {
+    macro_rules! check_that {
+        ($cond:expr) => {
+            if !$cond {
+                return false;
+            }
+        };
+    }
+
     let db = table.db;
     match item {
         AssocItemId::FunctionId(m) => {
             let data = db.function_data(m);
-            if let Some(name) = name {
-                if &data.name != name {
-                    return false;
+
+            check_that!(name.map_or(true, |n| n == &data.name));
+            check_that!(visible_from_module.map_or(true, |from_module| {
+                let v = db.function_visibility(m).is_visible_from(db.upcast(), from_module);
+                if !v {
+                    cov_mark::hit!(autoderef_candidate_not_visible);
                 }
-            }
+                v
+            }));
+
             table.run_in_snapshot(|table| {
                 let subst = TyBuilder::subst_for_def(db, m).fill_with_inference_vars(table).build();
-                let expected_self_ty = match m.lookup(db.upcast()).container {
+                let expect_self_ty = match m.lookup(db.upcast()).container {
                     ItemContainerId::TraitId(_) => {
                         subst.at(Interner, 0).assert_ty_ref(Interner).clone()
                     }
@@ -993,49 +1059,31 @@ fn is_valid_candidate(
                         unreachable!()
                     }
                 };
-                if !table.unify(&expected_self_ty, &self_ty) {
-                    return false;
-                }
+                check_that!(table.unify(&expect_self_ty, self_ty));
                 if let Some(receiver_ty) = receiver_ty {
-                    if !data.has_self_param() {
-                        return false;
-                    }
+                    check_that!(data.has_self_param());
 
                     let sig = db.callable_item_signature(m.into());
                     let expected_receiver =
                         sig.map(|s| s.params()[0].clone()).substitute(Interner, &subst);
-                    let receiver_matches = table.unify(&receiver_ty, &expected_receiver);
 
-                    if !receiver_matches {
-                        return false;
-                    }
+                    check_that!(table.unify(&receiver_ty, &expected_receiver));
                 }
-                if let Some(from_module) = visible_from_module {
-                    if !db.function_visibility(m).is_visible_from(db.upcast(), from_module) {
-                        cov_mark::hit!(autoderef_candidate_not_visible);
-                        return false;
-                    }
-                }
-
                 true
             })
         }
         AssocItemId::ConstId(c) => {
             let data = db.const_data(c);
-            if receiver_ty.is_some() {
-                return false;
-            }
-            if let Some(name) = name {
-                if data.name.as_ref() != Some(name) {
-                    return false;
-                }
-            }
-            if let Some(from_module) = visible_from_module {
-                if !db.const_visibility(c).is_visible_from(db.upcast(), from_module) {
+            check_that!(receiver_ty.is_none());
+
+            check_that!(name.map_or(true, |n| data.name.as_ref() == Some(n)));
+            check_that!(visible_from_module.map_or(true, |from_module| {
+                let v = db.const_visibility(c).is_visible_from(db.upcast(), from_module);
+                if !v {
                     cov_mark::hit!(const_candidate_not_visible);
-                    return false;
                 }
-            }
+                v
+            }));
             if let ItemContainerId::ImplId(impl_id) = c.lookup(db.upcast()).container {
                 let self_ty_matches = table.run_in_snapshot(|table| {
                     let subst =
@@ -1112,7 +1160,7 @@ fn generic_implements_goal(
 }
 
 fn autoderef_method_receiver(
-    table: &mut InferenceTable,
+    table: &mut InferenceTable<'_>,
     ty: Ty,
 ) -> (Vec<Canonical<Ty>>, Vec<ReceiverAdjustments>) {
     let (mut deref_chain, mut adjustments): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());

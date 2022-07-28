@@ -94,7 +94,7 @@ pub(crate) fn signature_help(db: &RootDatabase, position: FilePosition) -> Optio
 }
 
 fn signature_help_for_call(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     token: SyntaxToken,
 ) -> Option<SignatureHelp> {
     // Find the calling expression and its NameRef
@@ -198,7 +198,7 @@ fn signature_help_for_call(
 }
 
 fn signature_help_for_generics(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     token: SyntaxToken,
 ) -> Option<SignatureHelp> {
     let parent = token.parent()?;
@@ -237,7 +237,8 @@ fn signature_help_for_generics(
             | hir::PathResolution::Local(_)
             | hir::PathResolution::TypeParam(_)
             | hir::PathResolution::ConstParam(_)
-            | hir::PathResolution::SelfType(_) => return None,
+            | hir::PathResolution::SelfType(_)
+            | hir::PathResolution::DeriveHelper(_) => return None,
         };
 
         generic_def

@@ -168,7 +168,7 @@ impl chalk_ir::interner::Interner for Interner {
     }
 
     fn debug_separator_trait_ref(
-        separator_trait_ref: &chalk_ir::SeparatorTraitRef<Interner>,
+        separator_trait_ref: &chalk_ir::SeparatorTraitRef<'_, Interner>,
         fmt: &mut fmt::Formatter<'_>,
     ) -> Option<fmt::Result> {
         Some(write!(fmt, "{:?}", separator_trait_ref.debug(Interner)))
@@ -257,12 +257,7 @@ impl chalk_ir::interner::Interner for Interner {
         c1: &Self::InternedConcreteConst,
         c2: &Self::InternedConcreteConst,
     ) -> bool {
-        match (c1, c2) {
-            (&ConstScalar::Usize(a), &ConstScalar::Usize(b)) => a == b,
-            // we were previously assuming this to be true, I'm not whether true or false on
-            // unknown values is safer.
-            (_, _) => true,
-        }
+        (c1 == &ConstScalar::Unknown) || (c2 == &ConstScalar::Unknown) || (c1 == c2)
     }
 
     fn intern_generic_arg(

@@ -5,12 +5,13 @@ use std::{mem, sync::Arc};
 
 use either::Either;
 use hir_expand::{
-    ast_id_map::{AstIdMap, FileAstId},
+    ast_id_map::AstIdMap,
     hygiene::Hygiene,
     name::{name, AsName, Name},
-    ExpandError, HirFileId, InFile,
+    AstId, ExpandError, HirFileId, InFile,
 };
 use la_arena::Arena;
+use once_cell::unsync::OnceCell;
 use profile::Count;
 use rustc_hash::FxHashMap;
 use syntax::{
@@ -41,8 +42,7 @@ use crate::{
 pub struct LowerCtx<'a> {
     pub db: &'a dyn DefDatabase,
     hygiene: Hygiene,
-    file_id: Option<HirFileId>,
-    source_ast_id_map: Option<Arc<AstIdMap>>,
+    ast_id_map: Option<(HirFileId, OnceCell<Arc<AstIdMap>>)>,
 }
 
 impl<'a> LowerCtx<'a> {
@@ -50,29 +50,26 @@ impl<'a> LowerCtx<'a> {
         LowerCtx {
             db,
             hygiene: Hygiene::new(db.upcast(), file_id),
-            file_id: Some(file_id),
-            source_ast_id_map: Some(db.ast_id_map(file_id)),
+            ast_id_map: Some((file_id, OnceCell::new())),
         }
     }
 
     pub fn with_hygiene(db: &'a dyn DefDatabase, hygiene: &Hygiene) -> Self {
-        LowerCtx { db, hygiene: hygiene.clone(), file_id: None, source_ast_id_map: None }
+        LowerCtx { db, hygiene: hygiene.clone(), ast_id_map: None }
     }
 
     pub(crate) fn hygiene(&self) -> &Hygiene {
         &self.hygiene
     }
 
-    pub(crate) fn file_id(&self) -> HirFileId {
-        self.file_id.unwrap()
-    }
-
     pub(crate) fn lower_path(&self, ast: ast::Path) -> Option<Path> {
         Path::from_src(ast, self)
     }
 
-    pub(crate) fn ast_id<N: AstNode>(&self, item: &N) -> Option<FileAstId<N>> {
-        self.source_ast_id_map.as_ref().map(|ast_id_map| ast_id_map.ast_id(item))
+    pub(crate) fn ast_id<N: AstNode>(&self, db: &dyn DefDatabase, item: &N) -> Option<AstId<N>> {
+        let &(file_id, ref ast_id_map) = self.ast_id_map.as_ref()?;
+        let ast_id_map = ast_id_map.get_or_init(|| db.ast_id_map(file_id));
+        Some(InFile::new(file_id, ast_id_map.ast_id(item)))
     }
 }
 
@@ -85,6 +82,7 @@ pub(super) fn lower(
     ExprCollector {
         db,
         source_map: BodySourceMap::default(),
+        ast_id_map: db.ast_id_map(expander.current_file_id),
         body: Body {
             exprs: Arena::default(),
             pats: Arena::default(),
@@ -98,6 +96,7 @@ pub(super) fn lower(
         expander,
         name_to_pat_grouping: Default::default(),
         is_lowering_inside_or_pat: false,
+        is_lowering_assignee_expr: false,
     }
     .collect(params, body)
 }
@@ -105,11 +104,13 @@ pub(super) fn lower(
 struct ExprCollector<'a> {
     db: &'a dyn DefDatabase,
     expander: Expander,
+    ast_id_map: Arc<AstIdMap>,
     body: Body,
     source_map: BodySourceMap,
     // a poor-mans union-find?
     name_to_pat_grouping: FxHashMap<Name, Vec<PatId>>,
     is_lowering_inside_or_pat: bool,
+    is_lowering_assignee_expr: bool,
 }
 
 impl ExprCollector<'_> {
@@ -284,7 +285,10 @@ impl ExprCollector<'_> {
                 } else {
                     Box::default()
                 };
-                self.alloc_expr(Expr::Call { callee, args }, syntax_ptr)
+                self.alloc_expr(
+                    Expr::Call { callee, args, is_assignee_expr: self.is_lowering_assignee_expr },
+                    syntax_ptr,
+                )
             }
             ast::Expr::MethodCallExpr(e) => {
                 let receiver = self.collect_expr_opt(e.receiver());
@@ -360,6 +364,7 @@ impl ExprCollector<'_> {
             ast::Expr::RecordExpr(e) => {
                 let path =
                     e.path().and_then(|path| self.expander.parse_path(self.db, path)).map(Box::new);
+                let is_assignee_expr = self.is_lowering_assignee_expr;
                 let record_lit = if let Some(nfl) = e.record_expr_field_list() {
                     let fields = nfl
                         .fields()
@@ -379,9 +384,16 @@ impl ExprCollector<'_> {
                         })
                         .collect();
                     let spread = nfl.spread().map(|s| self.collect_expr(s));
-                    Expr::RecordLit { path, fields, spread }
+                    let ellipsis = nfl.dotdot_token().is_some();
+                    Expr::RecordLit { path, fields, spread, ellipsis, is_assignee_expr }
                 } else {
-                    Expr::RecordLit { path, fields: Box::default(), spread: None }
+                    Expr::RecordLit {
+                        path,
+                        fields: Box::default(),
+                        spread: None,
+                        ellipsis: false,
+                        is_assignee_expr,
+                    }
                 };
 
                 self.alloc_expr(record_lit, syntax_ptr)
@@ -459,14 +471,21 @@ impl ExprCollector<'_> {
                 )
             }
             ast::Expr::BinExpr(e) => {
-                let lhs = self.collect_expr_opt(e.lhs());
-                let rhs = self.collect_expr_opt(e.rhs());
                 let op = e.op_kind();
+                if let Some(ast::BinaryOp::Assignment { op: None }) = op {
+                    self.is_lowering_assignee_expr = true;
+                }
+                let lhs = self.collect_expr_opt(e.lhs());
+                self.is_lowering_assignee_expr = false;
+                let rhs = self.collect_expr_opt(e.rhs());
                 self.alloc_expr(Expr::BinaryOp { lhs, rhs, op }, syntax_ptr)
             }
             ast::Expr::TupleExpr(e) => {
                 let exprs = e.fields().map(|expr| self.collect_expr(expr)).collect();
-                self.alloc_expr(Expr::Tuple { exprs }, syntax_ptr)
+                self.alloc_expr(
+                    Expr::Tuple { exprs, is_assignee_expr: self.is_lowering_assignee_expr },
+                    syntax_ptr,
+                )
             }
             ast::Expr::BoxExpr(e) => {
                 let expr = self.collect_expr_opt(e.expr());
@@ -478,8 +497,14 @@ impl ExprCollector<'_> {
 
                 match kind {
                     ArrayExprKind::ElementList(e) => {
-                        let exprs = e.map(|expr| self.collect_expr(expr)).collect();
-                        self.alloc_expr(Expr::Array(Array::ElementList(exprs)), syntax_ptr)
+                        let elements = e.map(|expr| self.collect_expr(expr)).collect();
+                        self.alloc_expr(
+                            Expr::Array(Array::ElementList {
+                                elements,
+                                is_assignee_expr: self.is_lowering_assignee_expr,
+                            }),
+                            syntax_ptr,
+                        )
                     }
                     ArrayExprKind::Repeat { initializer, repeat } => {
                         let initializer = self.collect_expr_opt(initializer);
@@ -586,8 +611,13 @@ impl ExprCollector<'_> {
         match res.value {
             Some((mark, expansion)) => {
                 self.source_map.expansions.insert(macro_call_ptr, self.expander.current_file_id);
+                let prev_ast_id_map = mem::replace(
+                    &mut self.ast_id_map,
+                    self.db.ast_id_map(self.expander.current_file_id),
+                );
 
                 let id = collector(self, Some(expansion));
+                self.ast_id_map = prev_ast_id_map;
                 self.expander.exit(self.db, mark);
                 id
             }
@@ -675,7 +705,8 @@ impl ExprCollector<'_> {
     }
 
     fn collect_block(&mut self, block: ast::BlockExpr) -> ExprId {
-        let ast_id = self.expander.ast_id(&block);
+        let file_local_id = self.ast_id_map.ast_id(&block);
+        let ast_id = AstId::new(self.expander.current_file_id, file_local_id);
         let block_loc =
             BlockLoc { ast_id, module: self.expander.def_map.module_id(self.expander.module) };
         let block_id = self.db.intern_block(block_loc);

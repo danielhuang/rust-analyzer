@@ -42,7 +42,8 @@ export class Ctx {
 
         const res = new Ctx(config, extCtx, client, serverPath, statusBar);
 
-        await client.start();
+        res.pushCleanup(client.start());
+        await client.onReady();
         client.onNotification(ra.serverStatus, (params) => res.setServerStatus(params));
         return res;
     }
@@ -97,7 +98,9 @@ export class Ctx {
                 icon = "$(warning) ";
                 break;
             case "error":
-                statusBar.tooltip += "\nClick to reload.";
+                statusBar.tooltip =
+                    (status.message ? status.message + "\n" : "") + "Click to reload.";
+
                 statusBar.command = "rust-analyzer.reloadWorkspace";
                 statusBar.color = new vscode.ThemeColor("statusBarItem.errorForeground");
                 statusBar.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");

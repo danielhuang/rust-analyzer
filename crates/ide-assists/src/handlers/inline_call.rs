@@ -7,7 +7,7 @@ use ide_db::{
     imports::insert_use::remove_path_if_in_use_stmt,
     path_transform::PathTransform,
     search::{FileReference, SearchScope},
-    syntax_helpers::node_ext::expr_as_name_ref,
+    syntax_helpers::{insert_whitespace_into_node::insert_ws_into, node_ext::expr_as_name_ref},
     RootDatabase,
 };
 use itertools::{izip, Itertools};
@@ -59,7 +59,7 @@ use crate::{
 //     };
 // }
 // ```
-pub(crate) fn inline_into_callers(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
+pub(crate) fn inline_into_callers(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let def_file = ctx.file_id();
     let name = ctx.find_node_at_offset::<ast::Name>()?;
     let ast_func = name.syntax().parent().and_then(ast::Fn::cast)?;
@@ -174,7 +174,7 @@ pub(crate) fn inline_into_callers(acc: &mut Assists, ctx: &AssistContext) -> Opt
 //         };
 // }
 // ```
-pub(crate) fn inline_call(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
+pub(crate) fn inline_call(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let name_ref: ast::NameRef = ctx.find_node_at_offset()?;
     let call_info = CallInfo::from_name_ref(name_ref.clone())?;
     let (function, label) = match &call_info.node {
@@ -294,14 +294,23 @@ fn get_fn_params(
 }
 
 fn inline(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     function_def_file_id: FileId,
     function: hir::Function,
     fn_body: &ast::BlockExpr,
     params: &[(ast::Pat, Option<ast::Type>, hir::Param)],
     CallInfo { node, arguments, generic_arg_list }: &CallInfo,
 ) -> ast::Expr {
-    let body = fn_body.clone_for_update();
+    let body = if sema.hir_file_for(fn_body.syntax()).is_macro() {
+        cov_mark::hit!(inline_call_defined_in_macro);
+        if let Some(body) = ast::BlockExpr::cast(insert_ws_into(fn_body.syntax().clone())) {
+            body
+        } else {
+            fn_body.clone_for_update()
+        }
+    } else {
+        fn_body.clone_for_update()
+    };
     let usages_for_locals = |local| {
         Definition::Local(local)
             .usages(sema)
@@ -1143,6 +1152,41 @@ fn bar() -> u32 {
         let x = 0;
         x
     }) + foo()
+}
+"#,
+        )
+    }
+
+    #[test]
+    fn inline_call_defined_in_macro() {
+        cov_mark::check!(inline_call_defined_in_macro);
+        check_assist(
+            inline_call,
+            r#"
+macro_rules! define_foo {
+    () => { fn foo() -> u32 {
+        let x = 0;
+        x
+    } };
+}
+define_foo!();
+fn bar() -> u32 {
+    foo$0()
+}
+"#,
+            r#"
+macro_rules! define_foo {
+    () => { fn foo() -> u32 {
+        let x = 0;
+        x
+    } };
+}
+define_foo!();
+fn bar() -> u32 {
+    {
+      let x = 0;
+      x
+    }
 }
 "#,
         )

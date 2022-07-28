@@ -45,7 +45,7 @@ use crate::{
 };
 
 pub(crate) fn handle_workspace_reload(state: &mut GlobalState, _: ()) -> Result<()> {
-    state.proc_macro_client = None;
+    state.proc_macro_clients.clear();
     state.proc_macro_changed = false;
     state.fetch_workspaces_queue.request_op("reload workspace request".to_string());
     state.fetch_build_data_queue.request_op("reload workspace request".to_string());
@@ -1320,7 +1320,8 @@ pub(crate) fn publish_diagnostics(
                 .unwrap(),
             }),
             source: Some("rust-analyzer".to_string()),
-            message: d.message,
+            // https://github.com/rust-lang/rust-analyzer/issues/11404
+            message: if !d.message.is_empty() { d.message } else { " ".to_string() },
             related_information: None,
             tags: if d.unused { Some(vec![DiagnosticTag::UNNECESSARY]) } else { None },
             data: None,

@@ -18,7 +18,7 @@ use hir_expand::{
     ExpandTo, HirFileId, InFile, MacroCallId, MacroCallKind, MacroCallLoc, MacroDefId,
     MacroDefKind,
 };
-use itertools::Itertools;
+use itertools::{izip, Itertools};
 use la_arena::Idx;
 use limit::Limit;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -110,7 +110,6 @@ pub(super) fn collect_defs(db: &dyn DefDatabase, mut def_map: DefMap, tree_id: T
         proc_macros,
         from_glob_import: Default::default(),
         skip_attrs: Default::default(),
-        derive_helpers_in_scope: Default::default(),
         is_proc_macro,
     };
     if tree_id.is_block() {
@@ -258,9 +257,6 @@ struct DefCollector<'a> {
     /// This also stores the attributes to skip when we resolve derive helpers and non-macro
     /// non-builtin attributes in general.
     skip_attrs: FxHashMap<InFile<ModItem>, AttrId>,
-    /// Tracks which custom derives are in scope for an item, to allow resolution of derive helper
-    /// attributes.
-    derive_helpers_in_scope: FxHashMap<AstId<ast::Item>, Vec<Name>>,
 }
 
 impl DefCollector<'_> {
@@ -1059,7 +1055,7 @@ impl DefCollector<'_> {
         };
         let mut res = ReachedFixedPoint::Yes;
         macros.retain(|directive| {
-            let resolver = |path| {
+            let resolver2 = |path| {
                 let resolved_res = self.def_map.resolve_path_fp_with_macro(
                     self.db,
                     ResolveMode::Other,
@@ -1067,8 +1063,12 @@ impl DefCollector<'_> {
                     &path,
                     BuiltinShadowMode::Module,
                 );
-                resolved_res.resolved_def.take_macros().map(|it| macro_id_to_def_id(self.db, it))
+                resolved_res
+                    .resolved_def
+                    .take_macros()
+                    .map(|it| (it, macro_id_to_def_id(self.db, it)))
             };
+            let resolver = |path| resolver2(path).map(|(_, it)| it);
 
             match &directive.kind {
                 MacroDirectiveKind::FnLike { ast_id, expand_to } => {
@@ -1087,21 +1087,37 @@ impl DefCollector<'_> {
                     }
                 }
                 MacroDirectiveKind::Derive { ast_id, derive_attr, derive_pos } => {
-                    let call_id = derive_macro_as_call_id(
+                    let id = derive_macro_as_call_id(
                         self.db,
                         ast_id,
                         *derive_attr,
                         *derive_pos as u32,
                         self.def_map.krate,
-                        &resolver,
+                        &resolver2,
                     );
-                    if let Ok(call_id) = call_id {
+
+                    if let Ok((macro_id, def_id, call_id)) = id {
                         self.def_map.modules[directive.module_id].scope.set_derive_macro_invoc(
                             ast_id.ast_id,
                             call_id,
                             *derive_attr,
                             *derive_pos,
                         );
+                        // Record its helper attributes.
+                        if def_id.krate != self.def_map.krate {
+                            let def_map = self.db.crate_def_map(def_id.krate);
+                            if let Some(helpers) = def_map.exported_derives.get(&def_id) {
+                                self.def_map
+                                    .derive_helpers_in_scope
+                                    .entry(ast_id.ast_id.map(|it| it.upcast()))
+                                    .or_default()
+                                    .extend(izip!(
+                                        helpers.iter().cloned(),
+                                        iter::repeat(macro_id),
+                                        iter::repeat(call_id),
+                                    ));
+                            }
+                        }
 
                         push_resolved(directive, call_id);
                         res = ReachedFixedPoint::No;
@@ -1132,8 +1148,8 @@ impl DefCollector<'_> {
                     };
 
                     if let Some(ident) = path.as_ident() {
-                        if let Some(helpers) = self.derive_helpers_in_scope.get(&ast_id) {
-                            if helpers.contains(ident) {
+                        if let Some(helpers) = self.def_map.derive_helpers_in_scope.get(&ast_id) {
+                            if helpers.iter().any(|(it, ..)| it == ident) {
                                 cov_mark::hit!(resolved_derive_helper);
                                 // Resolved to derive helper. Collect the item's attributes again,
                                 // starting after the derive helper.
@@ -1148,7 +1164,7 @@ impl DefCollector<'_> {
                     };
                     if matches!(
                         def,
-                        MacroDefId {  kind:MacroDefKind::BuiltInAttr(expander, _),.. }
+                        MacroDefId { kind:MacroDefKind::BuiltInAttr(expander, _),.. }
                         if expander.is_derive()
                     ) {
                         // Resolved to `#[derive]`
@@ -1315,19 +1331,6 @@ impl DefCollector<'_> {
             };
 
             self.def_map.diagnostics.push(diag);
-        }
-
-        // If we've just resolved a derive, record its helper attributes.
-        if let MacroCallKind::Derive { ast_id, .. } = &loc.kind {
-            if loc.def.krate != self.def_map.krate {
-                let def_map = self.db.crate_def_map(loc.def.krate);
-                if let Some(helpers) = def_map.exported_derives.get(&loc.def) {
-                    self.derive_helpers_in_scope
-                        .entry(ast_id.map(|it| it.upcast()))
-                        .or_default()
-                        .extend(helpers.iter().cloned());
-                }
-            }
         }
 
         // Then, fetch and process the item tree. This will reuse the expansion result from above.
@@ -1509,7 +1512,7 @@ impl ModCollector<'_, '_> {
             let module = self.def_collector.def_map.module_id(self.module_id);
             let def_map = &mut self.def_collector.def_map;
             let update_def =
-                |def_collector: &mut DefCollector, id, name: &Name, vis, has_constructor| {
+                |def_collector: &mut DefCollector<'_>, id, name: &Name, vis, has_constructor| {
                     def_collector.def_map.modules[self.module_id].scope.declare(id);
                     def_collector.update(
                         self.module_id,
@@ -1525,7 +1528,7 @@ impl ModCollector<'_, '_> {
             };
 
             match item {
-                ModItem::Mod(m) => self.collect_module(&self.item_tree[m], &attrs),
+                ModItem::Mod(m) => self.collect_module(m, &attrs),
                 ModItem::Import(import_id) => {
                     let imports = Import::from_use(
                         db,
@@ -1700,9 +1703,10 @@ impl ModCollector<'_, '_> {
         }
     }
 
-    fn collect_module(&mut self, module: &Mod, attrs: &Attrs) {
+    fn collect_module(&mut self, module_id: FileItemTreeId<Mod>, attrs: &Attrs) {
         let path_attr = attrs.by_key("path").string_value();
         let is_macro_use = attrs.by_key("macro_use").exists();
+        let module = &self.item_tree[module_id];
         match &module.kind {
             // inline module, just recurse
             ModKind::Inline { items } => {
@@ -1711,6 +1715,7 @@ impl ModCollector<'_, '_> {
                     AstId::new(self.file_id(), module.ast_id),
                     None,
                     &self.item_tree[module.visibility],
+                    module_id,
                 );
 
                 if let Some(mod_dir) = self.mod_dir.descend_into_definition(&module.name, path_attr)
@@ -1748,6 +1753,7 @@ impl ModCollector<'_, '_> {
                                 ast_id,
                                 Some((file_id, is_mod_rs)),
                                 &self.item_tree[module.visibility],
+                                module_id,
                             );
                             ModCollector {
                                 def_collector: self.def_collector,
@@ -1774,6 +1780,7 @@ impl ModCollector<'_, '_> {
                             ast_id,
                             None,
                             &self.item_tree[module.visibility],
+                            module_id,
                         );
                         self.def_collector.def_map.diagnostics.push(
                             DefDiagnostic::unresolved_module(self.module_id, ast_id, candidates),
@@ -1790,6 +1797,7 @@ impl ModCollector<'_, '_> {
         declaration: AstId<ast::Module>,
         definition: Option<(FileId, bool)>,
         visibility: &crate::visibility::RawVisibility,
+        mod_tree_id: FileItemTreeId<Mod>,
     ) -> LocalModuleId {
         let def_map = &mut self.def_collector.def_map;
         let vis = def_map
@@ -1797,10 +1805,16 @@ impl ModCollector<'_, '_> {
             .unwrap_or(Visibility::Public);
         let modules = &mut def_map.modules;
         let origin = match definition {
-            None => ModuleOrigin::Inline { definition: declaration },
-            Some((definition, is_mod_rs)) => {
-                ModuleOrigin::File { declaration, definition, is_mod_rs }
-            }
+            None => ModuleOrigin::Inline {
+                definition: declaration,
+                definition_tree_id: ItemTreeId::new(self.tree_id, mod_tree_id),
+            },
+            Some((definition, is_mod_rs)) => ModuleOrigin::File {
+                declaration,
+                definition,
+                is_mod_rs,
+                declaration_tree_id: ItemTreeId::new(self.tree_id, mod_tree_id),
+            },
         };
 
         let res = modules.alloc(ModuleData::new(origin, vis));
@@ -2129,7 +2143,6 @@ mod tests {
             proc_macros: Default::default(),
             from_glob_import: Default::default(),
             skip_attrs: Default::default(),
-            derive_helpers_in_scope: Default::default(),
             is_proc_macro: false,
         };
         collector.seed_with_top_level();

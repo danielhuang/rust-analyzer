@@ -6,12 +6,14 @@ mod proc_macro;
 
 #[allow(dead_code)]
 #[doc(hidden)]
-mod rustc_server;
+mod ra_server;
 
 use libloading::Library;
 use proc_macro_api::ProcMacroKind;
 
 use super::PanicMessage;
+
+pub use ra_server::TokenStream;
 
 pub(crate) struct Abi {
     exported_macros: Vec<proc_macro::bridge::client::ProcMacro>,
@@ -25,7 +27,7 @@ impl From<proc_macro::bridge::PanicMessage> for PanicMessage {
 
 impl Abi {
     pub unsafe fn from_lib(lib: &Library, symbol_name: String) -> Result<Abi, libloading::Error> {
-        let macros: libloading::Symbol<&&[proc_macro::bridge::client::ProcMacro]> =
+        let macros: libloading::Symbol<'_, &&[proc_macro::bridge::client::ProcMacro]> =
             lib.get(symbol_name.as_bytes())?;
         Ok(Self { exported_macros: macros.to_vec() })
     }
@@ -36,11 +38,10 @@ impl Abi {
         macro_body: &tt::Subtree,
         attributes: Option<&tt::Subtree>,
     ) -> Result<tt::Subtree, PanicMessage> {
-        let parsed_body = rustc_server::TokenStream::with_subtree(macro_body.clone());
+        let parsed_body = TokenStream::with_subtree(macro_body.clone());
 
-        let parsed_attributes = attributes.map_or(rustc_server::TokenStream::new(), |attr| {
-            rustc_server::TokenStream::with_subtree(attr.clone())
-        });
+        let parsed_attributes =
+            attributes.map_or(TokenStream::new(), |attr| TokenStream::with_subtree(attr.clone()));
 
         for proc_macro in &self.exported_macros {
             match proc_macro {
@@ -49,7 +50,7 @@ impl Abi {
                 } if *trait_name == macro_name => {
                     let res = client.run(
                         &proc_macro::bridge::server::SameThread,
-                        rustc_server::Rustc::default(),
+                        ra_server::RustAnalyzer::default(),
                         parsed_body,
                         true,
                     );
@@ -60,7 +61,7 @@ impl Abi {
                 {
                     let res = client.run(
                         &proc_macro::bridge::server::SameThread,
-                        rustc_server::Rustc::default(),
+                        ra_server::RustAnalyzer::default(),
                         parsed_body,
                         true,
                     );
@@ -71,7 +72,7 @@ impl Abi {
                 {
                     let res = client.run(
                         &proc_macro::bridge::server::SameThread,
-                        rustc_server::Rustc::default(),
+                        ra_server::RustAnalyzer::default(),
                         parsed_attributes,
                         parsed_body,
                         true,

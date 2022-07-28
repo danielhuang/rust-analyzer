@@ -44,7 +44,7 @@ use syntax::{ast, SmolStr};
 
 use crate::{
     all_super_traits,
-    consteval::{intern_scalar_const, path_to_const, unknown_const, unknown_const_as_generic},
+    consteval::{intern_const_scalar, path_to_const, unknown_const, unknown_const_as_generic},
     db::HirDatabase,
     make_binders,
     mapping::ToChalk,
@@ -106,7 +106,7 @@ impl<'a> TyLoweringContext<'a> {
     pub fn with_debruijn<T>(
         &self,
         debruijn: DebruijnIndex,
-        f: impl FnOnce(&TyLoweringContext) -> T,
+        f: impl FnOnce(&TyLoweringContext<'_>) -> T,
     ) -> T {
         let opaque_ty_data_vec = self.opaque_type_data.take();
         let expander = self.expander.take();
@@ -130,7 +130,7 @@ impl<'a> TyLoweringContext<'a> {
     pub fn with_shifted_in<T>(
         &self,
         debruijn: DebruijnIndex,
-        f: impl FnOnce(&TyLoweringContext) -> T,
+        f: impl FnOnce(&TyLoweringContext<'_>) -> T,
     ) -> T {
         self.with_debruijn(self.in_binders.shifted_in_from(debruijn), f)
     }
@@ -1033,7 +1033,7 @@ fn count_impl_traits(type_ref: &TypeRef) -> usize {
 }
 
 /// Build the signature of a callable item (function, struct or enum variant).
-pub fn callable_item_sig(db: &dyn HirDatabase, def: CallableDefId) -> PolyFnSig {
+pub(crate) fn callable_item_sig(db: &dyn HirDatabase, def: CallableDefId) -> PolyFnSig {
     match def {
         CallableDefId::FunctionId(f) => fn_sig_for_fn(db, f),
         CallableDefId::StructId(s) => fn_sig_for_struct_constructor(db, s),
@@ -1161,8 +1161,9 @@ pub(crate) fn generic_predicates_for_param_query(
                             return false;
                         }
                     }
-                    WherePredicateTypeTarget::TypeOrConstParam(local_id) => {
-                        if *local_id != param_id.local_id {
+                    &WherePredicateTypeTarget::TypeOrConstParam(local_id) => {
+                        let target_id = TypeOrConstParamId { parent: def, local_id };
+                        if target_id != param_id {
                             return false;
                         }
                     }
@@ -1742,7 +1743,7 @@ pub(crate) fn const_or_path_to_chalk(
     debruijn: DebruijnIndex,
 ) -> Const {
     match value {
-        ConstScalarOrPath::Scalar(s) => intern_scalar_const(s.clone(), expected_ty),
+        ConstScalarOrPath::Scalar(s) => intern_const_scalar(s.clone(), expected_ty),
         ConstScalarOrPath::Path(n) => {
             let path = ModPath::from_segments(PathKind::Plain, Some(n.clone()));
             path_to_const(db, resolver, &path, mode, args, debruijn)

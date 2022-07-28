@@ -44,7 +44,7 @@ use crate::{
 //     }
 // }
 // ```
-pub(crate) fn add_missing_impl_members(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
+pub(crate) fn add_missing_impl_members(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     add_missing_impl_members_inner(
         acc,
         ctx,
@@ -85,7 +85,10 @@ pub(crate) fn add_missing_impl_members(acc: &mut Assists, ctx: &AssistContext) -
 //     $0fn bar(&self) {}
 // }
 // ```
-pub(crate) fn add_missing_default_members(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
+pub(crate) fn add_missing_default_members(
+    acc: &mut Assists,
+    ctx: &AssistContext<'_>,
+) -> Option<()> {
     add_missing_impl_members_inner(
         acc,
         ctx,
@@ -97,7 +100,7 @@ pub(crate) fn add_missing_default_members(acc: &mut Assists, ctx: &AssistContext
 
 fn add_missing_impl_members_inner(
     acc: &mut Assists,
-    ctx: &AssistContext,
+    ctx: &AssistContext<'_>,
     mode: DefaultMethods,
     assist_id: &'static str,
     label: &'static str,
@@ -142,13 +145,16 @@ fn add_missing_impl_members_inner(
             Some(cap) => {
                 let mut cursor = Cursor::Before(first_new_item.syntax());
                 let placeholder;
-                if let ast::AssocItem::Fn(func) = &first_new_item {
-                    if try_gen_trait_body(ctx, func, &trait_, &impl_def).is_none() {
-                        if let Some(m) = func.syntax().descendants().find_map(ast::MacroCall::cast)
-                        {
-                            if m.syntax().text() == "todo!()" {
-                                placeholder = m;
-                                cursor = Cursor::Replace(placeholder.syntax());
+                if let DefaultMethods::No = mode {
+                    if let ast::AssocItem::Fn(func) = &first_new_item {
+                        if try_gen_trait_body(ctx, func, &trait_, &impl_def).is_none() {
+                            if let Some(m) =
+                                func.syntax().descendants().find_map(ast::MacroCall::cast)
+                            {
+                                if m.syntax().text() == "todo!()" {
+                                    placeholder = m;
+                                    cursor = Cursor::Replace(placeholder.syntax());
+                                }
                             }
                         }
                     }
@@ -164,7 +170,7 @@ fn add_missing_impl_members_inner(
 }
 
 fn try_gen_trait_body(
-    ctx: &AssistContext,
+    ctx: &AssistContext<'_>,
     func: &ast::Fn,
     trait_: &hir::Trait,
     impl_def: &ast::Impl,
@@ -1303,6 +1309,32 @@ impl Trait<u32> for Impl {
         }
     }
 }"#,
+        );
+    }
+
+    #[test]
+    fn test_default_partial_eq() {
+        check_assist(
+            add_missing_default_members,
+            r#"
+//- minicore: eq
+struct SomeStruct {
+    data: usize,
+    field: (usize, usize),
+}
+impl PartialEq for SomeStruct {$0}
+"#,
+            r#"
+struct SomeStruct {
+    data: usize,
+    field: (usize, usize),
+}
+impl PartialEq for SomeStruct {
+    $0fn ne(&self, other: &Self) -> bool {
+            !self.eq(other)
+        }
+}
+"#,
         );
     }
 }

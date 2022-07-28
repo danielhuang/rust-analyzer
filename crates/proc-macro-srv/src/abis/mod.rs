@@ -23,21 +23,25 @@
 //! for the relevant versions of the rust compiler
 //!
 
-// pub(crate) so tests can use the TokenStream, more notes in test/utils.rs
-pub(crate) mod abi_1_48;
-mod abi_1_54;
-mod abi_1_56;
-mod abi_1_57;
 mod abi_1_58;
 mod abi_1_63;
+mod abi_1_64;
+#[cfg(feature = "sysroot-abi")]
+mod abi_sysroot;
+
+// see `build.rs`
+include!(concat!(env!("OUT_DIR"), "/rustc_version.rs"));
+
+// Used by `test/utils.rs`
+#[cfg(test)]
+pub(crate) use abi_1_64::TokenStream as TestTokenStream;
 
 use super::dylib::LoadProcMacroDylibError;
-pub(crate) use abi_1_48::Abi as Abi_1_48;
-pub(crate) use abi_1_54::Abi as Abi_1_54;
-pub(crate) use abi_1_56::Abi as Abi_1_56;
-pub(crate) use abi_1_57::Abi as Abi_1_57;
 pub(crate) use abi_1_58::Abi as Abi_1_58;
 pub(crate) use abi_1_63::Abi as Abi_1_63;
+pub(crate) use abi_1_64::Abi as Abi_1_64;
+#[cfg(feature = "sysroot-abi")]
+pub(crate) use abi_sysroot::Abi as Abi_Sysroot;
 use libloading::Library;
 use proc_macro_api::{ProcMacroKind, RustCInfo};
 
@@ -52,12 +56,11 @@ impl PanicMessage {
 }
 
 pub(crate) enum Abi {
-    Abi1_48(Abi_1_48),
-    Abi1_54(Abi_1_54),
-    Abi1_56(Abi_1_56),
-    Abi1_57(Abi_1_57),
     Abi1_58(Abi_1_58),
     Abi1_63(Abi_1_63),
+    Abi1_64(Abi_1_64),
+    #[cfg(feature = "sysroot-abi")]
+    AbiSysroot(Abi_Sysroot),
 }
 
 impl Abi {
@@ -75,32 +78,51 @@ impl Abi {
         symbol_name: String,
         info: RustCInfo,
     ) -> Result<Abi, LoadProcMacroDylibError> {
+        // the sysroot ABI relies on `extern proc_macro` with unstable features,
+        // instead of a snapshot of the proc macro bridge's source code. it's only
+        // enabled if we have an exact version match.
+        #[cfg(feature = "sysroot-abi")]
+        {
+            if info.version_string == RUSTC_VERSION_STRING {
+                let inner = unsafe { Abi_Sysroot::from_lib(lib, symbol_name) }?;
+                return Ok(Abi::AbiSysroot(inner));
+            }
+
+            // if we reached this point, versions didn't match. in testing, we
+            // want that to panic - this could mean that the format of `rustc
+            // --version` no longer matches the format of the version string
+            // stored in the `.rustc` section, and we want to catch that in-tree
+            // with `x.py test`
+            #[cfg(test)]
+            {
+                let allow_mismatch = std::env::var("PROC_MACRO_SRV_ALLOW_SYSROOT_MISMATCH");
+                if let Ok("1") = allow_mismatch.as_deref() {
+                    // only used by rust-analyzer developers, when working on the
+                    // sysroot ABI from the rust-analyzer repository - which should
+                    // only happen pre-subtree. this can be removed later.
+                } else {
+                    panic!(
+                        "sysroot ABI mismatch: dylib rustc version (read from .rustc section): {:?} != proc-macro-srv version (read from 'rustc --version'): {:?}",
+                        info.version_string, RUSTC_VERSION_STRING
+                    );
+                }
+            }
+        }
+
         // FIXME: this should use exclusive ranges when they're stable
         // https://github.com/rust-lang/rust/issues/37854
         match (info.version.0, info.version.1) {
-            (1, 48..=53) => {
-                let inner = unsafe { Abi_1_48::from_lib(lib, symbol_name) }?;
-                Ok(Abi::Abi1_48(inner))
-            }
-            (1, 54..=55) => {
-                let inner = unsafe { Abi_1_54::from_lib(lib, symbol_name) }?;
-                Ok(Abi::Abi1_54(inner))
-            }
-            (1, 56) => {
-                let inner = unsafe { Abi_1_56::from_lib(lib, symbol_name) }?;
-                Ok(Abi::Abi1_56(inner))
-            }
-            (1, 57) => {
-                let inner = unsafe { Abi_1_57::from_lib(lib, symbol_name) }?;
-                Ok(Abi::Abi1_57(inner))
-            }
             (1, 58..=62) => {
                 let inner = unsafe { Abi_1_58::from_lib(lib, symbol_name) }?;
                 Ok(Abi::Abi1_58(inner))
             }
-            (1, 63..) => {
+            (1, 63) => {
                 let inner = unsafe { Abi_1_63::from_lib(lib, symbol_name) }?;
                 Ok(Abi::Abi1_63(inner))
+            }
+            (1, 64..) => {
+                let inner = unsafe { Abi_1_64::from_lib(lib, symbol_name) }?;
+                Ok(Abi::Abi1_64(inner))
             }
             _ => Err(LoadProcMacroDylibError::UnsupportedABI),
         }
@@ -113,23 +135,21 @@ impl Abi {
         attributes: Option<&tt::Subtree>,
     ) -> Result<tt::Subtree, PanicMessage> {
         match self {
-            Self::Abi1_48(abi) => abi.expand(macro_name, macro_body, attributes),
-            Self::Abi1_54(abi) => abi.expand(macro_name, macro_body, attributes),
-            Self::Abi1_56(abi) => abi.expand(macro_name, macro_body, attributes),
-            Self::Abi1_57(abi) => abi.expand(macro_name, macro_body, attributes),
             Self::Abi1_58(abi) => abi.expand(macro_name, macro_body, attributes),
             Self::Abi1_63(abi) => abi.expand(macro_name, macro_body, attributes),
+            Self::Abi1_64(abi) => abi.expand(macro_name, macro_body, attributes),
+            #[cfg(feature = "sysroot-abi")]
+            Self::AbiSysroot(abi) => abi.expand(macro_name, macro_body, attributes),
         }
     }
 
     pub fn list_macros(&self) -> Vec<(String, ProcMacroKind)> {
         match self {
-            Self::Abi1_48(abi) => abi.list_macros(),
-            Self::Abi1_54(abi) => abi.list_macros(),
-            Self::Abi1_56(abi) => abi.list_macros(),
-            Self::Abi1_57(abi) => abi.list_macros(),
             Self::Abi1_58(abi) => abi.list_macros(),
             Self::Abi1_63(abi) => abi.list_macros(),
+            Self::Abi1_64(abi) => abi.list_macros(),
+            #[cfg(feature = "sysroot-abi")]
+            Self::AbiSysroot(abi) => abi.list_macros(),
         }
     }
 }

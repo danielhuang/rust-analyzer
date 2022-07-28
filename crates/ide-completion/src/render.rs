@@ -121,7 +121,7 @@ pub(crate) fn render_field(
     let mut item = CompletionItem::new(
         SymbolKind::Field,
         ctx.source_range(),
-        receiver.map_or_else(|| name.clone(), |receiver| format!("{}.{}", receiver, name).into()),
+        field_with_receiver(receiver.as_ref(), &name),
     );
     item.set_relevance(CompletionRelevance {
         type_match: compute_type_match(ctx.completion, ty),
@@ -132,13 +132,20 @@ pub(crate) fn render_field(
         .set_documentation(field.docs(ctx.db()))
         .set_deprecated(is_deprecated)
         .lookup_by(name.clone());
-    item.insert_text(escaped_name);
+    item.insert_text(field_with_receiver(receiver.as_ref(), &escaped_name));
     if let Some(receiver) = &dot_access.receiver {
-        if let Some(ref_match) = compute_ref_match(ctx.completion, ty) {
-            item.ref_match(ref_match, receiver.syntax().text_range().start());
+        if let Some(original) = ctx.completion.sema.original_ast_node(receiver.clone()) {
+            if let Some(ref_match) = compute_ref_match(ctx.completion, ty) {
+                item.ref_match(ref_match, original.syntax().text_range().start());
+            }
         }
     }
     item.build()
+}
+
+fn field_with_receiver(receiver: Option<&hir::Name>, field_name: &str) -> SmolStr {
+    receiver
+        .map_or_else(|| field_name.into(), |receiver| format!("{}.{}", receiver, field_name).into())
 }
 
 pub(crate) fn render_tuple_field(
@@ -150,13 +157,16 @@ pub(crate) fn render_tuple_field(
     let mut item = CompletionItem::new(
         SymbolKind::Field,
         ctx.source_range(),
-        receiver.map_or_else(|| field.to_string(), |receiver| format!("{}.{}", receiver, field)),
+        field_with_receiver(receiver.as_ref(), &field.to_string()),
     );
     item.detail(ty.display(ctx.db()).to_string()).lookup_by(field.to_string());
     item.build()
 }
 
-pub(crate) fn render_type_inference(ty_string: String, ctx: &CompletionContext) -> CompletionItem {
+pub(crate) fn render_type_inference(
+    ty_string: String,
+    ctx: &CompletionContext<'_>,
+) -> CompletionItem {
     let mut builder =
         CompletionItem::new(CompletionItemKind::InferredType, ctx.source_range(), ty_string);
     builder.set_relevance(CompletionRelevance { is_definite: true, ..Default::default() });
@@ -204,7 +214,7 @@ pub(crate) fn render_resolution_with_import_pat(
 
 fn scope_def_to_name(
     resolution: ScopeDef,
-    ctx: &RenderContext,
+    ctx: &RenderContext<'_>,
     import_edit: &LocatedImport,
 ) -> Option<hir::Name> {
     Some(match resolution {
@@ -398,7 +408,7 @@ fn scope_def_is_deprecated(ctx: &RenderContext<'_>, resolution: ScopeDef) -> boo
 }
 
 fn compute_type_match(
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     completion_ty: &hir::Type,
 ) -> Option<CompletionRelevanceTypeMatch> {
     let expected_type = ctx.expected_type.as_ref()?;
@@ -418,12 +428,12 @@ fn compute_type_match(
     }
 }
 
-fn compute_exact_name_match(ctx: &CompletionContext, completion_name: &str) -> bool {
+fn compute_exact_name_match(ctx: &CompletionContext<'_>, completion_name: &str) -> bool {
     ctx.expected_name.as_ref().map_or(false, |name| name.text() == completion_name)
 }
 
 fn compute_ref_match(
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     completion_ty: &hir::Type,
 ) -> Option<hir::Mutability> {
     let expected_type = ctx.expected_type.as_ref()?;
@@ -1261,8 +1271,8 @@ fn main() {
                 st S []
                 st &mut S [type]
                 st S []
-                fn main() []
                 fn foo(…) []
+                fn main() []
             "#]],
         );
         check_relevance(
@@ -1278,8 +1288,8 @@ fn main() {
                 lc s [type+name+local]
                 st S [type]
                 st S []
-                fn main() []
                 fn foo(…) []
+                fn main() []
             "#]],
         );
         check_relevance(
@@ -1295,8 +1305,8 @@ fn main() {
                 lc ssss [type+local]
                 st S [type]
                 st S []
-                fn main() []
                 fn foo(…) []
+                fn main() []
             "#]],
         );
     }
@@ -1332,12 +1342,11 @@ fn main() {
                 lc &t [type+local]
                 st S []
                 st &S [type]
-                st T []
                 st S []
-                fn main() []
+                st T []
                 fn foo(…) []
+                fn main() []
                 md core []
-                tt Sized []
             "#]],
         )
     }
@@ -1379,12 +1388,11 @@ fn main() {
                 lc &mut t [type+local]
                 st S []
                 st &mut S [type]
-                st T []
                 st S []
-                fn main() []
+                st T []
                 fn foo(…) []
+                fn main() []
                 md core []
-                tt Sized []
             "#]],
         )
     }
@@ -1475,14 +1483,13 @@ fn main() {
             expect![[r#"
                 st S []
                 st &S [type]
-                st T []
                 st S []
-                fn main() []
+                st T []
                 fn bar() []
                 fn &bar() [type]
                 fn foo(…) []
+                fn main() []
                 md core []
-                tt Sized []
             "#]],
         )
     }
@@ -1626,8 +1633,8 @@ fn foo() {
                 ev Foo::B [type_could_unify]
                 fn foo() []
                 en Foo []
-                fn baz() []
                 fn bar() []
+                fn baz() []
             "#]],
         );
     }
@@ -1717,9 +1724,9 @@ fn f() {
 }
 "#,
             expect![[r#"
-                md std []
                 st Buffer []
                 fn f() []
+                md std []
                 tt BufRead (use std::io::BufRead) [requires_import]
                 st BufReader (use std::io::BufReader) [requires_import]
                 st BufWriter (use std::io::BufWriter) [requires_import]
@@ -1868,6 +1875,35 @@ impl r#trait for r#struct { type t$0 }
 struct r#struct {}
 trait r#trait { type r#type; }
 impl r#trait for r#struct { type r#type = $0; }
+"#,
+        )
+    }
+
+    #[test]
+    fn field_access_includes_self() {
+        check_edit(
+            "length",
+            r#"
+struct S {
+    length: i32
+}
+
+impl S {
+    fn some_fn(&self) {
+        let l = len$0
+    }
+}
+"#,
+            r#"
+struct S {
+    length: i32
+}
+
+impl S {
+    fn some_fn(&self) {
+        let l = self.length
+    }
+}
 "#,
         )
     }

@@ -12,7 +12,7 @@ use crate::{
 
 // Assist: generate_new
 //
-// Adds a new inherent impl for a type.
+// Adds a `fn new` for a type.
 //
 // ```
 // struct Ctx<T: Clone> {
@@ -29,7 +29,7 @@ use crate::{
 //     fn $0new(data: T) -> Self { Self { data } }
 // }
 // ```
-pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext) -> Option<()> {
+pub(crate) fn generate_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let strukt = ctx.find_node_at_offset::<ast::Struct>()?;
 
     // We want to only apply this to non-union structs with named fields

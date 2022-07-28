@@ -20,7 +20,7 @@ use crate::{
 
 pub(crate) fn complete_postfix(
     acc: &mut Completions,
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     dot_access: &DotAccess,
 ) {
     if !ctx.config.enable_postfix_completions {
@@ -193,13 +193,21 @@ pub(crate) fn complete_postfix(
 }
 
 fn get_receiver_text(receiver: &ast::Expr, receiver_is_ambiguous_float_literal: bool) -> String {
-    if receiver_is_ambiguous_float_literal {
+    let text = if receiver_is_ambiguous_float_literal {
         let text = receiver.syntax().text();
         let without_dot = ..text.len() - TextSize::of('.');
         text.slice(without_dot).to_string()
     } else {
         receiver.to_string()
-    }
+    };
+
+    // The receiver texts should be interpreted as-is, as they are expected to be
+    // normal Rust expressions. We escape '\' and '$' so they don't get treated as
+    // snippet-specific constructs.
+    //
+    // Note that we don't need to escape the other characters that can be escaped,
+    // because they wouldn't be treated as snippet-specific constructs without '$'.
+    text.replace('\\', "\\\\").replace('$', "\\$")
 }
 
 fn include_references(initial_element: &ast::Expr) -> ast::Expr {
@@ -213,7 +221,7 @@ fn include_references(initial_element: &ast::Expr) -> ast::Expr {
 }
 
 fn build_postfix_snippet_builder<'ctx>(
-    ctx: &'ctx CompletionContext,
+    ctx: &'ctx CompletionContext<'_>,
     cap: SnippetCap,
     receiver: &'ctx ast::Expr,
 ) -> Option<impl Fn(&str, &str, &str) -> Builder + 'ctx> {
@@ -228,7 +236,7 @@ fn build_postfix_snippet_builder<'ctx>(
     // Wrapping impl Fn in an option ruins lifetime inference for the parameters in a way that
     // can't be annotated for the closure, hence fix it by constructing it without the Option first
     fn build<'ctx>(
-        ctx: &'ctx CompletionContext,
+        ctx: &'ctx CompletionContext<'_>,
         cap: SnippetCap,
         delete_range: TextRange,
     ) -> impl Fn(&str, &str, &str) -> Builder + 'ctx {
@@ -254,7 +262,7 @@ fn build_postfix_snippet_builder<'ctx>(
 
 fn add_custom_postfix_completions(
     acc: &mut Completions,
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     postfix_snippet: impl Fn(&str, &str, &str) -> Builder,
     receiver_text: &str,
 ) -> Option<()> {
@@ -494,19 +502,21 @@ fn main() {
 
     #[test]
     fn custom_postfix_completion() {
+        let config = CompletionConfig {
+            snippets: vec![Snippet::new(
+                &[],
+                &["break".into()],
+                &["ControlFlow::Break(${receiver})".into()],
+                "",
+                &["core::ops::ControlFlow".into()],
+                crate::SnippetScope::Expr,
+            )
+            .unwrap()],
+            ..TEST_CONFIG
+        };
+
         check_edit_with_config(
-            CompletionConfig {
-                snippets: vec![Snippet::new(
-                    &[],
-                    &["break".into()],
-                    &["ControlFlow::Break(${receiver})".into()],
-                    "",
-                    &["core::ops::ControlFlow".into()],
-                    crate::SnippetScope::Expr,
-                )
-                .unwrap()],
-                ..TEST_CONFIG
-            },
+            config.clone(),
             "break",
             r#"
 //- minicore: try
@@ -516,6 +526,49 @@ fn main() { 42.$0 }
 use core::ops::ControlFlow;
 
 fn main() { ControlFlow::Break(42) }
+"#,
+        );
+
+        // The receiver texts should be escaped, see comments in `get_receiver_text()`
+        // for detail.
+        //
+        // Note that the last argument is what *lsp clients would see* rather than
+        // what users would see. Unescaping happens thereafter.
+        check_edit_with_config(
+            config.clone(),
+            "break",
+            r#"
+//- minicore: try
+fn main() { '\\'.$0 }
+"#,
+            r#"
+use core::ops::ControlFlow;
+
+fn main() { ControlFlow::Break('\\\\') }
+"#,
+        );
+
+        check_edit_with_config(
+            config.clone(),
+            "break",
+            r#"
+//- minicore: try
+fn main() {
+    match true {
+        true => "${1:placeholder}",
+        false => "\$",
+    }.$0
+}
+"#,
+            r#"
+use core::ops::ControlFlow;
+
+fn main() {
+    ControlFlow::Break(match true {
+        true => "\${1:placeholder}",
+        false => "\\\$",
+    })
+}
 "#,
         );
     }

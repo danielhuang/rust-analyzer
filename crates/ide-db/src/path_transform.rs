@@ -224,7 +224,8 @@ impl<'a> Ctx<'a> {
             | hir::PathResolution::SelfType(_)
             | hir::PathResolution::Def(_)
             | hir::PathResolution::BuiltinAttr(_)
-            | hir::PathResolution::ToolModule(_) => (),
+            | hir::PathResolution::ToolModule(_)
+            | hir::PathResolution::DeriveHelper(_) => (),
         }
         Some(())
     }
@@ -255,7 +256,7 @@ fn get_type_args_from_arg_list(generic_arg_list: ast::GenericArgList) -> Option<
 }
 
 fn find_trait_for_assoc_item(
-    scope: &SemanticsScope,
+    scope: &SemanticsScope<'_>,
     type_param: hir::TypeParam,
     assoc_item: ast::NameRef,
 ) -> Option<hir::Trait> {

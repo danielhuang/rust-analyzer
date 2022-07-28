@@ -7,15 +7,14 @@
 use std::{convert::TryInto, mem, sync::Arc};
 
 use base_db::{FileId, FileRange, SourceDatabase, SourceDatabaseExt};
-use hir::{
-    AsAssocItem, DefWithBody, HasAttrs, HasSource, InFile, ModuleSource, Semantics, Visibility,
-};
+use hir::{DefWithBody, HasAttrs, HasSource, InFile, ModuleSource, Semantics, Visibility};
 use once_cell::unsync::Lazy;
 use rustc_hash::FxHashMap;
 use syntax::{ast, match_ast, AstNode, TextRange, TextSize};
 
 use crate::{
     defs::{Definition, NameClass, NameRefClass},
+    traits::{as_trait_assoc_def, convert_to_def_in_trait},
     RootDatabase,
 };
 
@@ -55,7 +54,9 @@ impl IntoIterator for UsageSearchResult {
 
 #[derive(Debug, Clone)]
 pub struct FileReference {
+    /// The range of the reference in the original file
     pub range: TextRange,
+    /// The node of the reference in the (macro-)file
     pub name: ast::NameLike,
     pub category: Option<ReferenceCategory>,
 }
@@ -277,14 +278,14 @@ impl Definition {
                     }
                 }
                 hir::MacroKind::BuiltIn => SearchScope::crate_graph(db),
-                // FIXME: We don't actually see derives in derive attributes as these do not
-                // expand to something that references the derive macro in the output.
-                // We could get around this by doing pseudo expansions for proc_macro_derive like we
-                // do for the derive attribute
                 hir::MacroKind::Derive | hir::MacroKind::Attr | hir::MacroKind::ProcMacro => {
                     SearchScope::reverse_dependencies(db, module.krate())
                 }
             };
+        }
+
+        if let Definition::DeriveHelper(_) = self {
+            return SearchScope::reverse_dependencies(db, module.krate());
         }
 
         let vis = self.visibility(db);
@@ -306,13 +307,14 @@ impl Definition {
         }
     }
 
-    pub fn usages<'a>(self, sema: &'a Semantics<RootDatabase>) -> FindUsages<'a> {
+    pub fn usages<'a>(self, sema: &'a Semantics<'_, RootDatabase>) -> FindUsages<'a> {
         FindUsages {
             local_repr: match self {
                 Definition::Local(local) => Some(local.representative(sema.db)),
                 _ => None,
             },
             def: self,
+            trait_assoc_def: as_trait_assoc_def(sema.db, self),
             sema,
             scope: None,
             include_self_kw_refs: None,
@@ -324,6 +326,8 @@ impl Definition {
 #[derive(Clone)]
 pub struct FindUsages<'a> {
     def: Definition,
+    /// If def is an assoc item from a trait or trait impl, this is the corresponding item of the trait definition
+    trait_assoc_def: Option<Definition>,
     sema: &'a Semantics<'a, RootDatabase>,
     scope: Option<SearchScope>,
     include_self_kw_refs: Option<hir::Type>,
@@ -374,7 +378,7 @@ impl<'a> FindUsages<'a> {
         let sema = self.sema;
 
         let search_scope = {
-            let base = self.def.search_scope(sema.db);
+            let base = self.trait_assoc_def.unwrap_or(self.def).search_scope(sema.db);
             match &self.scope {
                 None => base,
                 Some(scope) => base.intersection(scope),
@@ -422,7 +426,7 @@ impl<'a> FindUsages<'a> {
         }
 
         fn scope_files<'a>(
-            sema: &'a Semantics<RootDatabase>,
+            sema: &'a Semantics<'_, RootDatabase>,
             scope: &'a SearchScope,
         ) -> impl Iterator<Item = (Arc<String>, FileId, TextRange)> + 'a {
             scope.entries.iter().map(|(&file_id, &search_range)| {
@@ -619,7 +623,15 @@ impl<'a> FindUsages<'a> {
                 };
                 sink(file_id, reference)
             }
-            Some(NameRefClass::Definition(def)) if def == self.def => {
+            Some(NameRefClass::Definition(def))
+                if match self.trait_assoc_def {
+                    Some(trait_assoc_def) => {
+                        // we have a trait assoc item, so force resolve all assoc items to their trait version
+                        convert_to_def_in_trait(self.sema.db, def) == trait_assoc_def
+                    }
+                    None => self.def == def,
+                } =>
+            {
                 let FileRange { file_id, range } = self.sema.original_range(name_ref.syntax());
                 let reference = FileReference {
                     range,
@@ -708,37 +720,29 @@ impl<'a> FindUsages<'a> {
                 }
                 false
             }
-            // Resolve trait impl function definitions to the trait definition's version if self.def is the trait definition's
             Some(NameClass::Definition(def)) if def != self.def => {
-                /* poor man's try block */
-                (|| {
-                    let this_trait = self
-                        .def
-                        .as_assoc_item(self.sema.db)?
-                        .containing_trait_or_trait_impl(self.sema.db)?;
-                    let trait_ = def
-                        .as_assoc_item(self.sema.db)?
-                        .containing_trait_or_trait_impl(self.sema.db)?;
-                    (trait_ == this_trait && self.def.name(self.sema.db) == def.name(self.sema.db))
-                        .then(|| {
-                            let FileRange { file_id, range } =
-                                self.sema.original_range(name.syntax());
-                            let reference = FileReference {
-                                range,
-                                name: ast::NameLike::Name(name.clone()),
-                                category: None,
-                            };
-                            sink(file_id, reference)
-                        })
-                })()
-                .unwrap_or(false)
+                // if the def we are looking for is a trait (impl) assoc item, we'll have to resolve the items to trait definition assoc item
+                if !matches!(
+                    self.trait_assoc_def,
+                    Some(trait_assoc_def)
+                        if convert_to_def_in_trait(self.sema.db, def) == trait_assoc_def
+                ) {
+                    return false;
+                }
+                let FileRange { file_id, range } = self.sema.original_range(name.syntax());
+                let reference = FileReference {
+                    range,
+                    name: ast::NameLike::Name(name.clone()),
+                    category: None,
+                };
+                sink(file_id, reference)
             }
             _ => false,
         }
     }
 }
 
-fn def_to_ty(sema: &Semantics<RootDatabase>, def: &Definition) -> Option<hir::Type> {
+fn def_to_ty(sema: &Semantics<'_, RootDatabase>, def: &Definition) -> Option<hir::Type> {
     match def {
         Definition::Adt(adt) => Some(adt.ty(sema.db)),
         Definition::TypeAlias(it) => Some(it.ty(sema.db)),

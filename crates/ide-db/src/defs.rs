@@ -7,9 +7,9 @@
 
 use arrayvec::ArrayVec;
 use hir::{
-    Adt, AsAssocItem, AssocItem, BuiltinAttr, BuiltinType, Const, Crate, Field, Function,
-    GenericParam, HasVisibility, Impl, ItemInNs, Label, Local, Macro, Module, ModuleDef, Name,
-    PathResolution, Semantics, Static, ToolModule, Trait, TypeAlias, Variant, Visibility,
+    Adt, AsAssocItem, AssocItem, BuiltinAttr, BuiltinType, Const, Crate, DeriveHelper, Field,
+    Function, GenericParam, HasVisibility, Impl, ItemInNs, Label, Local, Macro, Module, ModuleDef,
+    Name, PathResolution, Semantics, Static, ToolModule, Trait, TypeAlias, Variant, Visibility,
 };
 use stdx::impl_from;
 use syntax::{
@@ -37,6 +37,7 @@ pub enum Definition {
     Local(Local),
     GenericParam(GenericParam),
     Label(Label),
+    DeriveHelper(DeriveHelper),
     BuiltinAttr(BuiltinAttr),
     ToolModule(ToolModule),
 }
@@ -69,6 +70,7 @@ impl Definition {
             Definition::Local(it) => it.module(db),
             Definition::GenericParam(it) => it.module(db),
             Definition::Label(it) => it.module(db),
+            Definition::DeriveHelper(it) => it.derive().module(db),
             Definition::BuiltinAttr(_) | Definition::BuiltinType(_) | Definition::ToolModule(_) => {
                 return None
             }
@@ -94,7 +96,8 @@ impl Definition {
             | Definition::SelfType(_)
             | Definition::Local(_)
             | Definition::GenericParam(_)
-            | Definition::Label(_) => return None,
+            | Definition::Label(_)
+            | Definition::DeriveHelper(_) => return None,
         };
         Some(vis)
     }
@@ -118,6 +121,7 @@ impl Definition {
             Definition::Label(it) => it.name(db),
             Definition::BuiltinAttr(_) => return None, // FIXME
             Definition::ToolModule(_) => return None,  // FIXME
+            Definition::DeriveHelper(it) => it.name(db),
         };
         Some(name)
     }
@@ -130,7 +134,10 @@ pub enum IdentClass {
 }
 
 impl IdentClass {
-    pub fn classify_node(sema: &Semantics<RootDatabase>, node: &SyntaxNode) -> Option<IdentClass> {
+    pub fn classify_node(
+        sema: &Semantics<'_, RootDatabase>,
+        node: &SyntaxNode,
+    ) -> Option<IdentClass> {
         match_ast! {
             match node {
                 ast::Name(name) => NameClass::classify(sema, &name).map(IdentClass::NameClass),
@@ -146,7 +153,7 @@ impl IdentClass {
     }
 
     pub fn classify_token(
-        sema: &Semantics<RootDatabase>,
+        sema: &Semantics<'_, RootDatabase>,
         token: &SyntaxToken,
     ) -> Option<IdentClass> {
         let parent = token.parent()?;
@@ -154,7 +161,7 @@ impl IdentClass {
     }
 
     pub fn classify_lifetime(
-        sema: &Semantics<RootDatabase>,
+        sema: &Semantics<'_, RootDatabase>,
         lifetime: &ast::Lifetime,
     ) -> Option<IdentClass> {
         NameRefClass::classify_lifetime(sema, lifetime)
@@ -218,7 +225,7 @@ impl NameClass {
         Some(res)
     }
 
-    pub fn classify(sema: &Semantics<RootDatabase>, name: &ast::Name) -> Option<NameClass> {
+    pub fn classify(sema: &Semantics<'_, RootDatabase>, name: &ast::Name) -> Option<NameClass> {
         let _p = profile::span("classify_name");
 
         let parent = name.syntax().parent()?;
@@ -238,7 +245,10 @@ impl NameClass {
         };
         return Some(NameClass::Definition(definition));
 
-        fn classify_item(sema: &Semantics<RootDatabase>, item: ast::Item) -> Option<Definition> {
+        fn classify_item(
+            sema: &Semantics<'_, RootDatabase>,
+            item: ast::Item,
+        ) -> Option<Definition> {
             let definition = match item {
                 ast::Item::MacroRules(it) => {
                     Definition::Macro(sema.to_def(&ast::Macro::MacroRules(it))?)
@@ -266,7 +276,7 @@ impl NameClass {
         }
 
         fn classify_ident_pat(
-            sema: &Semantics<RootDatabase>,
+            sema: &Semantics<'_, RootDatabase>,
             ident_pat: ast::IdentPat,
         ) -> Option<NameClass> {
             if let Some(def) = sema.resolve_bind_pat_to_const(&ident_pat) {
@@ -289,7 +299,7 @@ impl NameClass {
         }
 
         fn classify_rename(
-            sema: &Semantics<RootDatabase>,
+            sema: &Semantics<'_, RootDatabase>,
             rename: ast::Rename,
         ) -> Option<Definition> {
             if let Some(use_tree) = rename.syntax().parent().and_then(ast::UseTree::cast) {
@@ -305,7 +315,7 @@ impl NameClass {
     }
 
     pub fn classify_lifetime(
-        sema: &Semantics<RootDatabase>,
+        sema: &Semantics<'_, RootDatabase>,
         lifetime: &ast::Lifetime,
     ) -> Option<NameClass> {
         let _p = profile::span("classify_lifetime").detail(|| lifetime.to_string());
@@ -338,7 +348,7 @@ impl NameRefClass {
     // Note: we don't have unit-tests for this rather important function.
     // It is primarily exercised via goto definition tests in `ide`.
     pub fn classify(
-        sema: &Semantics<RootDatabase>,
+        sema: &Semantics<'_, RootDatabase>,
         name_ref: &ast::NameRef,
     ) -> Option<NameRefClass> {
         let _p = profile::span("classify_name_ref").detail(|| name_ref.to_string());
@@ -418,7 +428,7 @@ impl NameRefClass {
     }
 
     pub fn classify_lifetime(
-        sema: &Semantics<RootDatabase>,
+        sema: &Semantics<'_, RootDatabase>,
         lifetime: &ast::Lifetime,
     ) -> Option<NameRefClass> {
         let _p = profile::span("classify_lifetime_ref").detail(|| lifetime.to_string());
@@ -494,6 +504,7 @@ impl From<PathResolution> for Definition {
             PathResolution::SelfType(impl_def) => Definition::SelfType(impl_def),
             PathResolution::BuiltinAttr(attr) => Definition::BuiltinAttr(attr),
             PathResolution::ToolModule(tool) => Definition::ToolModule(tool),
+            PathResolution::DeriveHelper(helper) => Definition::DeriveHelper(helper),
         }
     }
 }

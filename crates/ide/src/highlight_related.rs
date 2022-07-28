@@ -44,7 +44,7 @@ pub struct HighlightRelatedConfig {
 //
 // Note: `?` and `->` do not currently trigger this behavior in the VSCode editor.
 pub(crate) fn highlight_related(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     config: HighlightRelatedConfig,
     FilePosition { offset, file_id }: FilePosition,
 ) -> Option<Vec<HighlightedRange>> {
@@ -76,7 +76,7 @@ pub(crate) fn highlight_related(
 }
 
 fn highlight_references(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     node: &SyntaxNode,
     token: SyntaxToken,
     file_id: FileId,
@@ -136,11 +136,11 @@ fn highlight_references(
 }
 
 fn highlight_exit_points(
-    sema: &Semantics<RootDatabase>,
+    sema: &Semantics<'_, RootDatabase>,
     token: SyntaxToken,
 ) -> Option<Vec<HighlightedRange>> {
     fn hl(
-        sema: &Semantics<RootDatabase>,
+        sema: &Semantics<'_, RootDatabase>,
         body: Option<ast::Expr>,
     ) -> Option<Vec<HighlightedRange>> {
         let mut highlights = Vec::new();
@@ -330,7 +330,7 @@ fn cover_range(r0: Option<TextRange>, r1: Option<TextRange>) -> Option<TextRange
     }
 }
 
-fn find_defs(sema: &Semantics<RootDatabase>, token: SyntaxToken) -> FxHashSet<Definition> {
+fn find_defs(sema: &Semantics<'_, RootDatabase>, token: SyntaxToken) -> FxHashSet<Definition> {
     sema.descend_into_macros(token)
         .into_iter()
         .filter_map(|token| IdentClass::classify_token(sema, &token).map(IdentClass::definitions))
@@ -1306,6 +1306,70 @@ fn foo((
     foo$0;
   //^^^read
     let foo;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_hl_trait_impl_methods() {
+        check(
+            r#"
+trait Trait {
+    fn func$0(self) {}
+     //^^^^
+}
+
+impl Trait for () {
+    fn func(self) {}
+     //^^^^
+}
+
+fn main() {
+    <()>::func(());
+        //^^^^
+    ().func();
+     //^^^^
+}
+"#,
+        );
+        check(
+            r#"
+trait Trait {
+    fn func(self) {}
+     //^^^^
+}
+
+impl Trait for () {
+    fn func$0(self) {}
+     //^^^^
+}
+
+fn main() {
+    <()>::func(());
+        //^^^^
+    ().func();
+     //^^^^
+}
+"#,
+        );
+        check(
+            r#"
+trait Trait {
+    fn func(self) {}
+     //^^^^
+}
+
+impl Trait for () {
+    fn func(self) {}
+     //^^^^
+}
+
+fn main() {
+    <()>::func(());
+        //^^^^
+    ().func$0();
+     //^^^^
 }
 "#,
         );

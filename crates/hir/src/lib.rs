@@ -17,6 +17,7 @@
 //! from the ide with completions, hovers, etc. It is a (soft, internal) boundary:
 //! <https://www.tedinski.com/2018/02/06/system-boundaries.html>.
 
+#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
 #![recursion_limit = "512"]
 
 mod semantics;
@@ -2251,6 +2252,32 @@ impl Local {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DeriveHelper {
+    pub(crate) derive: MacroId,
+    pub(crate) idx: usize,
+}
+
+impl DeriveHelper {
+    pub fn derive(&self) -> Macro {
+        Macro { id: self.derive.into() }
+    }
+
+    pub fn name(&self, db: &dyn HirDatabase) -> Name {
+        match self.derive {
+            MacroId::Macro2Id(_) => None,
+            MacroId::MacroRulesId(_) => None,
+            MacroId::ProcMacroId(proc_macro) => db
+                .proc_macro_data(proc_macro)
+                .helpers
+                .as_ref()
+                .and_then(|it| it.get(self.idx))
+                .cloned(),
+        }
+        .unwrap_or_else(|| Name::missing())
+    }
+}
+
 // FIXME: Wrong name? This is could also be a registered attribute
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BuiltinAttr {
@@ -2742,6 +2769,10 @@ impl Type {
         self.derived(self.ty.strip_references().clone())
     }
 
+    pub fn strip_reference(&self) -> Type {
+        self.derived(self.ty.strip_reference().clone())
+    }
+
     pub fn is_unknown(&self) -> bool {
         self.ty.is_unknown()
     }
@@ -3027,7 +3058,7 @@ impl Type {
     pub fn iterate_method_candidates<T>(
         &self,
         db: &dyn HirDatabase,
-        scope: &SemanticsScope,
+        scope: &SemanticsScope<'_>,
         // FIXME this can be retrieved from `scope`, except autoimport uses this
         // to specify a different set, so the method needs to be split
         traits_in_scope: &FxHashSet<TraitId>,
@@ -3060,7 +3091,7 @@ impl Type {
     fn iterate_method_candidates_dyn(
         &self,
         db: &dyn HirDatabase,
-        scope: &SemanticsScope,
+        scope: &SemanticsScope<'_>,
         traits_in_scope: &FxHashSet<TraitId>,
         with_local_impls: Option<Module>,
         name: Option<&Name>,
@@ -3090,7 +3121,7 @@ impl Type {
     pub fn iterate_path_candidates<T>(
         &self,
         db: &dyn HirDatabase,
-        scope: &SemanticsScope,
+        scope: &SemanticsScope<'_>,
         traits_in_scope: &FxHashSet<TraitId>,
         with_local_impls: Option<Module>,
         name: Option<&Name>,
@@ -3118,7 +3149,7 @@ impl Type {
     fn iterate_path_candidates_dyn(
         &self,
         db: &dyn HirDatabase,
-        scope: &SemanticsScope,
+        scope: &SemanticsScope<'_>,
         traits_in_scope: &FxHashSet<TraitId>,
         with_local_impls: Option<Module>,
         name: Option<&Name>,

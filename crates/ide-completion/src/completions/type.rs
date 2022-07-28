@@ -11,7 +11,7 @@ use crate::{
 
 pub(crate) fn complete_type_path(
     acc: &mut Completions,
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     path_ctx @ PathCompletionCtx { qualified, .. }: &PathCompletionCtx,
     location: &TypeLocation,
 ) {
@@ -49,11 +49,27 @@ pub(crate) fn complete_type_path(
     };
 
     match qualified {
-        Qualified::Infer => ctx
+        Qualified::TypeAnchor { ty: None, trait_: None } => ctx
             .traits_in_scope()
             .iter()
             .flat_map(|&it| hir::Trait::from(it).items(ctx.sema.db))
             .for_each(|item| add_assoc_item(acc, item)),
+        Qualified::TypeAnchor { trait_: Some(trait_), .. } => {
+            trait_.items(ctx.sema.db).into_iter().for_each(|item| add_assoc_item(acc, item))
+        }
+        Qualified::TypeAnchor { ty: Some(ty), trait_: None } => {
+            ctx.iterate_path_candidates(&ty, |item| {
+                add_assoc_item(acc, item);
+            });
+
+            // Iterate assoc types separately
+            ty.iterate_assoc_items(ctx.db, ctx.krate, |item| {
+                if let hir::AssocItem::TypeAlias(ty) = item {
+                    acc.add_type_alias(ctx, ty)
+                }
+                None::<()>
+            });
+        }
         Qualified::With { resolution: None, .. } => {}
         Qualified::With { resolution: Some(resolution), .. } => {
             // Add associated types on type parameters and `Self`.
@@ -208,7 +224,7 @@ pub(crate) fn complete_type_path(
 
 pub(crate) fn complete_ascribed_type(
     acc: &mut Completions,
-    ctx: &CompletionContext,
+    ctx: &CompletionContext<'_>,
     path_ctx: &PathCompletionCtx,
     ascription: &TypeAscriptionTarget,
 ) -> Option<()> {

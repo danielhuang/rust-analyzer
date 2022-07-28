@@ -5,6 +5,8 @@
 //! is used to provide basic infrastructure for communication between two
 //! processes: Client (RA itself), Server (the external program)
 
+#![warn(rust_2018_idioms, unused_lifetimes, semicolon_in_expressions_from_macros)]
+
 pub mod msg;
 mod process;
 mod version;
@@ -24,7 +26,7 @@ use crate::{
     process::ProcMacroProcessSrv,
 };
 
-pub use version::{read_dylib_info, RustCInfo};
+pub use version::{read_dylib_info, read_version, RustCInfo};
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum ProcMacroKind {
