@@ -33,7 +33,9 @@ pub struct DeclarationLocation {
 
 impl DeclarationLocation {
     pub fn syntax<DB: HirDatabase>(&self, sema: &Semantics<'_, DB>) -> Option<SyntaxNode> {
+        let _p = profile::span("syntax");
         let root = sema.parse_or_expand(self.hir_file_id)?;
+        let _p2 = profile::span("sema.parse_or_expand");
         Some(self.ptr.to_node(&root))
     }
 

@@ -9,7 +9,7 @@ use hir::{
     AsAssocItem, Crate, ItemInNs, Semantics,
 };
 use limit::Limit;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::ParallelBridge;
 use syntax::{ast, AstNode, SyntaxKind::NAME};
 
 use crate::{
@@ -17,6 +17,7 @@ use crate::{
     imports::import_assets::NameToImport,
     symbol_index, RootDatabase,
 };
+use rayon::iter::ParallelIterator;
 
 /// A value to use, when uncertain which limit to pick.
 pub static DEFAULT_QUERY_SEARCH_LIMIT: Limit = Limit::new(400000);
@@ -116,21 +117,18 @@ fn find_items<'a>(
         });
 
     // Query the local crate using the symbol index.
-    let local_results: Vec<_> = symbol_index::crate_symbols(db, krate.into(), local_query)
+    let local_results = symbol_index::crate_symbols(db, krate, local_query)
         .into_iter()
         .filter_map(move |local_candidate| get_name_definition(sema, &local_candidate))
         .filter_map(|name_definition_to_import| match name_definition_to_import {
             Definition::Macro(macro_def) => Some(ItemInNs::from(macro_def)),
             def => <Option<_>>::from(def),
-        })
-        .collect();
+        });
 
-    external_importables.into_iter().chain(local_results).filter(move |&item| {
-        match assoc_item_search {
-            AssocItemSearch::Include => true,
-            AssocItemSearch::Exclude => !is_assoc_item(item, sema.db),
-            AssocItemSearch::AssocItemsOnly => is_assoc_item(item, sema.db),
-        }
+    external_importables.chain(local_results).filter(move |&item| match assoc_item_search {
+        AssocItemSearch::Include => true,
+        AssocItemSearch::Exclude => !is_assoc_item(item, sema.db),
+        AssocItemSearch::AssocItemsOnly => is_assoc_item(item, sema.db),
     })
 }
 
@@ -142,17 +140,12 @@ fn get_name_definition(
 
     let candidate_node = import_candidate.loc.syntax(sema)?;
     let candidate_name_node = if candidate_node.kind() != NAME {
-        let _p = profile::span("get_name_definition candidate_name_node from children")
-            .detail(|| candidate_node.children().count().to_string());
         candidate_node.children().find(|it| it.kind() == NAME)?
     } else {
         candidate_node
     };
-    {
-        let _p = profile::span("get_name_definition NameClass::classify");
-        let name = ast::Name::cast(candidate_name_node)?;
-        NameClass::classify(sema, &name)?.defined()
-    }
+    let name = ast::Name::cast(candidate_name_node)?;
+    NameClass::classify(sema, &name)?.defined()
 }
 
 fn is_assoc_item(item: ItemInNs, db: &RootDatabase) -> bool {

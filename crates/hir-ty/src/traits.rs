@@ -123,8 +123,7 @@ pub(crate) fn trait_solve_query(
     krate: CrateId,
     goal: Canonical<InEnvironment<Goal>>,
 ) -> Option<Solution> {
-    // dbg!(&krate, &goal);
-    // dbg!(&*db as *const dyn HirDatabase);
+    dbg!(&krate, &goal);
 
     let _p = profile::span("trait_solve_query").detail(|| match &goal.value.goal.data(Interner) {
         GoalData::DomainGoal(DomainGoal::Holds(WhereClause::Implemented(it))) => {
