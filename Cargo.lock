@@ -814,6 +814,7 @@ dependencies = [
  "ide-db",
  "itertools",
  "profile",
+ "serde_json",
  "sourcegen",
  "stdx",
  "syntax",
