@@ -20,6 +20,7 @@ miniz_oxide.opt-level = 3
 incremental = true
 # Set this to 1 or 2 to get more useful backtraces in debugger.
 debug = 0
+lto = "thin"
 
 [patch.'crates-io']
 # rowan = { path = "../rowan" }

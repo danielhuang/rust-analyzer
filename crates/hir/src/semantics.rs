@@ -119,6 +119,10 @@ pub struct SemanticsImpl<'db> {
     macro_call_cache: RefCell<FxHashMap<InFile<ast::MacroCall>, HirFileId>>,
 }
 
+// dbg REMOVE
+unsafe impl Send for SemanticsImpl<'_> {}
+unsafe impl Sync for SemanticsImpl<'_> {}
+
 impl<DB> fmt::Debug for Semantics<'_, DB> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Semantics {{ ... }}")

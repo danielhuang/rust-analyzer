@@ -2,6 +2,7 @@
 //! by its name and a few criteria.
 //! The main reason for this module to exist is the fact that project's items and dependencies' items
 //! are located in different caches, with different APIs.
+use cached::proc_macro::cached;
 use either::Either;
 use hir::{
     import_map::{self, ImportKind},
@@ -132,6 +133,7 @@ fn find_items<'a>(
     })
 }
 
+#[cached(size = 100000, key = "String", convert = "{ format!(\"{:?}\", import_candidate) }")]
 fn get_name_definition(
     sema: &Semantics<'_, RootDatabase>,
     import_candidate: &FileSymbol,

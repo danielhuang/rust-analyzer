@@ -196,9 +196,9 @@ fn trait_solve_wait(
 ) -> Option<crate::Solution> {
     let _p = profile::span("trait_solve::wait");
     let start = Instant::now();
-    let x = trait_solve_query(&db, krate.clone(), goal.clone());
+    let x = trait_solve_query(db, krate.clone(), goal.clone());
     if start.elapsed().as_millis() > 10 {
-        dbg!(&krate, &goal);
+        // dbg!(&krate, &goal);
     }
     x
 }

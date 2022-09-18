@@ -6,6 +6,7 @@ use std::{iter, ops::ControlFlow, sync::Arc};
 
 use arrayvec::ArrayVec;
 use base_db::{CrateId, Edition};
+use cached::proc_macro::cached;
 use chalk_ir::{cast::Cast, Mutability, UniverseIndex};
 use hir_def::{
     data::ImplData, item_scope::ItemScope, nameres::DefMap, AssocItemId, BlockId, ConstId,
@@ -14,6 +15,7 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::BTreeSet;
 use stdx::never;
 
 use crate::{
@@ -455,7 +457,7 @@ pub enum LookupMode {
     Path,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum VisibleFromModule {
     /// Filter for results that are visible from the given module
     Filter(ModuleId),
@@ -650,6 +652,11 @@ pub fn iterate_path_candidates(
     )
 }
 
+// #[cached(
+//     size = 100000,
+//     key = "(String, BTreeSet<String>)",
+//     convert = "{ (format!(\"{:?}\", (&env, &visible_from_module, &name, &mode)), traits_in_scope.iter().map(|x| format!(\"{:?}\", x)).collect()) }"
+// )]
 pub fn iterate_method_candidates_dyn(
     ty: &Canonical<Ty>,
     db: &dyn HirDatabase,
