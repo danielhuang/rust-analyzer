@@ -139,6 +139,7 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             "ssr": true,
             "workspaceSymbolScopeKindFiltering": true,
         })),
+        position_encoding: None,
     }
 }
 
