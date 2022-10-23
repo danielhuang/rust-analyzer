@@ -1,4 +1,4 @@
-use hir::{HasSource, HirDisplay, Module, Semantics, TypeInfo};
+use hir::{Adt, HasSource, HirDisplay, Module, Semantics, TypeInfo};
 use ide_db::{
     base_db::FileId,
     defs::{Definition, NameRefClass},
@@ -61,43 +61,8 @@ fn gen_fn(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     }
 
     let fn_name = &*name_ref.text();
-    let target_module;
-    let mut adt_name = None;
-
-    let (target, file, insert_offset) = match path.qualifier() {
-        Some(qualifier) => match ctx.sema.resolve_path(&qualifier) {
-            Some(hir::PathResolution::Def(hir::ModuleDef::Module(module))) => {
-                target_module = Some(module);
-                get_fn_target(ctx, &target_module, call.clone())?
-            }
-            Some(hir::PathResolution::Def(hir::ModuleDef::Adt(adt))) => {
-                if let hir::Adt::Enum(_) = adt {
-                    // Don't suggest generating function if the name starts with an uppercase letter
-                    if name_ref.text().starts_with(char::is_uppercase) {
-                        return None;
-                    }
-                }
-
-                let current_module = ctx.sema.scope(call.syntax())?.module();
-                let module = adt.module(ctx.sema.db);
-                target_module = if current_module == module { None } else { Some(module) };
-                if current_module.krate() != module.krate() {
-                    return None;
-                }
-                let (impl_, file) = get_adt_source(ctx, &adt, fn_name)?;
-                let (target, insert_offset) = get_method_target(ctx, &module, &impl_)?;
-                adt_name = if impl_.is_none() { Some(adt.name(ctx.sema.db)) } else { None };
-                (target, file, insert_offset)
-            }
-            _ => {
-                return None;
-            }
-        },
-        _ => {
-            target_module = None;
-            get_fn_target(ctx, &target_module, call.clone())?
-        }
-    };
+    let TargetInfo { target_module, adt_name, target, file, insert_offset } =
+        fn_target_info(ctx, path, &call, fn_name)?;
     let function_builder = FunctionBuilder::from_call(ctx, &call, fn_name, target_module, target)?;
     let text_range = call.syntax().text_range();
     let label = format!("Generate {} function", function_builder.fn_name);
@@ -111,6 +76,57 @@ fn gen_fn(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         adt_name,
         label,
     )
+}
+
+struct TargetInfo {
+    target_module: Option<Module>,
+    adt_name: Option<hir::Name>,
+    target: GeneratedFunctionTarget,
+    file: FileId,
+    insert_offset: TextSize,
+}
+
+impl TargetInfo {
+    fn new(
+        target_module: Option<Module>,
+        adt_name: Option<hir::Name>,
+        target: GeneratedFunctionTarget,
+        file: FileId,
+        insert_offset: TextSize,
+    ) -> Self {
+        Self { target_module, adt_name, target, file, insert_offset }
+    }
+}
+
+fn fn_target_info(
+    ctx: &AssistContext<'_>,
+    path: ast::Path,
+    call: &CallExpr,
+    fn_name: &str,
+) -> Option<TargetInfo> {
+    match path.qualifier() {
+        Some(qualifier) => match ctx.sema.resolve_path(&qualifier) {
+            Some(hir::PathResolution::Def(hir::ModuleDef::Module(module))) => {
+                get_fn_target_info(ctx, &Some(module), call.clone())
+            }
+            Some(hir::PathResolution::Def(hir::ModuleDef::Adt(adt))) => {
+                if let hir::Adt::Enum(_) = adt {
+                    // Don't suggest generating function if the name starts with an uppercase letter
+                    if fn_name.starts_with(char::is_uppercase) {
+                        return None;
+                    }
+                }
+
+                assoc_fn_target_info(ctx, call, adt, fn_name)
+            }
+            Some(hir::PathResolution::SelfType(impl_)) => {
+                let adt = impl_.self_ty(ctx.db()).as_adt()?;
+                assoc_fn_target_info(ctx, call, adt, fn_name)
+            }
+            _ => None,
+        },
+        _ => get_fn_target_info(ctx, &None, call.clone()),
+    }
 }
 
 fn gen_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
@@ -129,7 +145,8 @@ fn gen_method(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         return None;
     }
     let (impl_, file) = get_adt_source(ctx, &adt, fn_name.text().as_str())?;
-    let (target, insert_offset) = get_method_target(ctx, &target_module, &impl_)?;
+    let (target, insert_offset) = get_method_target(ctx, &impl_, &adt)?;
+
     let function_builder =
         FunctionBuilder::from_method_call(ctx, &call, &fn_name, target_module, target)?;
     let text_range = call.syntax().text_range();
@@ -158,10 +175,11 @@ fn add_func_to_accumulator(
     label: String,
 ) -> Option<()> {
     acc.add(AssistId("generate_function", AssistKind::Generate), label, text_range, |builder| {
-        let function_template = function_builder.render();
+        let indent = IndentLevel::from_node(function_builder.target.syntax());
+        let function_template = function_builder.render(adt_name.is_some());
         let mut func = function_template.to_string(ctx.config.snippet_cap);
         if let Some(name) = adt_name {
-            func = format!("\nimpl {} {{\n{}\n}}", name, func);
+            func = format!("\n{indent}impl {name} {{\n{func}\n{indent}}}");
         }
         builder.edit_file(file);
         match ctx.config.snippet_cap {
@@ -180,7 +198,7 @@ fn get_adt_source(
     let file = ctx.sema.parse(range.file_id);
     let adt_source =
         ctx.sema.find_node_at_offset_with_macros(file.syntax(), range.range.start())?;
-    find_struct_impl(ctx, &adt_source, fn_name).map(|impl_| (impl_, range.file_id))
+    find_struct_impl(ctx, &adt_source, &[fn_name.to_string()]).map(|impl_| (impl_, range.file_id))
 }
 
 struct FunctionTemplate {
@@ -194,23 +212,26 @@ struct FunctionTemplate {
 
 impl FunctionTemplate {
     fn to_string(&self, cap: Option<SnippetCap>) -> String {
+        let Self { leading_ws, fn_def, ret_type, should_focus_return_type, trailing_ws, tail_expr } =
+            self;
+
         let f = match cap {
             Some(cap) => {
-                let cursor = if self.should_focus_return_type {
+                let cursor = if *should_focus_return_type {
                     // Focus the return type if there is one
-                    match self.ret_type {
-                        Some(ref ret_type) => ret_type.syntax(),
-                        None => self.tail_expr.syntax(),
+                    match ret_type {
+                        Some(ret_type) => ret_type.syntax(),
+                        None => tail_expr.syntax(),
                     }
                 } else {
-                    self.tail_expr.syntax()
+                    tail_expr.syntax()
                 };
-                render_snippet(cap, self.fn_def.syntax(), Cursor::Replace(cursor))
+                render_snippet(cap, fn_def.syntax(), Cursor::Replace(cursor))
             }
-            None => self.fn_def.to_string(),
+            None => fn_def.to_string(),
         };
 
-        format!("{}{}{}", self.leading_ws, f, self.trailing_ws)
+        format!("{leading_ws}{f}{trailing_ws}")
     }
 }
 
@@ -291,7 +312,7 @@ impl FunctionBuilder {
         })
     }
 
-    fn render(self) -> FunctionTemplate {
+    fn render(self, is_method: bool) -> FunctionTemplate {
         let placeholder_expr = make::ext::expr_todo();
         let fn_body = make::block_expr(vec![], Some(placeholder_expr));
         let visibility = if self.needs_pub { Some(make::visibility_pub_crate()) } else { None };
@@ -309,16 +330,23 @@ impl FunctionBuilder {
 
         match self.target {
             GeneratedFunctionTarget::BehindItem(it) => {
-                let indent = IndentLevel::from_node(&it);
-                leading_ws = format!("\n\n{}", indent);
+                let mut indent = IndentLevel::from_node(&it);
+                if is_method {
+                    indent = indent + 1;
+                    leading_ws = format!("{indent}");
+                } else {
+                    leading_ws = format!("\n\n{indent}");
+                }
+
                 fn_def = fn_def.indent(indent);
                 trailing_ws = String::new();
             }
             GeneratedFunctionTarget::InEmptyItemList(it) => {
                 let indent = IndentLevel::from_node(&it);
-                leading_ws = format!("\n{}", indent + 1);
-                fn_def = fn_def.indent(indent + 1);
-                trailing_ws = format!("\n{}", indent);
+                let leading_indent = indent + 1;
+                leading_ws = format!("\n{leading_indent}");
+                fn_def = fn_def.indent(leading_indent);
+                trailing_ws = format!("\n{indent}");
             }
         };
 
@@ -366,6 +394,15 @@ fn make_return_type(
     (ret_type, should_focus_return_type)
 }
 
+fn get_fn_target_info(
+    ctx: &AssistContext<'_>,
+    target_module: &Option<Module>,
+    call: CallExpr,
+) -> Option<TargetInfo> {
+    let (target, file, insert_offset) = get_fn_target(ctx, target_module, call)?;
+    Some(TargetInfo::new(*target_module, None, target, file, insert_offset))
+}
+
 fn get_fn_target(
     ctx: &AssistContext<'_>,
     target_module: &Option<Module>,
@@ -386,17 +423,34 @@ fn get_fn_target(
 
 fn get_method_target(
     ctx: &AssistContext<'_>,
-    target_module: &Module,
     impl_: &Option<ast::Impl>,
+    adt: &Adt,
 ) -> Option<(GeneratedFunctionTarget, TextSize)> {
     let target = match impl_ {
         Some(impl_) => next_space_for_fn_in_impl(impl_)?,
         None => {
-            next_space_for_fn_in_module(ctx.sema.db, &target_module.definition_source(ctx.sema.db))?
-                .1
+            GeneratedFunctionTarget::BehindItem(adt.source(ctx.sema.db)?.syntax().value.clone())
         }
     };
     Some((target.clone(), get_insert_offset(&target)))
+}
+
+fn assoc_fn_target_info(
+    ctx: &AssistContext<'_>,
+    call: &CallExpr,
+    adt: hir::Adt,
+    fn_name: &str,
+) -> Option<TargetInfo> {
+    let current_module = ctx.sema.scope(call.syntax())?.module();
+    let module = adt.module(ctx.sema.db);
+    let target_module = if current_module == module { None } else { Some(module) };
+    if current_module.krate() != module.krate() {
+        return None;
+    }
+    let (impl_, file) = get_adt_source(ctx, &adt, fn_name)?;
+    let (target, insert_offset) = get_method_target(ctx, &impl_, &adt)?;
+    let adt_name = if impl_.is_none() { Some(adt.name(ctx.sema.db)) } else { None };
+    Some(TargetInfo::new(target_module, adt_name, target, file, insert_offset))
 }
 
 fn get_insert_offset(target: &GeneratedFunctionTarget) -> TextSize {
@@ -1425,14 +1479,12 @@ fn foo() {S.bar$0();}
 ",
             r"
 struct S;
-fn foo() {S.bar();}
 impl S {
-
-
-fn bar(&self) ${0:-> _} {
-    todo!()
+    fn bar(&self) ${0:-> _} {
+        todo!()
+    }
 }
-}
+fn foo() {S.bar();}
 ",
         )
     }
@@ -1473,13 +1525,11 @@ fn foo() {s::S.bar$0();}
             r"
 mod s {
     pub struct S;
-impl S {
-
-
-    pub(crate) fn bar(&self) ${0:-> _} {
-        todo!()
+    impl S {
+        pub(crate) fn bar(&self) ${0:-> _} {
+            todo!()
+        }
     }
-}
 }
 fn foo() {s::S.bar();}
 ",
@@ -1501,17 +1551,15 @@ mod s {
 ",
             r"
 struct S;
+impl S {
+    fn bar(&self) ${0:-> _} {
+        todo!()
+    }
+}
 mod s {
     fn foo() {
         super::S.bar();
     }
-}
-impl S {
-
-
-fn bar(&self) ${0:-> _} {
-    todo!()
-}
 }
 
 ",
@@ -1528,14 +1576,12 @@ fn foo() {$0S.bar();}
 ",
             r"
 struct S;
-fn foo() {S.bar();}
 impl S {
-
-
-fn bar(&self) ${0:-> _} {
-    todo!()
+    fn bar(&self) ${0:-> _} {
+        todo!()
+    }
 }
-}
+fn foo() {S.bar();}
 ",
         )
     }
@@ -1550,14 +1596,12 @@ fn foo() {S::bar$0();}
 ",
             r"
 struct S;
-fn foo() {S::bar();}
 impl S {
-
-
-fn bar() ${0:-> _} {
-    todo!()
+    fn bar() ${0:-> _} {
+        todo!()
+    }
 }
-}
+fn foo() {S::bar();}
 ",
         )
     }
@@ -1598,13 +1642,11 @@ fn foo() {s::S::bar$0();}
             r"
 mod s {
     pub struct S;
-impl S {
-
-
-    pub(crate) fn bar() ${0:-> _} {
-        todo!()
+    impl S {
+        pub(crate) fn bar() ${0:-> _} {
+            todo!()
+        }
     }
-}
 }
 fn foo() {s::S::bar();}
 ",
@@ -1621,13 +1663,38 @@ fn foo() {$0S::bar();}
 ",
             r"
 struct S;
-fn foo() {S::bar();}
 impl S {
-
-
-fn bar() ${0:-> _} {
-    todo!()
+    fn bar() ${0:-> _} {
+        todo!()
+    }
 }
+fn foo() {S::bar();}
+",
+        )
+    }
+
+    #[test]
+    fn create_static_method_within_an_impl_with_self_syntax() {
+        check_assist(
+            generate_function,
+            r"
+struct S;
+impl S {
+    fn foo(&self) {
+        Self::bar$0();
+    }
+}
+",
+            r"
+struct S;
+impl S {
+    fn foo(&self) {
+        Self::bar();
+    }
+
+    fn bar() ${0:-> _} {
+        todo!()
+    }
 }
 ",
         )
@@ -1771,15 +1838,13 @@ fn main() {
 ",
             r"
 enum Foo {}
+impl Foo {
+    fn new() ${0:-> _} {
+        todo!()
+    }
+}
 fn main() {
     Foo::new();
-}
-impl Foo {
-
-
-fn new() ${0:-> _} {
-    todo!()
-}
 }
 ",
         )

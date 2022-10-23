@@ -1,11 +1,8 @@
-import path = require("path");
+import * as path from "path";
+import * as os from "os";
 import * as vscode from "vscode";
 import { Env } from "./client";
 import { log } from "./util";
-
-export type UpdatesChannel = "stable" | "nightly";
-
-const NIGHTLY_TAG = "nightly";
 
 export type RunnableEnvCfg =
     | undefined
@@ -14,23 +11,17 @@ export type RunnableEnvCfg =
 
 export class Config {
     readonly extensionId = "rust-lang.rust-analyzer";
+    configureLang: vscode.Disposable | undefined;
 
     readonly rootSection = "rust-analyzer";
-    private readonly requiresWorkspaceReloadOpts = [
-        "serverPath",
-        "server",
-        // FIXME: This shouldn't be here, changing this setting should reload
-        // `continueCommentsOnNewline` behavior without restart
-        "typing",
-    ].map((opt) => `${this.rootSection}.${opt}`);
     private readonly requiresReloadOpts = [
         "cargo",
         "procMacro",
+        "serverPath",
+        "server",
         "files",
         "lens", // works as lens.*
-    ]
-        .map((opt) => `${this.rootSection}.${opt}`)
-        .concat(this.requiresWorkspaceReloadOpts);
+    ].map((opt) => `${this.rootSection}.${opt}`);
 
     readonly package: {
         version: string;
@@ -48,6 +39,11 @@ export class Config {
             ctx.subscriptions
         );
         this.refreshLogging();
+        this.configureLanguage();
+    }
+
+    dispose() {
+        this.configureLang?.dispose();
     }
 
     private refreshLogging() {
@@ -61,33 +57,86 @@ export class Config {
     private async onDidChangeConfiguration(event: vscode.ConfigurationChangeEvent) {
         this.refreshLogging();
 
+        this.configureLanguage();
+
         const requiresReloadOpt = this.requiresReloadOpts.find((opt) =>
             event.affectsConfiguration(opt)
         );
 
         if (!requiresReloadOpt) return;
 
-        const requiresWorkspaceReloadOpt = this.requiresWorkspaceReloadOpts.find((opt) =>
-            event.affectsConfiguration(opt)
-        );
-
-        if (!requiresWorkspaceReloadOpt && this.restartServerOnConfigChange) {
+        if (this.restartServerOnConfigChange) {
             await vscode.commands.executeCommand("rust-analyzer.reload");
             return;
         }
 
-        const message = requiresWorkspaceReloadOpt
-            ? `Changing "${requiresWorkspaceReloadOpt}" requires a window reload`
-            : `Changing "${requiresReloadOpt}" requires a reload`;
-        const userResponse = await vscode.window.showInformationMessage(message, "Reload now");
+        const message = `Changing "${requiresReloadOpt}" requires a server restart`;
+        const userResponse = await vscode.window.showInformationMessage(message, "Restart now");
 
-        if (userResponse === "Reload now") {
-            const command = requiresWorkspaceReloadOpt
-                ? "workbench.action.reloadWindow"
-                : "rust-analyzer.reload";
-            if (userResponse === "Reload now") {
-                await vscode.commands.executeCommand(command);
-            }
+        if (userResponse) {
+            const command = "rust-analyzer.reload";
+            await vscode.commands.executeCommand(command);
+        }
+    }
+
+    /**
+     * Sets up additional language configuration that's impossible to do via a
+     * separate language-configuration.json file. See [1] for more information.
+     *
+     * [1]: https://github.com/Microsoft/vscode/issues/11514#issuecomment-244707076
+     */
+    private configureLanguage() {
+        if (this.typingContinueCommentsOnNewline && !this.configureLang) {
+            const indentAction = vscode.IndentAction.None;
+
+            this.configureLang = vscode.languages.setLanguageConfiguration("rust", {
+                onEnterRules: [
+                    {
+                        // Doc single-line comment
+                        // e.g. ///|
+                        beforeText: /^\s*\/{3}.*$/,
+                        action: { indentAction, appendText: "/// " },
+                    },
+                    {
+                        // Parent doc single-line comment
+                        // e.g. //!|
+                        beforeText: /^\s*\/{2}\!.*$/,
+                        action: { indentAction, appendText: "//! " },
+                    },
+                    {
+                        // Begins an auto-closed multi-line comment (standard or parent doc)
+                        // e.g. /** | */ or /*! | */
+                        beforeText: /^\s*\/\*(\*|\!)(?!\/)([^\*]|\*(?!\/))*$/,
+                        afterText: /^\s*\*\/$/,
+                        action: {
+                            indentAction: vscode.IndentAction.IndentOutdent,
+                            appendText: " * ",
+                        },
+                    },
+                    {
+                        // Begins a multi-line comment (standard or parent doc)
+                        // e.g. /** ...| or /*! ...|
+                        beforeText: /^\s*\/\*(\*|\!)(?!\/)([^\*]|\*(?!\/))*$/,
+                        action: { indentAction, appendText: " * " },
+                    },
+                    {
+                        // Continues a multi-line comment
+                        // e.g.  * ...|
+                        beforeText: /^(\ \ )*\ \*(\ ([^\*]|\*(?!\/))*)?$/,
+                        action: { indentAction, appendText: "* " },
+                    },
+                    {
+                        // Dedents after closing a multi-line comment
+                        // e.g.  */|
+                        beforeText: /^(\ \ )*\ \*\/\s*$/,
+                        action: { indentAction, removeText: 1 },
+                    },
+                ],
+            });
+        }
+        if (!this.typingContinueCommentsOnNewline && this.configureLang) {
+            this.configureLang.dispose();
+            this.configureLang = undefined;
         }
     }
 
@@ -137,7 +186,21 @@ export class Config {
     }
 
     get runnableEnv() {
-        return this.get<RunnableEnvCfg>("runnableEnv");
+        const item = this.get<any>("runnableEnv");
+        if (!item) return item;
+        const fixRecord = (r: Record<string, any>) => {
+            for (const key in r) {
+                if (typeof r[key] !== "string") {
+                    r[key] = String(r[key]);
+                }
+            }
+        };
+        if (item instanceof Array) {
+            item.forEach((x) => fixRecord(x.env));
+        } else {
+            fixRecord(item);
+        }
+        return item;
     }
 
     get restartServerOnConfigChange() {
@@ -175,106 +238,39 @@ export class Config {
             gotoTypeDef: this.get<boolean>("hover.actions.gotoTypeDef.enable"),
         };
     }
-
-    get currentExtensionIsNightly() {
-        return this.package.releaseTag === NIGHTLY_TAG;
-    }
 }
 
-export async function updateConfig(config: vscode.WorkspaceConfiguration) {
-    const renames = [
-        ["assist.allowMergingIntoGlobImports", "imports.merge.glob"],
-        ["assist.exprFillDefault", "assist.expressionFillDefault"],
-        ["assist.importEnforceGranularity", "imports.granularity.enforce"],
-        ["assist.importGranularity", "imports.granularity.group"],
-        ["assist.importMergeBehavior", "imports.granularity.group"],
-        ["assist.importMergeBehaviour", "imports.granularity.group"],
-        ["assist.importGroup", "imports.group.enable"],
-        ["assist.importPrefix", "imports.prefix"],
-        ["primeCaches.enable", "cachePriming.enable"],
-        ["cache.warmup", "cachePriming.enable"],
-        ["cargo.loadOutDirsFromCheck", "cargo.buildScripts.enable"],
-        ["cargo.runBuildScripts", "cargo.buildScripts.enable"],
-        ["cargo.runBuildScriptsCommand", "cargo.buildScripts.overrideCommand"],
-        ["cargo.useRustcWrapperForBuildScripts", "cargo.buildScripts.useRustcWrapper"],
-        ["completion.snippets", "completion.snippets.custom"],
-        ["diagnostics.enableExperimental", "diagnostics.experimental.enable"],
-        ["experimental.procAttrMacros", "procMacro.attributes.enable"],
-        ["highlighting.strings", "semanticHighlighting.strings.enable"],
-        ["highlightRelated.breakPoints", "highlightRelated.breakPoints.enable"],
-        ["highlightRelated.exitPoints", "highlightRelated.exitPoints.enable"],
-        ["highlightRelated.yieldPoints", "highlightRelated.yieldPoints.enable"],
-        ["highlightRelated.references", "highlightRelated.references.enable"],
-        ["hover.documentation", "hover.documentation.enable"],
-        ["hover.linksInHover", "hover.links.enable"],
-        ["hoverActions.linksInHover", "hover.links.enable"],
-        ["hoverActions.debug", "hover.actions.debug.enable"],
-        ["hoverActions.enable", "hover.actions.enable.enable"],
-        ["hoverActions.gotoTypeDef", "hover.actions.gotoTypeDef.enable"],
-        ["hoverActions.implementations", "hover.actions.implementations.enable"],
-        ["hoverActions.references", "hover.actions.references.enable"],
-        ["hoverActions.run", "hover.actions.run.enable"],
-        ["inlayHints.chainingHints", "inlayHints.chainingHints.enable"],
-        ["inlayHints.closureReturnTypeHints", "inlayHints.closureReturnTypeHints.enable"],
-        ["inlayHints.hideNamedConstructorHints", "inlayHints.typeHints.hideNamedConstructor"],
-        ["inlayHints.parameterHints", "inlayHints.parameterHints.enable"],
-        ["inlayHints.reborrowHints", "inlayHints.reborrowHints.enable"],
-        ["inlayHints.typeHints", "inlayHints.typeHints.enable"],
-        ["lruCapacity", "lru.capacity"],
-        ["runnables.cargoExtraArgs", "runnables.extraArgs"],
-        ["runnables.overrideCargo", "runnables.command"],
-        ["rustcSource", "rustc.source"],
-        ["rustfmt.enableRangeFormatting", "rustfmt.rangeFormatting.enable"],
-    ];
+const VarRegex = new RegExp(/\$\{(.+?)\}/g);
 
-    for (const [oldKey, newKey] of renames) {
-        const inspect = config.inspect(oldKey);
-        if (inspect !== undefined) {
-            const valMatrix = [
-                {
-                    val: inspect.globalValue,
-                    langVal: inspect.globalLanguageValue,
-                    target: vscode.ConfigurationTarget.Global,
-                },
-                {
-                    val: inspect.workspaceFolderValue,
-                    langVal: inspect.workspaceFolderLanguageValue,
-                    target: vscode.ConfigurationTarget.WorkspaceFolder,
-                },
-                {
-                    val: inspect.workspaceValue,
-                    langVal: inspect.workspaceLanguageValue,
-                    target: vscode.ConfigurationTarget.Workspace,
-                },
-            ];
-            for (const { val, langVal, target } of valMatrix) {
-                const patch = (val: unknown) => {
-                    // some of the updates we do only append "enable" or "custom"
-                    // that means on the next run we would find these again, but as objects with
-                    // these properties causing us to destroy the config
-                    // so filter those already updated ones out
-                    return (
-                        val !== undefined &&
-                        !(
-                            typeof val === "object" &&
-                            val !== null &&
-                            (oldKey === "completion.snippets" || !val.hasOwnProperty("custom"))
-                        )
-                    );
-                };
-                if (patch(val)) {
-                    await config.update(newKey, val, target, false);
-                    await config.update(oldKey, undefined, target, false);
-                }
-                if (patch(langVal)) {
-                    await config.update(newKey, langVal, target, true);
-                    await config.update(oldKey, undefined, target, true);
-                }
-            }
+export function substituteVSCodeVariableInString(val: string): string {
+    return val.replace(VarRegex, (substring: string, varName) => {
+        if (typeof varName === "string") {
+            return computeVscodeVar(varName) || substring;
+        } else {
+            return substring;
         }
-    }
+    });
 }
 
+export function substituteVSCodeVariables(resp: any): any {
+    if (typeof resp === "string") {
+        return substituteVSCodeVariableInString(resp);
+    } else if (resp && Array.isArray(resp)) {
+        return resp.map((val) => {
+            return substituteVSCodeVariables(val);
+        });
+    } else if (resp && typeof resp === "object") {
+        const res: { [key: string]: any } = {};
+        for (const key in resp) {
+            const val = resp[key];
+            res[key] = substituteVSCodeVariables(val);
+        }
+        return res;
+    } else if (typeof resp === "function") {
+        return null;
+    }
+    return resp;
+}
 export function substituteVariablesInEnv(env: Env): Env {
     const missingDeps = new Set<string>();
     // vscode uses `env:ENV_NAME` for env vars resolution, and it's easier
@@ -321,7 +317,7 @@ export function substituteVariablesInEnv(env: Env): Env {
             }
         } else {
             envWithDeps[dep] = {
-                value: computeVscodeVar(dep),
+                value: computeVscodeVar(dep) || "${" + dep + "}",
                 deps: [],
             };
         }
@@ -352,37 +348,34 @@ export function substituteVariablesInEnv(env: Env): Env {
     return resolvedEnv;
 }
 
-function computeVscodeVar(varName: string): string {
+function computeVscodeVar(varName: string): string | null {
+    const workspaceFolder = () => {
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        if (folders.length === 1) {
+            // TODO: support for remote workspaces?
+            return folders[0].uri.fsPath;
+        } else if (folders.length > 1) {
+            // could use currently opened document to detect the correct
+            // workspace. However, that would be determined by the document
+            // user has opened on Editor startup. Could lead to
+            // unpredictable workspace selection in practice.
+            // It's better to pick the first one
+            return folders[0].uri.fsPath;
+        } else {
+            // no workspace opened
+            return "";
+        }
+    };
     // https://code.visualstudio.com/docs/editor/variables-reference
     const supportedVariables: { [k: string]: () => string } = {
-        workspaceFolder: () => {
-            const folders = vscode.workspace.workspaceFolders ?? [];
-            if (folders.length === 1) {
-                // TODO: support for remote workspaces?
-                return folders[0].uri.fsPath;
-            } else if (folders.length > 1) {
-                // could use currently opened document to detect the correct
-                // workspace. However, that would be determined by the document
-                // user has opened on Editor startup. Could lead to
-                // unpredictable workspace selection in practice.
-                // It's better to pick the first one
-                return folders[0].uri.fsPath;
-            } else {
-                // no workspace opened
-                return "";
-            }
-        },
+        workspaceFolder,
 
         workspaceFolderBasename: () => {
-            const workspaceFolder = computeVscodeVar("workspaceFolder");
-            if (workspaceFolder) {
-                return path.basename(workspaceFolder);
-            } else {
-                return "";
-            }
+            return path.basename(workspaceFolder());
         },
 
         cwd: () => process.cwd(),
+        userHome: () => os.homedir(),
 
         // see
         // https://github.com/microsoft/vscode/blob/08ac1bb67ca2459496b272d8f4a908757f24f56f/src/vs/workbench/api/common/extHostVariableResolverService.ts#L81
@@ -396,7 +389,7 @@ function computeVscodeVar(varName: string): string {
     if (varName in supportedVariables) {
         return supportedVariables[varName]();
     } else {
-        // can't resolve, keep the expression as is
-        return "${" + varName + "}";
+        // return "${" + varName + "}";
+        return null;
     }
 }

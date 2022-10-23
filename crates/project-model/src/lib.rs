@@ -3,7 +3,7 @@
 //!
 //! Pure model is represented by the [`base_db::CrateGraph`] from another crate.
 //!
-//! In this crate, we are conserned with "real world" project models.
+//! In this crate, we are concerned with "real world" project models.
 //!
 //! Specifically, here we have a representation for a Cargo project
 //! ([`CargoWorkspace`]) and for manually specified layout ([`ProjectJson`]).
@@ -42,8 +42,8 @@ use rustc_hash::FxHashSet;
 pub use crate::{
     build_scripts::WorkspaceBuildScripts,
     cargo_workspace::{
-        CargoConfig, CargoWorkspace, Package, PackageData, PackageDependency, RustcSource, Target,
-        TargetData, TargetKind, UnsetTestCrates,
+        CargoConfig, CargoFeatures, CargoWorkspace, Package, PackageData, PackageDependency,
+        RustcSource, Target, TargetData, TargetKind, UnsetTestCrates,
     },
     manifest_path::ManifestPath,
     project_json::{ProjectJson, ProjectJsonData},
@@ -67,7 +67,7 @@ impl ProjectManifest {
         if path.file_name().unwrap_or_default() == "Cargo.toml" {
             return Ok(ProjectManifest::CargoToml(path));
         }
-        bail!("project root must point to Cargo.toml or rust-project.json: {}", path.display())
+        bail!("project root must point to Cargo.toml or rust-project.json: {}", path.display());
     }
 
     pub fn discover_single(path: &AbsPath) -> Result<ProjectManifest> {
@@ -78,7 +78,7 @@ impl ProjectManifest {
         };
 
         if !candidates.is_empty() {
-            bail!("more than one project")
+            bail!("more than one project");
         }
         Ok(res)
     }
@@ -156,4 +156,18 @@ fn utf8_stdout(mut cmd: Command) -> Result<String> {
     }
     let stdout = String::from_utf8(output.stdout)?;
     Ok(stdout.trim().to_string())
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum InvocationStrategy {
+    Once,
+    #[default]
+    PerWorkspace,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum InvocationLocation {
+    Root(AbsPathBuf),
+    #[default]
+    Workspace,
 }

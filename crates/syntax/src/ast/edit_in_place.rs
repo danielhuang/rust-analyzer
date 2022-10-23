@@ -235,6 +235,24 @@ impl ast::GenericParamList {
             }
         }
     }
+
+    /// Constructs a matching [`ast::GenericArgList`]
+    pub fn to_generic_args(&self) -> ast::GenericArgList {
+        let args = self.generic_params().filter_map(|param| match param {
+            ast::GenericParam::LifetimeParam(it) => {
+                Some(ast::GenericArg::LifetimeArg(make::lifetime_arg(it.lifetime()?)))
+            }
+            ast::GenericParam::TypeParam(it) => {
+                Some(ast::GenericArg::TypeArg(make::type_arg(make::ext::ty_name(it.name()?))))
+            }
+            ast::GenericParam::ConstParam(it) => {
+                // Name-only const params get parsed as `TypeArg`s
+                Some(ast::GenericArg::TypeArg(make::type_arg(make::ext::ty_name(it.name()?))))
+            }
+        });
+
+        make::generic_arg_list(args)
+    }
 }
 
 impl ast::WhereClause {
@@ -248,8 +266,48 @@ impl ast::WhereClause {
     }
 }
 
-impl ast::TypeBoundList {
-    pub fn remove(&self) {
+impl ast::TypeParam {
+    pub fn remove_default(&self) {
+        if let Some((eq, last)) = self
+            .syntax()
+            .children_with_tokens()
+            .find(|it| it.kind() == T![=])
+            .zip(self.syntax().last_child_or_token())
+        {
+            ted::remove_all(eq..=last);
+
+            // remove any trailing ws
+            if let Some(last) = self.syntax().last_token().filter(|it| it.kind() == WHITESPACE) {
+                last.detach();
+            }
+        }
+    }
+}
+
+impl ast::ConstParam {
+    pub fn remove_default(&self) {
+        if let Some((eq, last)) = self
+            .syntax()
+            .children_with_tokens()
+            .find(|it| it.kind() == T![=])
+            .zip(self.syntax().last_child_or_token())
+        {
+            ted::remove_all(eq..=last);
+
+            // remove any trailing ws
+            if let Some(last) = self.syntax().last_token().filter(|it| it.kind() == WHITESPACE) {
+                last.detach();
+            }
+        }
+    }
+}
+
+pub trait Removable: AstNode {
+    fn remove(&self);
+}
+
+impl Removable for ast::TypeBoundList {
+    fn remove(&self) {
         match self.syntax().siblings_with_tokens(Direction::Prev).find(|it| it.kind() == T![:]) {
             Some(colon) => ted::remove_all(colon..=self.syntax().clone().into()),
             None => ted::remove(self.syntax()),
@@ -260,15 +318,15 @@ impl ast::TypeBoundList {
 impl ast::PathSegment {
     pub fn get_or_create_generic_arg_list(&self) -> ast::GenericArgList {
         if self.generic_arg_list().is_none() {
-            let arg_list = make::generic_arg_list().clone_for_update();
+            let arg_list = make::generic_arg_list(empty()).clone_for_update();
             ted::append_child(self.syntax(), arg_list.syntax());
         }
         self.generic_arg_list().unwrap()
     }
 }
 
-impl ast::UseTree {
-    pub fn remove(&self) {
+impl Removable for ast::UseTree {
+    fn remove(&self) {
         for dir in [Direction::Next, Direction::Prev] {
             if let Some(next_use_tree) = neighbor(self, dir) {
                 let separators = self
@@ -282,7 +340,9 @@ impl ast::UseTree {
         }
         ted::remove(self.syntax());
     }
+}
 
+impl ast::UseTree {
     pub fn get_or_create_use_tree_list(&self) -> ast::UseTreeList {
         match self.use_tree_list() {
             Some(it) => it,
@@ -373,8 +433,8 @@ impl ast::UseTreeList {
     }
 }
 
-impl ast::Use {
-    pub fn remove(&self) {
+impl Removable for ast::Use {
+    fn remove(&self) {
         let next_ws = self
             .syntax()
             .next_sibling_or_token()
@@ -444,8 +504,8 @@ impl ast::Fn {
     }
 }
 
-impl ast::MatchArm {
-    pub fn remove(&self) {
+impl Removable for ast::MatchArm {
+    fn remove(&self) {
         if let Some(sibling) = self.syntax().prev_sibling_or_token() {
             if sibling.kind() == SyntaxKind::WHITESPACE {
                 ted::remove(sibling);
@@ -585,7 +645,7 @@ impl ast::RecordPatFieldList {
 }
 
 fn get_or_insert_comma_after(syntax: &SyntaxNode) -> SyntaxToken {
-    let comma = match syntax
+    match syntax
         .siblings_with_tokens(Direction::Next)
         .filter_map(|it| it.into_token())
         .find(|it| it.kind() == T![,])
@@ -596,8 +656,7 @@ fn get_or_insert_comma_after(syntax: &SyntaxNode) -> SyntaxToken {
             ted::insert(Position::after(syntax), &comma);
             comma
         }
-    };
-    comma
+    }
 }
 
 impl ast::StmtList {

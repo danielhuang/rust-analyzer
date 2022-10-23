@@ -184,10 +184,10 @@ pub(crate) fn resolve_doc_path_for_def(
         Definition::TypeAlias(it) => it.resolve_doc_path(db, link, ns),
         Definition::Macro(it) => it.resolve_doc_path(db, link, ns),
         Definition::Field(it) => it.resolve_doc_path(db, link, ns),
+        Definition::SelfType(it) => it.resolve_doc_path(db, link, ns),
         Definition::BuiltinAttr(_)
         | Definition::ToolModule(_)
         | Definition::BuiltinType(_)
-        | Definition::SelfType(_)
         | Definition::Local(_)
         | Definition::GenericParam(_)
         | Definition::Label(_)
@@ -232,8 +232,13 @@ pub(crate) fn token_as_doc_comment(doc_token: &SyntaxToken) -> Option<DocComment
     (match_ast! {
         match doc_token {
             ast::Comment(comment) => TextSize::try_from(comment.prefix().len()).ok(),
-            ast::String(string) => doc_token.parent_ancestors().find_map(ast::Attr::cast)
-                .filter(|attr| attr.simple_name().as_deref() == Some("doc")).and_then(|_| string.open_quote_text_range().map(|it| it.len())),
+            ast::String(string) => {
+                doc_token.parent_ancestors().find_map(ast::Attr::cast).filter(|attr| attr.simple_name().as_deref() == Some("doc"))?;
+                if doc_token.parent_ancestors().find_map(ast::MacroCall::cast).filter(|mac| mac.path().and_then(|p| p.segment()?.name_ref()).as_ref().map(|n| n.text()).as_deref() == Some("include_str")).is_some() {
+                    return None;
+                }
+                string.open_quote_text_range().map(|it| it.len())
+            },
             _ => None,
         }
     }).map(|prefix_len| DocCommentToken { prefix_len, doc_token: doc_token.clone() })

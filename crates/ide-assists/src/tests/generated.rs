@@ -408,6 +408,47 @@ fn main() {
 }
 
 #[test]
+fn doctest_convert_named_struct_to_tuple_struct() {
+    check_doc_test(
+        "convert_named_struct_to_tuple_struct",
+        r#####"
+struct Point$0 { x: f32, y: f32 }
+
+impl Point {
+    pub fn new(x: f32, y: f32) -> Self {
+        Point { x, y }
+    }
+
+    pub fn x(&self) -> f32 {
+        self.x
+    }
+
+    pub fn y(&self) -> f32 {
+        self.y
+    }
+}
+"#####,
+        r#####"
+struct Point(f32, f32);
+
+impl Point {
+    pub fn new(x: f32, y: f32) -> Self {
+        Point(x, y)
+    }
+
+    pub fn x(&self) -> f32 {
+        self.0
+    }
+
+    pub fn y(&self) -> f32 {
+        self.1
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_convert_to_guarded_return() {
     check_doc_test(
         "convert_to_guarded_return",
@@ -467,6 +508,26 @@ impl Point {
     pub fn y(&self) -> f32 {
         self.field2
     }
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_convert_two_arm_bool_match_to_matches_macro() {
+    check_doc_test(
+        "convert_two_arm_bool_match_to_matches_macro",
+        r#####"
+fn main() {
+    match scrutinee$0 {
+        Some(val) if val.cond() => true,
+        _ => false,
+    }
+}
+"#####,
+        r#####"
+fn main() {
+    matches!(scrutinee, Some(val) if val.cond())
 }
 "#####,
     )
@@ -1357,6 +1418,31 @@ fn main() {
 }
 
 #[test]
+fn doctest_inline_type_alias_uses() {
+    check_doc_test(
+        "inline_type_alias_uses",
+        r#####"
+type $0A = i32;
+fn id(x: A) -> A {
+    x
+};
+fn foo() {
+    let _: A = 3;
+}
+"#####,
+        r#####"
+
+fn id(x: i32) -> i32 {
+    x
+};
+fn foo() {
+    let _: i32 = 3;
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_introduce_named_generic() {
     check_doc_test(
         "introduce_named_generic",
@@ -1541,6 +1627,37 @@ fn apply<T, U, $0F: FnOnce(T) -> U>(f: F, x: T) -> U {
         r#####"
 fn apply<T, U, F>(f: F, x: T) -> U where F: FnOnce(T) -> U {
     f(x)
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_move_format_string_arg() {
+    check_doc_test(
+        "move_format_string_arg",
+        r#####"
+macro_rules! format_args {
+    ($lit:literal $(tt:tt)*) => { 0 },
+}
+macro_rules! print {
+    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
+}
+
+fn main() {
+    print!("{x + 1}$0");
+}
+"#####,
+        r#####"
+macro_rules! format_args {
+    ($lit:literal $(tt:tt)*) => { 0 },
+}
+macro_rules! print {
+    ($($arg:tt)*) => (std::io::_print(format_args!($($arg)*)));
+}
+
+fn main() {
+    print!("{}"$0, x + 1);
 }
 "#####,
     )
@@ -1985,6 +2102,46 @@ fn handle(action: Action) {
 }
 
 #[test]
+fn doctest_replace_or_else_with_or() {
+    check_doc_test(
+        "replace_or_else_with_or",
+        r#####"
+//- minicore:option
+fn foo() {
+    let a = Some(1);
+    a.unwra$0p_or_else(|| 2);
+}
+"#####,
+        r#####"
+fn foo() {
+    let a = Some(1);
+    a.unwrap_or(2);
+}
+"#####,
+    )
+}
+
+#[test]
+fn doctest_replace_or_with_or_else() {
+    check_doc_test(
+        "replace_or_with_or_else",
+        r#####"
+//- minicore:option
+fn foo() {
+    let a = Some(1);
+    a.unwra$0p_or(2);
+}
+"#####,
+        r#####"
+fn foo() {
+    let a = Some(1);
+    a.unwrap_or_else(|| 2);
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_replace_qualified_name_with_use() {
     check_doc_test(
         "replace_qualified_name_with_use",
@@ -2183,6 +2340,32 @@ fn arithmetics {
 }
 
 #[test]
+fn doctest_unmerge_match_arm() {
+    check_doc_test(
+        "unmerge_match_arm",
+        r#####"
+enum Action { Move { distance: u32 }, Stop }
+
+fn handle(action: Action) {
+    match action {
+        Action::Move(..) $0| Action::Stop => foo(),
+    }
+}
+"#####,
+        r#####"
+enum Action { Move { distance: u32 }, Stop }
+
+fn handle(action: Action) {
+    match action {
+        Action::Move(..) => foo(),
+        Action::Stop => foo(),
+    }
+}
+"#####,
+    )
+}
+
+#[test]
 fn doctest_unmerge_use() {
     check_doc_test(
         "unmerge_use",
@@ -2240,6 +2423,25 @@ fn foo() -> Result<i32>$0 { Ok(42i32) }
 "#####,
         r#####"
 fn foo() -> i32 { 42i32 }
+"#####,
+    )
+}
+
+#[test]
+fn doctest_unwrap_tuple() {
+    check_doc_test(
+        "unwrap_tuple",
+        r#####"
+//- minicore: result
+fn main() {
+    $0let (foo, bar) = ("Foo", "Bar");
+}
+"#####,
+        r#####"
+fn main() {
+    let foo = "Foo";
+    let bar = "Bar";
+}
 "#####,
     )
 }

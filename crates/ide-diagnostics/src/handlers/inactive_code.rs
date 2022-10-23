@@ -106,18 +106,17 @@ fn f() {
 
     #[test]
     fn inactive_assoc_item() {
-        // FIXME these currently don't work, hence the *
         check(
             r#"
 struct Foo;
 impl Foo {
     #[cfg(any())] pub fn f() {}
-  //*************************** weak: code is inactive due to #[cfg] directives
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives
 }
 
 trait Bar {
     #[cfg(any())] pub fn f() {}
-  //*************************** weak: code is inactive due to #[cfg] directives
+  //^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives
 }
 "#,
         );
@@ -138,6 +137,37 @@ trait Bar {
 
     #[cfg_attr(not(never), inline, cfg(no))] fn h() {}
   //^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: no is disabled
+"#,
+        );
+    }
+
+    #[test]
+    fn inactive_fields_and_variants() {
+        check(
+            r#"
+enum Foo {
+  #[cfg(a)] Bar,
+//^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: a is disabled
+  Baz {
+    #[cfg(a)] baz: String,
+  //^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: a is disabled
+  },
+  Qux(#[cfg(a)] String),
+    //^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: a is disabled
+}
+
+struct Baz {
+  #[cfg(a)] baz: String,
+//^^^^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: a is disabled
+}
+
+struct Qux(#[cfg(a)] String);
+         //^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: a is disabled
+
+union FooBar {
+  #[cfg(a)] baz: u32,
+//^^^^^^^^^^^^^^^^^^ weak: code is inactive due to #[cfg] directives: a is disabled
+}
 "#,
         );
     }

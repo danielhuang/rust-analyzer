@@ -221,8 +221,16 @@ pub fn expand_speculative(
     fixup::reverse_fixups(&mut speculative_expansion.value, &spec_args_tmap, &fixups.undo_info);
     let (node, rev_tmap) = token_tree_to_syntax_node(&speculative_expansion.value, expand_to);
 
-    let range = rev_tmap.first_range_by_token(token_id, token_to_map.kind())?;
-    let token = node.syntax_node().covering_element(range).into_token()?;
+    let syntax_node = node.syntax_node();
+    let token = rev_tmap
+        .ranges_by_token(token_id, token_to_map.kind())
+        .filter_map(|range| syntax_node.covering_element(range).into_token())
+        .min_by_key(|t| {
+            // prefer tokens of the same kind and text
+            // Note the inversion of the score here, as we want to prefer the first token in case
+            // of all tokens having the same score
+            (t.kind() != token_to_map.kind()) as u8 + (t.text() != token_to_map.text()) as u8
+        })?;
     Some((node.syntax_node(), token))
 }
 
@@ -321,7 +329,11 @@ fn censor_for_macro_input(loc: &MacroCallLoc, node: &SyntaxNode) -> FxHashSet<Sy
                 ast::Item::cast(node.clone())?
                     .attrs()
                     .take(derive_attr_index as usize + 1)
-                    // FIXME
+                    // FIXME, this resolution should not be done syntactically
+                    // derive is a proper macro now, no longer builtin
+                    // But we do not have resolution at this stage, this means
+                    // we need to know about all macro calls for the given ast item here
+                    // so we require some kind of mapping...
                     .filter(|attr| attr.simple_name().as_deref() == Some("derive"))
                     .map(|it| it.syntax().clone())
                     .collect()

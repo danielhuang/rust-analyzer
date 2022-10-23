@@ -2,8 +2,8 @@
 use itertools::Itertools;
 use parser::T;
 use syntax::{
-    ast::{self, HasLoopBody, PathSegmentKind, VisibilityKind},
-    AstNode, Preorder, RustLanguage, WalkEvent,
+    ast::{self, HasLoopBody, MacroCall, PathSegmentKind, VisibilityKind},
+    AstNode, AstToken, Preorder, RustLanguage, WalkEvent,
 };
 
 pub fn expr_as_name_ref(expr: &ast::Expr) -> Option<ast::NameRef> {
@@ -315,7 +315,6 @@ pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
         | ast::Expr::IndexExpr(_)
         | ast::Expr::Literal(_)
         | ast::Expr::MacroExpr(_)
-        | ast::Expr::MacroStmts(_)
         | ast::Expr::MethodCallExpr(_)
         | ast::Expr::ParenExpr(_)
         | ast::Expr::PathExpr(_)
@@ -457,4 +456,9 @@ pub fn parse_tt_as_comma_sep_paths(input: ast::TokenTree) -> Option<Vec<ast::Pat
         })
         .collect();
     Some(paths)
+}
+
+pub fn macro_call_for_string_token(string: &ast::String) -> Option<MacroCall> {
+    let macro_call = string.syntax().parent_ancestors().find_map(ast::MacroCall::cast)?;
+    Some(macro_call)
 }

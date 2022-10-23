@@ -92,13 +92,17 @@ fn rooted_project_json(data: ProjectJsonData) -> ProjectJson {
 }
 
 fn to_crate_graph(project_workspace: ProjectWorkspace) -> CrateGraph {
-    project_workspace.to_crate_graph(&mut |_, _| Ok(Vec::new()), &mut {
-        let mut counter = 0;
-        move |_path| {
-            counter += 1;
-            Some(FileId(counter))
-        }
-    })
+    project_workspace.to_crate_graph(
+        &mut |_, _| Ok(Vec::new()),
+        &mut {
+            let mut counter = 0;
+            move |_path| {
+                counter += 1;
+                Some(FileId(counter))
+            }
+        },
+        &Default::default(),
+    )
 }
 
 fn check_crate_graph(crate_graph: CrateGraph, expect: Expect) {
@@ -181,147 +185,8 @@ fn cargo_hello_world_project_model_with_wildcard_overrides() {
                         ),
                         origin: CratesIo {
                             repo: None,
-                        },
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        2,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            3,
-                        ),
-                        edition: Edition2018,
-                        version: Some(
-                            "0.1.0",
-                        ),
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "an_example",
-                                ),
-                                canonical_name: "an-example",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                            ],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                            ],
-                        ),
-                        env: Env {
-                            entries: {
-                                "CARGO_PKG_LICENSE": "",
-                                "CARGO_PKG_VERSION_MAJOR": "0",
-                                "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
-                                "CARGO_PKG_VERSION": "0.1.0",
-                                "CARGO_PKG_AUTHORS": "",
-                                "CARGO_CRATE_NAME": "hello_world",
-                                "CARGO_PKG_LICENSE_FILE": "",
-                                "CARGO_PKG_HOMEPAGE": "",
-                                "CARGO_PKG_DESCRIPTION": "",
-                                "CARGO_PKG_NAME": "hello-world",
-                                "CARGO_PKG_VERSION_PATCH": "0",
-                                "CARGO": "cargo",
-                                "CARGO_PKG_REPOSITORY": "",
-                                "CARGO_PKG_VERSION_MINOR": "1",
-                                "CARGO_PKG_VERSION_PRE": "",
-                            },
-                        },
-                        dependencies: [
-                            Dependency {
-                                crate_id: CrateId(
-                                    0,
-                                ),
-                                name: CrateName(
-                                    "hello_world",
-                                ),
-                                prelude: true,
-                            },
-                            Dependency {
-                                crate_id: CrateId(
-                                    4,
-                                ),
-                                name: CrateName(
-                                    "libc",
-                                ),
-                                prelude: true,
-                            },
-                        ],
-                        proc_macro: Err(
-                            "crate has not (yet) been built",
-                        ),
-                        origin: CratesIo {
-                            repo: None,
-                        },
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        4,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            5,
-                        ),
-                        edition: Edition2015,
-                        version: Some(
-                            "0.2.98",
-                        ),
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "libc",
-                                ),
-                                canonical_name: "libc",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "feature=default",
-                                "feature=std",
-                            ],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "feature=align",
-                                "feature=const-extern-fn",
-                                "feature=default",
-                                "feature=extra_traits",
-                                "feature=rustc-dep-of-std",
-                                "feature=std",
-                                "feature=use_std",
-                            ],
-                        ),
-                        env: Env {
-                            entries: {
-                                "CARGO_PKG_LICENSE": "",
-                                "CARGO_PKG_VERSION_MAJOR": "0",
-                                "CARGO_MANIFEST_DIR": "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
-                                "CARGO_PKG_VERSION": "0.2.98",
-                                "CARGO_PKG_AUTHORS": "",
-                                "CARGO_CRATE_NAME": "libc",
-                                "CARGO_PKG_LICENSE_FILE": "",
-                                "CARGO_PKG_HOMEPAGE": "",
-                                "CARGO_PKG_DESCRIPTION": "",
-                                "CARGO_PKG_NAME": "libc",
-                                "CARGO_PKG_VERSION_PATCH": "98",
-                                "CARGO": "cargo",
-                                "CARGO_PKG_REPOSITORY": "",
-                                "CARGO_PKG_VERSION_MINOR": "2",
-                                "CARGO_PKG_VERSION_PRE": "",
-                            },
-                        },
-                        dependencies: [],
-                        proc_macro: Err(
-                            "crate has not (yet) been built",
-                        ),
-                        origin: CratesIo {
-                            repo: Some(
-                                "https://github.com/rust-lang/libc",
+                            name: Some(
+                                "hello-world",
                             ),
                         },
                         is_proc_macro: false,
@@ -398,6 +263,87 @@ fn cargo_hello_world_project_model_with_wildcard_overrides() {
                         ),
                         origin: CratesIo {
                             repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
+                        },
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        2,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            3,
+                        ),
+                        edition: Edition2018,
+                        version: Some(
+                            "0.1.0",
+                        ),
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "an_example",
+                                ),
+                                canonical_name: "an-example",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                            ],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                            ],
+                        ),
+                        env: Env {
+                            entries: {
+                                "CARGO_PKG_LICENSE": "",
+                                "CARGO_PKG_VERSION_MAJOR": "0",
+                                "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                                "CARGO_PKG_VERSION": "0.1.0",
+                                "CARGO_PKG_AUTHORS": "",
+                                "CARGO_CRATE_NAME": "hello_world",
+                                "CARGO_PKG_LICENSE_FILE": "",
+                                "CARGO_PKG_HOMEPAGE": "",
+                                "CARGO_PKG_DESCRIPTION": "",
+                                "CARGO_PKG_NAME": "hello-world",
+                                "CARGO_PKG_VERSION_PATCH": "0",
+                                "CARGO": "cargo",
+                                "CARGO_PKG_REPOSITORY": "",
+                                "CARGO_PKG_VERSION_MINOR": "1",
+                                "CARGO_PKG_VERSION_PRE": "",
+                            },
+                        },
+                        dependencies: [
+                            Dependency {
+                                crate_id: CrateId(
+                                    0,
+                                ),
+                                name: CrateName(
+                                    "hello_world",
+                                ),
+                                prelude: true,
+                            },
+                            Dependency {
+                                crate_id: CrateId(
+                                    4,
+                                ),
+                                name: CrateName(
+                                    "libc",
+                                ),
+                                prelude: true,
+                            },
+                        ],
+                        proc_macro: Err(
+                            "crate has not (yet) been built",
+                        ),
+                        origin: CratesIo {
+                            repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
                         },
                         is_proc_macro: false,
                     },
@@ -473,6 +419,79 @@ fn cargo_hello_world_project_model_with_wildcard_overrides() {
                         ),
                         origin: CratesIo {
                             repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
+                        },
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        4,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            5,
+                        ),
+                        edition: Edition2015,
+                        version: Some(
+                            "0.2.98",
+                        ),
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "libc",
+                                ),
+                                canonical_name: "libc",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "feature=default",
+                                "feature=std",
+                            ],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "feature=align",
+                                "feature=const-extern-fn",
+                                "feature=default",
+                                "feature=extra_traits",
+                                "feature=rustc-dep-of-std",
+                                "feature=std",
+                                "feature=use_std",
+                            ],
+                        ),
+                        env: Env {
+                            entries: {
+                                "CARGO_PKG_LICENSE": "",
+                                "CARGO_PKG_VERSION_MAJOR": "0",
+                                "CARGO_MANIFEST_DIR": "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
+                                "CARGO_PKG_VERSION": "0.2.98",
+                                "CARGO_PKG_AUTHORS": "",
+                                "CARGO_CRATE_NAME": "libc",
+                                "CARGO_PKG_LICENSE_FILE": "",
+                                "CARGO_PKG_HOMEPAGE": "",
+                                "CARGO_PKG_DESCRIPTION": "",
+                                "CARGO_PKG_NAME": "libc",
+                                "CARGO_PKG_VERSION_PATCH": "98",
+                                "CARGO": "cargo",
+                                "CARGO_PKG_REPOSITORY": "",
+                                "CARGO_PKG_VERSION_MINOR": "2",
+                                "CARGO_PKG_VERSION_PRE": "",
+                            },
+                        },
+                        dependencies: [],
+                        proc_macro: Err(
+                            "crate has not (yet) been built",
+                        ),
+                        origin: CratesIo {
+                            repo: Some(
+                                "https://github.com/rust-lang/libc",
+                            ),
+                            name: Some(
+                                "libc",
+                            ),
                         },
                         is_proc_macro: false,
                     },
@@ -563,149 +582,8 @@ fn cargo_hello_world_project_model_with_selective_overrides() {
                         ),
                         origin: CratesIo {
                             repo: None,
-                        },
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        2,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            3,
-                        ),
-                        edition: Edition2018,
-                        version: Some(
-                            "0.1.0",
-                        ),
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "an_example",
-                                ),
-                                canonical_name: "an-example",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "test",
-                            ],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "test",
-                            ],
-                        ),
-                        env: Env {
-                            entries: {
-                                "CARGO_PKG_LICENSE": "",
-                                "CARGO_PKG_VERSION_MAJOR": "0",
-                                "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
-                                "CARGO_PKG_VERSION": "0.1.0",
-                                "CARGO_PKG_AUTHORS": "",
-                                "CARGO_CRATE_NAME": "hello_world",
-                                "CARGO_PKG_LICENSE_FILE": "",
-                                "CARGO_PKG_HOMEPAGE": "",
-                                "CARGO_PKG_DESCRIPTION": "",
-                                "CARGO_PKG_NAME": "hello-world",
-                                "CARGO_PKG_VERSION_PATCH": "0",
-                                "CARGO": "cargo",
-                                "CARGO_PKG_REPOSITORY": "",
-                                "CARGO_PKG_VERSION_MINOR": "1",
-                                "CARGO_PKG_VERSION_PRE": "",
-                            },
-                        },
-                        dependencies: [
-                            Dependency {
-                                crate_id: CrateId(
-                                    0,
-                                ),
-                                name: CrateName(
-                                    "hello_world",
-                                ),
-                                prelude: true,
-                            },
-                            Dependency {
-                                crate_id: CrateId(
-                                    4,
-                                ),
-                                name: CrateName(
-                                    "libc",
-                                ),
-                                prelude: true,
-                            },
-                        ],
-                        proc_macro: Err(
-                            "crate has not (yet) been built",
-                        ),
-                        origin: CratesIo {
-                            repo: None,
-                        },
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        4,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            5,
-                        ),
-                        edition: Edition2015,
-                        version: Some(
-                            "0.2.98",
-                        ),
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "libc",
-                                ),
-                                canonical_name: "libc",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "feature=default",
-                                "feature=std",
-                            ],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "feature=align",
-                                "feature=const-extern-fn",
-                                "feature=default",
-                                "feature=extra_traits",
-                                "feature=rustc-dep-of-std",
-                                "feature=std",
-                                "feature=use_std",
-                            ],
-                        ),
-                        env: Env {
-                            entries: {
-                                "CARGO_PKG_LICENSE": "",
-                                "CARGO_PKG_VERSION_MAJOR": "0",
-                                "CARGO_MANIFEST_DIR": "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
-                                "CARGO_PKG_VERSION": "0.2.98",
-                                "CARGO_PKG_AUTHORS": "",
-                                "CARGO_CRATE_NAME": "libc",
-                                "CARGO_PKG_LICENSE_FILE": "",
-                                "CARGO_PKG_HOMEPAGE": "",
-                                "CARGO_PKG_DESCRIPTION": "",
-                                "CARGO_PKG_NAME": "libc",
-                                "CARGO_PKG_VERSION_PATCH": "98",
-                                "CARGO": "cargo",
-                                "CARGO_PKG_REPOSITORY": "",
-                                "CARGO_PKG_VERSION_MINOR": "2",
-                                "CARGO_PKG_VERSION_PRE": "",
-                            },
-                        },
-                        dependencies: [],
-                        proc_macro: Err(
-                            "crate has not (yet) been built",
-                        ),
-                        origin: CratesIo {
-                            repo: Some(
-                                "https://github.com/rust-lang/libc",
+                            name: Some(
+                                "hello-world",
                             ),
                         },
                         is_proc_macro: false,
@@ -784,6 +662,89 @@ fn cargo_hello_world_project_model_with_selective_overrides() {
                         ),
                         origin: CratesIo {
                             repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
+                        },
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        2,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            3,
+                        ),
+                        edition: Edition2018,
+                        version: Some(
+                            "0.1.0",
+                        ),
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "an_example",
+                                ),
+                                canonical_name: "an-example",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "test",
+                            ],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "test",
+                            ],
+                        ),
+                        env: Env {
+                            entries: {
+                                "CARGO_PKG_LICENSE": "",
+                                "CARGO_PKG_VERSION_MAJOR": "0",
+                                "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                                "CARGO_PKG_VERSION": "0.1.0",
+                                "CARGO_PKG_AUTHORS": "",
+                                "CARGO_CRATE_NAME": "hello_world",
+                                "CARGO_PKG_LICENSE_FILE": "",
+                                "CARGO_PKG_HOMEPAGE": "",
+                                "CARGO_PKG_DESCRIPTION": "",
+                                "CARGO_PKG_NAME": "hello-world",
+                                "CARGO_PKG_VERSION_PATCH": "0",
+                                "CARGO": "cargo",
+                                "CARGO_PKG_REPOSITORY": "",
+                                "CARGO_PKG_VERSION_MINOR": "1",
+                                "CARGO_PKG_VERSION_PRE": "",
+                            },
+                        },
+                        dependencies: [
+                            Dependency {
+                                crate_id: CrateId(
+                                    0,
+                                ),
+                                name: CrateName(
+                                    "hello_world",
+                                ),
+                                prelude: true,
+                            },
+                            Dependency {
+                                crate_id: CrateId(
+                                    4,
+                                ),
+                                name: CrateName(
+                                    "libc",
+                                ),
+                                prelude: true,
+                            },
+                        ],
+                        proc_macro: Err(
+                            "crate has not (yet) been built",
+                        ),
+                        origin: CratesIo {
+                            repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
                         },
                         is_proc_macro: false,
                     },
@@ -861,6 +822,79 @@ fn cargo_hello_world_project_model_with_selective_overrides() {
                         ),
                         origin: CratesIo {
                             repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
+                        },
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        4,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            5,
+                        ),
+                        edition: Edition2015,
+                        version: Some(
+                            "0.2.98",
+                        ),
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "libc",
+                                ),
+                                canonical_name: "libc",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "feature=default",
+                                "feature=std",
+                            ],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "feature=align",
+                                "feature=const-extern-fn",
+                                "feature=default",
+                                "feature=extra_traits",
+                                "feature=rustc-dep-of-std",
+                                "feature=std",
+                                "feature=use_std",
+                            ],
+                        ),
+                        env: Env {
+                            entries: {
+                                "CARGO_PKG_LICENSE": "",
+                                "CARGO_PKG_VERSION_MAJOR": "0",
+                                "CARGO_MANIFEST_DIR": "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
+                                "CARGO_PKG_VERSION": "0.2.98",
+                                "CARGO_PKG_AUTHORS": "",
+                                "CARGO_CRATE_NAME": "libc",
+                                "CARGO_PKG_LICENSE_FILE": "",
+                                "CARGO_PKG_HOMEPAGE": "",
+                                "CARGO_PKG_DESCRIPTION": "",
+                                "CARGO_PKG_NAME": "libc",
+                                "CARGO_PKG_VERSION_PATCH": "98",
+                                "CARGO": "cargo",
+                                "CARGO_PKG_REPOSITORY": "",
+                                "CARGO_PKG_VERSION_MINOR": "2",
+                                "CARGO_PKG_VERSION_PRE": "",
+                            },
+                        },
+                        dependencies: [],
+                        proc_macro: Err(
+                            "crate has not (yet) been built",
+                        ),
+                        origin: CratesIo {
+                            repo: Some(
+                                "https://github.com/rust-lang/libc",
+                            ),
+                            name: Some(
+                                "libc",
+                            ),
                         },
                         is_proc_macro: false,
                     },
@@ -942,149 +976,8 @@ fn cargo_hello_world_project_model() {
                         ),
                         origin: CratesIo {
                             repo: None,
-                        },
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        2,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            3,
-                        ),
-                        edition: Edition2018,
-                        version: Some(
-                            "0.1.0",
-                        ),
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "an_example",
-                                ),
-                                canonical_name: "an-example",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "test",
-                            ],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "test",
-                            ],
-                        ),
-                        env: Env {
-                            entries: {
-                                "CARGO_PKG_LICENSE": "",
-                                "CARGO_PKG_VERSION_MAJOR": "0",
-                                "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
-                                "CARGO_PKG_VERSION": "0.1.0",
-                                "CARGO_PKG_AUTHORS": "",
-                                "CARGO_CRATE_NAME": "hello_world",
-                                "CARGO_PKG_LICENSE_FILE": "",
-                                "CARGO_PKG_HOMEPAGE": "",
-                                "CARGO_PKG_DESCRIPTION": "",
-                                "CARGO_PKG_NAME": "hello-world",
-                                "CARGO_PKG_VERSION_PATCH": "0",
-                                "CARGO": "cargo",
-                                "CARGO_PKG_REPOSITORY": "",
-                                "CARGO_PKG_VERSION_MINOR": "1",
-                                "CARGO_PKG_VERSION_PRE": "",
-                            },
-                        },
-                        dependencies: [
-                            Dependency {
-                                crate_id: CrateId(
-                                    0,
-                                ),
-                                name: CrateName(
-                                    "hello_world",
-                                ),
-                                prelude: true,
-                            },
-                            Dependency {
-                                crate_id: CrateId(
-                                    4,
-                                ),
-                                name: CrateName(
-                                    "libc",
-                                ),
-                                prelude: true,
-                            },
-                        ],
-                        proc_macro: Err(
-                            "crate has not (yet) been built",
-                        ),
-                        origin: CratesIo {
-                            repo: None,
-                        },
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        4,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            5,
-                        ),
-                        edition: Edition2015,
-                        version: Some(
-                            "0.2.98",
-                        ),
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "libc",
-                                ),
-                                canonical_name: "libc",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "feature=default",
-                                "feature=std",
-                            ],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [
-                                "debug_assertions",
-                                "feature=align",
-                                "feature=const-extern-fn",
-                                "feature=default",
-                                "feature=extra_traits",
-                                "feature=rustc-dep-of-std",
-                                "feature=std",
-                                "feature=use_std",
-                            ],
-                        ),
-                        env: Env {
-                            entries: {
-                                "CARGO_PKG_LICENSE": "",
-                                "CARGO_PKG_VERSION_MAJOR": "0",
-                                "CARGO_MANIFEST_DIR": "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
-                                "CARGO_PKG_VERSION": "0.2.98",
-                                "CARGO_PKG_AUTHORS": "",
-                                "CARGO_CRATE_NAME": "libc",
-                                "CARGO_PKG_LICENSE_FILE": "",
-                                "CARGO_PKG_HOMEPAGE": "",
-                                "CARGO_PKG_DESCRIPTION": "",
-                                "CARGO_PKG_NAME": "libc",
-                                "CARGO_PKG_VERSION_PATCH": "98",
-                                "CARGO": "cargo",
-                                "CARGO_PKG_REPOSITORY": "",
-                                "CARGO_PKG_VERSION_MINOR": "2",
-                                "CARGO_PKG_VERSION_PRE": "",
-                            },
-                        },
-                        dependencies: [],
-                        proc_macro: Err(
-                            "crate has not (yet) been built",
-                        ),
-                        origin: CratesIo {
-                            repo: Some(
-                                "https://github.com/rust-lang/libc",
+                            name: Some(
+                                "hello-world",
                             ),
                         },
                         is_proc_macro: false,
@@ -1163,6 +1056,89 @@ fn cargo_hello_world_project_model() {
                         ),
                         origin: CratesIo {
                             repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
+                        },
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        2,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            3,
+                        ),
+                        edition: Edition2018,
+                        version: Some(
+                            "0.1.0",
+                        ),
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "an_example",
+                                ),
+                                canonical_name: "an-example",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "test",
+                            ],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "test",
+                            ],
+                        ),
+                        env: Env {
+                            entries: {
+                                "CARGO_PKG_LICENSE": "",
+                                "CARGO_PKG_VERSION_MAJOR": "0",
+                                "CARGO_MANIFEST_DIR": "$ROOT$hello-world",
+                                "CARGO_PKG_VERSION": "0.1.0",
+                                "CARGO_PKG_AUTHORS": "",
+                                "CARGO_CRATE_NAME": "hello_world",
+                                "CARGO_PKG_LICENSE_FILE": "",
+                                "CARGO_PKG_HOMEPAGE": "",
+                                "CARGO_PKG_DESCRIPTION": "",
+                                "CARGO_PKG_NAME": "hello-world",
+                                "CARGO_PKG_VERSION_PATCH": "0",
+                                "CARGO": "cargo",
+                                "CARGO_PKG_REPOSITORY": "",
+                                "CARGO_PKG_VERSION_MINOR": "1",
+                                "CARGO_PKG_VERSION_PRE": "",
+                            },
+                        },
+                        dependencies: [
+                            Dependency {
+                                crate_id: CrateId(
+                                    0,
+                                ),
+                                name: CrateName(
+                                    "hello_world",
+                                ),
+                                prelude: true,
+                            },
+                            Dependency {
+                                crate_id: CrateId(
+                                    4,
+                                ),
+                                name: CrateName(
+                                    "libc",
+                                ),
+                                prelude: true,
+                            },
+                        ],
+                        proc_macro: Err(
+                            "crate has not (yet) been built",
+                        ),
+                        origin: CratesIo {
+                            repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
                         },
                         is_proc_macro: false,
                     },
@@ -1240,6 +1216,79 @@ fn cargo_hello_world_project_model() {
                         ),
                         origin: CratesIo {
                             repo: None,
+                            name: Some(
+                                "hello-world",
+                            ),
+                        },
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        4,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            5,
+                        ),
+                        edition: Edition2015,
+                        version: Some(
+                            "0.2.98",
+                        ),
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "libc",
+                                ),
+                                canonical_name: "libc",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "feature=default",
+                                "feature=std",
+                            ],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [
+                                "debug_assertions",
+                                "feature=align",
+                                "feature=const-extern-fn",
+                                "feature=default",
+                                "feature=extra_traits",
+                                "feature=rustc-dep-of-std",
+                                "feature=std",
+                                "feature=use_std",
+                            ],
+                        ),
+                        env: Env {
+                            entries: {
+                                "CARGO_PKG_LICENSE": "",
+                                "CARGO_PKG_VERSION_MAJOR": "0",
+                                "CARGO_MANIFEST_DIR": "$ROOT$.cargo/registry/src/github.com-1ecc6299db9ec823/libc-0.2.98",
+                                "CARGO_PKG_VERSION": "0.2.98",
+                                "CARGO_PKG_AUTHORS": "",
+                                "CARGO_CRATE_NAME": "libc",
+                                "CARGO_PKG_LICENSE_FILE": "",
+                                "CARGO_PKG_HOMEPAGE": "",
+                                "CARGO_PKG_DESCRIPTION": "",
+                                "CARGO_PKG_NAME": "libc",
+                                "CARGO_PKG_VERSION_PATCH": "98",
+                                "CARGO": "cargo",
+                                "CARGO_PKG_REPOSITORY": "",
+                                "CARGO_PKG_VERSION_MINOR": "2",
+                                "CARGO_PKG_VERSION_PRE": "",
+                            },
+                        },
+                        dependencies: [],
+                        proc_macro: Err(
+                            "crate has not (yet) been built",
+                        ),
+                        origin: CratesIo {
+                            repo: Some(
+                                "https://github.com/rust-lang/libc",
+                            ),
+                            name: Some(
+                                "libc",
+                            ),
                         },
                         is_proc_macro: false,
                     },
@@ -1301,19 +1350,53 @@ fn rust_project_hello_world_project_model() {
                         is_proc_macro: false,
                     },
                     CrateId(
-                        10,
+                        1,
                     ): CrateData {
                         root_file_id: FileId(
-                            11,
+                            2,
                         ),
                         edition: Edition2018,
                         version: None,
                         display_name: Some(
                             CrateDisplayName {
                                 crate_name: CrateName(
-                                    "unwind",
+                                    "core",
                                 ),
-                                canonical_name: "unwind",
+                                canonical_name: "core",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [],
+                        ),
+                        env: Env {
+                            entries: {},
+                        },
+                        dependencies: [],
+                        proc_macro: Err(
+                            "no proc macro loaded for sysroot crate",
+                        ),
+                        origin: Lang(
+                            Core,
+                        ),
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        2,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            3,
+                        ),
+                        edition: Edition2018,
+                        version: None,
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "panic_abort",
+                                ),
+                                canonical_name: "panic_abort",
                             },
                         ),
                         cfg_options: CfgOptions(
@@ -1335,19 +1418,19 @@ fn rust_project_hello_world_project_model() {
                         is_proc_macro: false,
                     },
                     CrateId(
-                        7,
+                        3,
                     ): CrateData {
                         root_file_id: FileId(
-                            8,
+                            4,
                         ),
                         edition: Edition2018,
                         version: None,
                         display_name: Some(
                             CrateDisplayName {
                                 crate_name: CrateName(
-                                    "std_detect",
+                                    "panic_unwind",
                                 ),
-                                canonical_name: "std_detect",
+                                canonical_name: "panic_unwind",
                             },
                         ),
                         cfg_options: CfgOptions(
@@ -1413,145 +1496,6 @@ fn rust_project_hello_world_project_model() {
                         is_proc_macro: false,
                     },
                     CrateId(
-                        1,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            2,
-                        ),
-                        edition: Edition2018,
-                        version: None,
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "core",
-                                ),
-                                canonical_name: "core",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [],
-                        ),
-                        env: Env {
-                            entries: {},
-                        },
-                        dependencies: [],
-                        proc_macro: Err(
-                            "no proc macro loaded for sysroot crate",
-                        ),
-                        origin: Lang(
-                            Core,
-                        ),
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        11,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            12,
-                        ),
-                        edition: Edition2018,
-                        version: None,
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "hello_world",
-                                ),
-                                canonical_name: "hello_world",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [],
-                        ),
-                        env: Env {
-                            entries: {},
-                        },
-                        dependencies: [
-                            Dependency {
-                                crate_id: CrateId(
-                                    1,
-                                ),
-                                name: CrateName(
-                                    "core",
-                                ),
-                                prelude: true,
-                            },
-                            Dependency {
-                                crate_id: CrateId(
-                                    0,
-                                ),
-                                name: CrateName(
-                                    "alloc",
-                                ),
-                                prelude: true,
-                            },
-                            Dependency {
-                                crate_id: CrateId(
-                                    6,
-                                ),
-                                name: CrateName(
-                                    "std",
-                                ),
-                                prelude: true,
-                            },
-                            Dependency {
-                                crate_id: CrateId(
-                                    9,
-                                ),
-                                name: CrateName(
-                                    "test",
-                                ),
-                                prelude: false,
-                            },
-                        ],
-                        proc_macro: Err(
-                            "no proc macro dylib present",
-                        ),
-                        origin: CratesIo {
-                            repo: None,
-                        },
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        8,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            9,
-                        ),
-                        edition: Edition2018,
-                        version: None,
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "term",
-                                ),
-                                canonical_name: "term",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [],
-                        ),
-                        env: Env {
-                            entries: {},
-                        },
-                        dependencies: [],
-                        proc_macro: Err(
-                            "no proc macro loaded for sysroot crate",
-                        ),
-                        origin: Lang(
-                            Other,
-                        ),
-                        is_proc_macro: false,
-                    },
-                    CrateId(
                         5,
                     ): CrateData {
                         root_file_id: FileId(
@@ -1582,74 +1526,6 @@ fn rust_project_hello_world_project_model() {
                         ),
                         origin: Lang(
                             Other,
-                        ),
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        2,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            3,
-                        ),
-                        edition: Edition2018,
-                        version: None,
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "panic_abort",
-                                ),
-                                canonical_name: "panic_abort",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [],
-                        ),
-                        env: Env {
-                            entries: {},
-                        },
-                        dependencies: [],
-                        proc_macro: Err(
-                            "no proc macro loaded for sysroot crate",
-                        ),
-                        origin: Lang(
-                            Other,
-                        ),
-                        is_proc_macro: false,
-                    },
-                    CrateId(
-                        9,
-                    ): CrateData {
-                        root_file_id: FileId(
-                            10,
-                        ),
-                        edition: Edition2018,
-                        version: None,
-                        display_name: Some(
-                            CrateDisplayName {
-                                crate_name: CrateName(
-                                    "test",
-                                ),
-                                canonical_name: "test",
-                            },
-                        ),
-                        cfg_options: CfgOptions(
-                            [],
-                        ),
-                        potential_cfg_options: CfgOptions(
-                            [],
-                        ),
-                        env: Env {
-                            entries: {},
-                        },
-                        dependencies: [],
-                        proc_macro: Err(
-                            "no proc macro loaded for sysroot crate",
-                        ),
-                        origin: Lang(
-                            Test,
                         ),
                         is_proc_macro: false,
                     },
@@ -1770,19 +1646,19 @@ fn rust_project_hello_world_project_model() {
                         is_proc_macro: false,
                     },
                     CrateId(
-                        3,
+                        7,
                     ): CrateData {
                         root_file_id: FileId(
-                            4,
+                            8,
                         ),
                         edition: Edition2018,
                         version: None,
                         display_name: Some(
                             CrateDisplayName {
                                 crate_name: CrateName(
-                                    "panic_unwind",
+                                    "std_detect",
                                 ),
-                                canonical_name: "panic_unwind",
+                                canonical_name: "std_detect",
                             },
                         ),
                         cfg_options: CfgOptions(
@@ -1801,6 +1677,182 @@ fn rust_project_hello_world_project_model() {
                         origin: Lang(
                             Other,
                         ),
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        8,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            9,
+                        ),
+                        edition: Edition2018,
+                        version: None,
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "term",
+                                ),
+                                canonical_name: "term",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [],
+                        ),
+                        env: Env {
+                            entries: {},
+                        },
+                        dependencies: [],
+                        proc_macro: Err(
+                            "no proc macro loaded for sysroot crate",
+                        ),
+                        origin: Lang(
+                            Other,
+                        ),
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        9,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            10,
+                        ),
+                        edition: Edition2018,
+                        version: None,
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "test",
+                                ),
+                                canonical_name: "test",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [],
+                        ),
+                        env: Env {
+                            entries: {},
+                        },
+                        dependencies: [],
+                        proc_macro: Err(
+                            "no proc macro loaded for sysroot crate",
+                        ),
+                        origin: Lang(
+                            Test,
+                        ),
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        10,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            11,
+                        ),
+                        edition: Edition2018,
+                        version: None,
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "unwind",
+                                ),
+                                canonical_name: "unwind",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [],
+                        ),
+                        env: Env {
+                            entries: {},
+                        },
+                        dependencies: [],
+                        proc_macro: Err(
+                            "no proc macro loaded for sysroot crate",
+                        ),
+                        origin: Lang(
+                            Other,
+                        ),
+                        is_proc_macro: false,
+                    },
+                    CrateId(
+                        11,
+                    ): CrateData {
+                        root_file_id: FileId(
+                            12,
+                        ),
+                        edition: Edition2018,
+                        version: None,
+                        display_name: Some(
+                            CrateDisplayName {
+                                crate_name: CrateName(
+                                    "hello_world",
+                                ),
+                                canonical_name: "hello_world",
+                            },
+                        ),
+                        cfg_options: CfgOptions(
+                            [],
+                        ),
+                        potential_cfg_options: CfgOptions(
+                            [],
+                        ),
+                        env: Env {
+                            entries: {},
+                        },
+                        dependencies: [
+                            Dependency {
+                                crate_id: CrateId(
+                                    1,
+                                ),
+                                name: CrateName(
+                                    "core",
+                                ),
+                                prelude: true,
+                            },
+                            Dependency {
+                                crate_id: CrateId(
+                                    0,
+                                ),
+                                name: CrateName(
+                                    "alloc",
+                                ),
+                                prelude: true,
+                            },
+                            Dependency {
+                                crate_id: CrateId(
+                                    6,
+                                ),
+                                name: CrateName(
+                                    "std",
+                                ),
+                                prelude: true,
+                            },
+                            Dependency {
+                                crate_id: CrateId(
+                                    9,
+                                ),
+                                name: CrateName(
+                                    "test",
+                                ),
+                                prelude: false,
+                            },
+                        ],
+                        proc_macro: Err(
+                            "no proc macro dylib present",
+                        ),
+                        origin: CratesIo {
+                            repo: None,
+                            name: Some(
+                                "hello_world",
+                            ),
+                        },
                         is_proc_macro: false,
                     },
                 },

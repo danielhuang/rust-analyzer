@@ -8,12 +8,13 @@ use std::{sync::Arc, time::Instant};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use flycheck::FlycheckHandle;
 use ide::{Analysis, AnalysisHost, Cancellable, Change, FileId};
-use ide_db::base_db::{CrateId, FileLoader, SourceDatabase, SourceDatabaseExt};
+use ide_db::base_db::{CrateId, FileLoader, SourceDatabase};
 use lsp_types::{SemanticTokens, Url};
 use parking_lot::{Mutex, RwLock};
 use proc_macro_api::ProcMacroServer;
 use project_model::{CargoWorkspace, ProjectWorkspace, Target, WorkspaceBuildScripts};
 use rustc_hash::FxHashMap;
+use stdx::hash::NoHashHashMap;
 use vfs::AnchoredPathBuf;
 
 use crate::{
@@ -63,11 +64,11 @@ pub(crate) struct GlobalState {
     pub(crate) source_root_config: SourceRootConfig,
     pub(crate) proc_macro_clients: Vec<Result<ProcMacroServer, String>>,
 
-    pub(crate) flycheck: Vec<FlycheckHandle>,
+    pub(crate) flycheck: Arc<[FlycheckHandle]>,
     pub(crate) flycheck_sender: Sender<flycheck::Message>,
     pub(crate) flycheck_receiver: Receiver<flycheck::Message>,
 
-    pub(crate) vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
+    pub(crate) vfs: Arc<RwLock<(vfs::Vfs, NoHashHashMap<FileId, LineEndings>)>>,
     pub(crate) vfs_config_version: u32,
     pub(crate) vfs_progress_config_version: u32,
     pub(crate) vfs_progress_n_total: usize,
@@ -113,8 +114,10 @@ pub(crate) struct GlobalStateSnapshot {
     pub(crate) check_fixes: CheckFixes,
     mem_docs: MemDocs,
     pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Url, SemanticTokens>>>,
-    vfs: Arc<RwLock<(vfs::Vfs, FxHashMap<FileId, LineEndings>)>>,
+    vfs: Arc<RwLock<(vfs::Vfs, NoHashHashMap<FileId, LineEndings>)>>,
     pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
+    pub(crate) proc_macros_loaded: bool,
+    pub(crate) flycheck: Arc<[FlycheckHandle]>,
 }
 
 impl std::panic::UnwindSafe for GlobalStateSnapshot {}
@@ -153,11 +156,11 @@ impl GlobalState {
             source_root_config: SourceRootConfig::default(),
             proc_macro_clients: vec![],
 
-            flycheck: Vec::new(),
+            flycheck: Arc::new([]),
             flycheck_sender,
             flycheck_receiver,
 
-            vfs: Arc::new(RwLock::new((vfs::Vfs::default(), FxHashMap::default()))),
+            vfs: Arc::new(RwLock::new((vfs::Vfs::default(), NoHashHashMap::default()))),
             vfs_config_version: 0,
             vfs_progress_config_version: 0,
             vfs_progress_n_total: 0,
@@ -176,23 +179,60 @@ impl GlobalState {
 
     pub(crate) fn process_changes(&mut self) -> bool {
         let _p = profile::span("GlobalState::process_changes");
-        let mut fs_refresh_changes = Vec::new();
         // A file was added or deleted
         let mut has_structure_changes = false;
+        let mut workspace_structure_change = None;
 
         let (change, changed_files) = {
             let mut change = Change::new();
             let (vfs, line_endings_map) = &mut *self.vfs.write();
-            let changed_files = vfs.take_changes();
+            let mut changed_files = vfs.take_changes();
             if changed_files.is_empty() {
                 return false;
             }
+
+            // important: this needs to be a stable sort, the order between changes is relevant
+            // for the same file ids
+            changed_files.sort_by_key(|file| file.file_id);
+            // We need to fix up the changed events a bit, if we have a create or modify for a file
+            // id that is followed by a delete we actually no longer observe the file text from the
+            // create or modify which may cause problems later on
+            changed_files.dedup_by(|a, b| {
+                use vfs::ChangeKind::*;
+
+                if a.file_id != b.file_id {
+                    return false;
+                }
+
+                match (a.change_kind, b.change_kind) {
+                    // duplicate can be merged
+                    (Create, Create) | (Modify, Modify) | (Delete, Delete) => true,
+                    // just leave the create, modify is irrelevant
+                    (Create, Modify) => {
+                        std::mem::swap(a, b);
+                        true
+                    }
+                    // modify becomes irrelevant if the file is deleted
+                    (Modify, Delete) => true,
+                    // we should fully remove this occurrence,
+                    // but leaving just a delete works as well
+                    (Create, Delete) => true,
+                    // this is equivalent to a modify
+                    (Delete, Create) => {
+                        a.change_kind = Modify;
+                        true
+                    }
+                    // can't really occur
+                    (Modify, Create) => false,
+                    (Delete, Modify) => false,
+                }
+            });
 
             for file in &changed_files {
                 if let Some(path) = vfs.file_path(file.file_id).as_path() {
                     let path = path.to_path_buf();
                     if reload::should_refresh_for_change(&path, file.change_kind) {
-                        fs_refresh_changes.push((path, file.file_id));
+                        workspace_structure_change = Some(path);
                     }
                     if file.is_created_or_deleted() {
                         has_structure_changes = true;
@@ -227,11 +267,10 @@ impl GlobalState {
 
         {
             let raw_database = self.analysis_host.raw_database();
-            let workspace_structure_change =
-                fs_refresh_changes.into_iter().find(|&(_, file_id)| {
-                    !raw_database.source_root(raw_database.file_source_root(file_id)).is_library
-                });
-            if let Some((path, _)) = workspace_structure_change {
+            // FIXME: ideally we should only trigger a workspace fetch for non-library changes
+            // but somethings going wrong with the source root business when we add a new local
+            // crate see https://github.com/rust-lang/rust-analyzer/issues/13029
+            if let Some(path) = workspace_structure_change {
                 self.fetch_workspaces_queue
                     .request_op(format!("workspace vfs file change: {}", path.display()));
             }
@@ -256,6 +295,8 @@ impl GlobalState {
             check_fixes: Arc::clone(&self.diagnostics.check_fixes),
             mem_docs: self.mem_docs.clone(),
             semantic_tokens_cache: Arc::clone(&self.semantic_tokens_cache),
+            proc_macros_loaded: !self.fetch_build_data_queue.last_op_result().0.is_empty(),
+            flycheck: self.flycheck.clone(),
         }
     }
 
@@ -315,6 +356,10 @@ impl GlobalState {
         }
     }
 
+    pub(crate) fn is_completed(&self, request: &lsp_server::Request) -> bool {
+        self.req_queue.incoming.is_completed(&request.id)
+    }
+
     fn send(&mut self, message: lsp_server::Message) {
         self.sender.send(message).unwrap()
     }
@@ -353,6 +398,10 @@ impl GlobalStateSnapshot {
         let path = base.join(&path.path).unwrap();
         let path = path.as_path().unwrap();
         url_from_abs_path(path)
+    }
+
+    pub(crate) fn file_id_to_file_path(&self, file_id: FileId) -> vfs::VfsPath {
+        self.vfs.read().0.file_path(file_id)
     }
 
     pub(crate) fn cargo_target_for_crate_root(

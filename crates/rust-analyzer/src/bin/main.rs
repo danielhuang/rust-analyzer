@@ -37,16 +37,15 @@ fn main() {
         process::exit(code);
     }
 
-    if let Err(err) = try_main() {
+    let flags = flags::RustAnalyzer::from_env_or_exit();
+    if let Err(err) = try_main(flags) {
         tracing::error!("Unexpected error: {}", err);
         eprintln!("{}", err);
         process::exit(101);
     }
 }
 
-fn try_main() -> Result<()> {
-    let flags = flags::RustAnalyzer::from_env()?;
-
+fn try_main(flags: flags::RustAnalyzer) -> Result<()> {
     #[cfg(debug_assertions)]
     if flags.wait_dbg || env::var("RA_WAIT_DBG").is_ok() {
         #[allow(unused_mut)]
@@ -76,10 +75,6 @@ fn try_main() -> Result<()> {
                 println!("rust-analyzer {}", rust_analyzer::version());
                 return Ok(());
             }
-            if cmd.help {
-                println!("{}", flags::RustAnalyzer::HELP);
-                return Ok(());
-            }
             with_extra_thread("LspServer", run_server)?;
         }
         flags::RustAnalyzerCmd::ProcMacro(flags::ProcMacro) => {
@@ -93,6 +88,7 @@ fn try_main() -> Result<()> {
         flags::RustAnalyzerCmd::Ssr(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::Search(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::Lsif(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::Scip(cmd) => cmd.run()?,
     }
     Ok(())
 }

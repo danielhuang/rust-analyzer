@@ -130,7 +130,6 @@ pub struct MacroDefId {
 pub enum MacroDefKind {
     Declarative(AstId<ast::Macro>),
     BuiltIn(BuiltinFnLikeExpander, AstId<ast::Macro>),
-    // FIXME: maybe just Builtin and rename BuiltinFnLikeExpander to BuiltinExpander
     BuiltInAttr(BuiltinAttrExpander, AstId<ast::Macro>),
     BuiltInDerive(BuiltinDeriveExpander, AstId<ast::Macro>),
     BuiltInEager(EagerExpander, AstId<ast::Macro>),
@@ -617,7 +616,7 @@ impl ExpansionInfo {
 
         let token_id = match token_id_in_attr_input {
             Some(token_id) => token_id,
-            // the token is not inside an attribute's input so do the lookup in the macro_arg as ususal
+            // the token is not inside an attribute's input so do the lookup in the macro_arg as usual
             None => {
                 let relative_range =
                     token.value.text_range().checked_sub(self.arg.value.text_range().start())?;
@@ -812,6 +811,31 @@ impl<'a> InFile<&'a SyntaxNode> {
             _ => None,
         }
     }
+
+    pub fn original_syntax_node(self, db: &dyn db::AstDatabase) -> Option<InFile<SyntaxNode>> {
+        // This kind of upmapping can only be achieved in attribute expanded files,
+        // as we don't have node inputs otherwise and  therefor can't find an `N` node in the input
+        if !self.file_id.is_macro() {
+            return Some(self.map(Clone::clone));
+        } else if !self.file_id.is_attr_macro(db) {
+            return None;
+        }
+
+        if let Some(InFile { file_id, value: (first, last) }) = ascend_node_border_tokens(db, self)
+        {
+            if file_id.is_macro() {
+                let range = first.text_range().cover(last.text_range());
+                tracing::error!("Failed mapping out of macro file for {:?}", range);
+                return None;
+            }
+            // FIXME: This heuristic is brittle and with the right macro may select completely unrelated nodes
+            let anc = algo::least_common_ancestor(&first.parent()?, &last.parent()?)?;
+            let kind = self.value.kind();
+            let value = anc.ancestors().find(|it| it.kind() == kind)?;
+            return Some(InFile::new(file_id, value));
+        }
+        None
+    }
 }
 
 impl InFile<SyntaxToken> {
@@ -970,7 +994,7 @@ impl ExpandTo {
         if parent.kind() == MACRO_EXPR
             && parent
                 .parent()
-                .map_or(true, |p| matches!(p.kind(), EXPR_STMT | STMT_LIST | MACRO_STMTS))
+                .map_or(false, |p| matches!(p.kind(), EXPR_STMT | STMT_LIST | MACRO_STMTS))
         {
             return ExpandTo::Statements;
         }

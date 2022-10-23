@@ -15,8 +15,9 @@ use syntax::SmolStr;
 
 use crate::method_resolution::TraitImpls;
 use crate::{
-    db::HirDatabase, AliasEq, AliasTy, Canonical, DomainGoal, Goal, Guidance, InEnvironment,
-    Interner, Solution, TraitRefExt, Ty, TyKind, WhereClause,
+    db::HirDatabase, infer::unify::InferenceTable, AliasEq, AliasTy, Canonical, DomainGoal, Goal,
+    Guidance, InEnvironment, Interner, ProjectionTy, ProjectionTyExt, Solution, TraitRefExt, Ty,
+    TyKind, WhereClause,
 };
 
 #[derive(Debug, Copy, Clone)]
@@ -116,6 +117,16 @@ impl TraitEnvironment {
     }
 }
 
+pub(crate) fn normalize_projection_query(
+    db: &dyn HirDatabase,
+    projection: ProjectionTy,
+    env: Arc<TraitEnvironment>,
+) -> Ty {
+    let mut table = InferenceTable::new(db, env);
+    let ty = table.normalize_projection_ty(projection);
+    table.resolve_completely(ty)
+}
+
 /// Solve a trait goal using Chalk.
 // #[cached(convert = r#"{ format!("{:?}", (&krate, &goal)) }"#, key = "String")]
 pub(crate) fn trait_solve_query(
@@ -139,7 +150,7 @@ pub(crate) fn trait_solve_query(
         ..
     }))) = &goal.value.goal.data(Interner)
     {
-        if let TyKind::BoundVar(_) = projection_ty.self_type_parameter(Interner).kind(Interner) {
+        if let TyKind::BoundVar(_) = projection_ty.self_type_parameter(db).kind(Interner) {
             // Hack: don't ask Chalk to normalize with an unknown self type, it'll say that's impossible
             return Some(Solution::Ambig(Guidance::Unknown));
         }

@@ -104,8 +104,7 @@ pub(crate) fn deref(table: &mut InferenceTable<'_>, ty: Ty) -> Option<Ty> {
 
 fn builtin_deref(ty: &Ty) -> Option<&Ty> {
     match ty.kind(Interner) {
-        TyKind::Ref(.., ty) => Some(ty),
-        TyKind::Raw(.., ty) => Some(ty),
+        TyKind::Ref(.., ty) | TyKind::Raw(.., ty) => Some(ty),
         _ => None,
     }
 }
@@ -124,13 +123,14 @@ fn deref_by_trait(table: &mut InferenceTable<'_>, ty: Ty) -> Option<Ty> {
     let target = db.trait_data(deref_trait).associated_type_by_name(&name![Target])?;
 
     let projection = {
-        let b = TyBuilder::assoc_type_projection(db, target);
+        let b = TyBuilder::subst_for_def(db, deref_trait, None);
         if b.remaining() != 1 {
             // the Target type + Deref trait should only have one generic parameter,
             // namely Deref's Self type
             return None;
         }
-        b.push(ty).build()
+        let deref_subst = b.push(ty).build();
+        TyBuilder::assoc_type_projection(db, target, Some(deref_subst)).build()
     };
 
     // Check that the type implements Deref at all

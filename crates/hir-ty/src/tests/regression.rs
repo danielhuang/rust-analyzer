@@ -573,7 +573,6 @@ fn issue_6811() {
         }
         "#,
         expect![[r#"
-            !0..16 'let_a=...t_b=1;': ()
             !3..5 '_a': i32
             !6..7 '1': i32
             !11..13 '_b': i32
@@ -1489,7 +1488,6 @@ fn regression_11688_4() {
 
 #[test]
 fn gat_crash_1() {
-    cov_mark::check!(ignore_gats);
     check_no_mismatches(
         r#"
 trait ATrait {}
@@ -1523,6 +1521,26 @@ unsafe impl Storage for InlineStorage {
     type Handle<T: ?Sized> = InlineStorageHandle<T>;
 }
 "#,
+    );
+}
+
+#[test]
+fn gat_crash_3() {
+    check_no_mismatches(
+        r#"
+trait Collection {
+type Item;
+type Member<T>: Collection<Item = T>;
+fn add(&mut self, value: Self::Item) -> Result<(), Self::Error>;
+}
+struct ConstGen<T, const N: usize> {
+data: [T; N],
+}
+impl<T, const N: usize> Collection for ConstGen<T, N> {
+type Item = T;
+type Member<U> = ConstGen<U, N>;
+}
+    "#,
     );
 }
 
@@ -1646,5 +1664,46 @@ fn main() {
         78..82 '(1,)': (i32,)
         79..80 '1': i32
         "#]],
+    );
+}
+
+#[test]
+fn trailing_empty_macro() {
+    check_no_mismatches(
+        r#"
+macro_rules! m2 {
+    ($($t:tt)*) => {$($t)*};
+}
+
+fn macrostmts() -> u8 {
+    m2! { 0 }
+    m2! {}
+}
+    "#,
+    );
+}
+
+#[test]
+fn dyn_with_unresolved_trait() {
+    check_types(
+        r#"
+fn foo(a: &dyn DoesNotExist) {
+    a.bar();
+  //^&{unknown}
+}
+        "#,
+    );
+}
+
+#[test]
+fn self_assoc_with_const_generics_crash() {
+    check_no_mismatches(
+        r#"
+trait Trait { type Item; }
+impl<T, const N: usize> Trait for [T; N] {
+    type Item = ();
+    fn f<U>(_: Self::Item) {}
+}
+        "#,
     );
 }

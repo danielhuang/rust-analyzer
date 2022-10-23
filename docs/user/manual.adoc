@@ -174,14 +174,25 @@ On Unix, running the editor from a shell or changing the `.desktop` file to set 
 
 ==== `rustup`
 
-`rust-analyzer` is available in `rustup`, but only in the nightly toolchain:
+`rust-analyzer` is available in `rustup`:
 
 [source,bash]
 ----
-$ rustup +nightly component add rust-analyzer-preview
+$ rustup component add rust-analyzer
 ----
 
-However, in contrast to `component add clippy` or `component add rustfmt`, this does not actually place a `rust-analyzer` binary in `~/.cargo/bin`, see https://github.com/rust-lang/rustup/issues/2411[this issue].
+However, in contrast to `component add clippy` or `component add rustfmt`, this does not actually place a `rust-analyzer` binary in `~/.cargo/bin`, see https://github.com/rust-lang/rustup/issues/2411[this issue]. You can find the path to the binary using:
+[source,bash]
+----
+$ rustup which --toolchain stable rust-analyzer
+----
+You can link to there from `~/.cargo/bin` or configure your editor to use the full path.
+
+Alternatively you might be able to configure your editor to start `rust-analyzer` using the command:
+[source,bash]
+----
+$ rustup run stable rust-analyzer
+----
 
 ==== Arch Linux
 
@@ -861,3 +872,14 @@ For example, if you want to run https://crates.io/crates/cargo-watch[`cargo watc
     "isBackground": true
 }
 ```
+
+==== Live Share
+
+VS Code Live Share has partial support for rust-analyzer.
+
+Live Share _requires_ the official Microsoft build of VS Code, OSS builds will not work correctly.
+
+The host's rust-analyzer instance will be shared with all guests joining the session.
+The guests do not have to have the rust-analyzer extension installed for this to work.
+
+If you are joining a Live Share session and _do_ have rust-analyzer installed locally, commands from the command palette will not work correctly since they will attempt to communicate with the local server.
