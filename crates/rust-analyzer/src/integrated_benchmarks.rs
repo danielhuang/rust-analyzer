@@ -191,7 +191,7 @@ fn integrated_completion_benchmark() {
 
 #[inline(never)]
 fn test(analysis: ide::Analysis, config: CompletionConfig, position: FilePosition) {
-    analysis.completions(&config, position).unwrap();
+    analysis.completions(&config, position, Some('.')).unwrap();
 }
 
 fn patch(what: &mut String, from: &str, to: &str) -> usize {
