@@ -67,6 +67,7 @@ impl WorkspaceBuildScripts {
                 let mut cmd = Command::new(toolchain::cargo());
 
                 cmd.args(["check", "--quiet", "--workspace", "--message-format=json"]);
+                cmd.args(&config.extra_args);
 
                 // --all-targets includes tests, benches and examples in addition to the
                 // default lib and bins. This is an independent concept from the --target
@@ -428,8 +429,9 @@ impl WorkspaceBuildScripts {
             for p in rustc.packages() {
                 let package = &rustc[p];
                 if package.targets.iter().any(|&it| rustc[it].is_proc_macro) {
-                    if let Some((_, path)) =
-                        proc_macro_dylibs.iter().find(|(name, _)| *name == package.name)
+                    if let Some((_, path)) = proc_macro_dylibs
+                        .iter()
+                        .find(|(name, _)| *name.trim_start_matches("lib") == package.name)
                     {
                         bs.outputs[p].proc_macro_dylib_path = Some(path.clone());
                     }

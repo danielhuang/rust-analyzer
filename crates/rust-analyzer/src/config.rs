@@ -22,7 +22,7 @@ use ide_db::{
 use itertools::Itertools;
 use lsp_types::{ClientCapabilities, MarkupKind};
 use project_model::{
-    CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectManifest, RustcSource,
+    CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectManifest, RustLibSource,
     UnsetTestCrates,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -101,6 +101,8 @@ config_data! {
         /// Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to
         /// avoid checking unnecessary things.
         cargo_buildScripts_useRustcWrapper: bool = "true",
+        /// Extra arguments that are passed to every cargo invocation.
+        cargo_extraArgs: Vec<String> = "[]",
         /// Extra environment variables that will be set when running cargo, rustc
         /// or other commands within the workspace. Useful for setting RUSTFLAGS.
         cargo_extraEnv: FxHashMap<String, String> = "{}",
@@ -270,7 +272,6 @@ config_data! {
         /// The warnings will be indicated by a blue squiggly underline in code
         /// and a blue icon in the `Problems Panel`.
         diagnostics_warningsAsInfo: Vec<String> = "[]",
-
         /// These directories will be ignored by rust-analyzer. They are
         /// relative to the workspace root, and globs are not supported. You may
         /// also need to add the folders to Code's `files.watcherExclude`.
@@ -893,6 +894,15 @@ impl Config {
         }
     }
 
+    pub fn add_linked_projects(&mut self, linked_projects: Vec<ProjectJsonData>) {
+        let mut linked_projects = linked_projects
+            .into_iter()
+            .map(ManifestOrProjectJson::ProjectJson)
+            .collect::<Vec<ManifestOrProjectJson>>();
+
+        self.data.linkedProjects.append(&mut linked_projects);
+    }
+
     pub fn did_save_text_document_dynamic_registration(&self) -> bool {
         let caps = try_or_def!(self.caps.text_document.as_ref()?.synchronization.clone()?);
         caps.did_save == Some(true) && caps.dynamic_registration == Some(true)
@@ -1055,8 +1065,18 @@ impl Config {
         }
     }
 
+    pub fn extra_args(&self) -> &Vec<String> {
+        &self.data.cargo_extraArgs
+    }
+
     pub fn extra_env(&self) -> &FxHashMap<String, String> {
         &self.data.cargo_extraEnv
+    }
+
+    pub fn check_extra_args(&self) -> Vec<String> {
+        let mut extra_args = self.extra_args().clone();
+        extra_args.extend_from_slice(&self.data.check_extraArgs);
+        extra_args
     }
 
     pub fn check_extra_env(&self) -> FxHashMap<String, String> {
@@ -1117,16 +1137,16 @@ impl Config {
     pub fn cargo(&self) -> CargoConfig {
         let rustc_source = self.data.rustc_source.as_ref().map(|rustc_src| {
             if rustc_src == "discover" {
-                RustcSource::Discover
+                RustLibSource::Discover
             } else {
-                RustcSource::Path(self.root_path.join(rustc_src))
+                RustLibSource::Path(self.root_path.join(rustc_src))
             }
         });
         let sysroot = self.data.cargo_sysroot.as_ref().map(|sysroot| {
             if sysroot == "discover" {
-                RustcSource::Discover
+                RustLibSource::Discover
             } else {
-                RustcSource::Path(self.root_path.join(sysroot))
+                RustLibSource::Path(self.root_path.join(sysroot))
             }
         });
         let sysroot_src =
@@ -1157,6 +1177,7 @@ impl Config {
                 InvocationLocation::Workspace => project_model::InvocationLocation::Workspace,
             },
             run_build_script_command: self.data.cargo_buildScripts_overrideCommand.clone(),
+            extra_args: self.data.cargo_extraArgs.clone(),
             extra_env: self.data.cargo_extraEnv.clone(),
         }
     }
@@ -1227,7 +1248,7 @@ impl Config {
                     CargoFeaturesDef::All => vec![],
                     CargoFeaturesDef::Selected(it) => it,
                 },
-                extra_args: self.data.check_extraArgs.clone(),
+                extra_args: self.check_extra_args(),
                 extra_env: self.check_extra_env(),
                 ansi_color_output: self.color_diagnostic_output(),
             },

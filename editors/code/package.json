@@ -200,6 +200,11 @@
                 "category": "rust-analyzer"
             },
             {
+                "command": "rust-analyzer.addProject",
+                "title": "Add current file's crate to workspace",
+                "category": "rust-analyzer"
+            },
+            {
                 "command": "rust-analyzer.reload",
                 "title": "Restart server",
                 "category": "rust-analyzer"
@@ -428,6 +433,17 @@
                     "default": false,
                     "type": "boolean"
                 },
+                "rust-analyzer.discoverProjectCommand": {
+                    "markdownDescription": "Sets the command that rust-analyzer uses to generate `rust-project.json` files. This command should only be used\n if a build system like Buck or Bazel is also in use. The command must accept files as arguments and return \n a rust-project.json over stdout.",
+                    "default": null,
+                    "type": [
+                        "null",
+                        "array"
+                    ],
+                    "items": {
+                        "type": "string"
+                    }
+                },
                 "$generated-start": {},
                 "rust-analyzer.assist.emitMustUse": {
                     "markdownDescription": "Whether to insert #[must_use] when generating `as_` methods\nfor enum variants.",
@@ -510,6 +526,14 @@
                     "markdownDescription": "Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to\navoid checking unnecessary things.",
                     "default": true,
                     "type": "boolean"
+                },
+                "rust-analyzer.cargo.extraArgs": {
+                    "markdownDescription": "Extra arguments that are passed to every cargo invocation.",
+                    "default": [],
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    }
                 },
                 "rust-analyzer.cargo.extraEnv": {
                     "markdownDescription": "Extra environment variables that will be set when running cargo, rustc\nor other commands within the workspace. Useful for setting RUSTFLAGS.",
