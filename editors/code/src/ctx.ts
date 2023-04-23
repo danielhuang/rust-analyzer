@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as lc from "vscode-languageclient/node";
 import * as ra from "./lsp_ext";
+import * as path from "path";
 
 import { Config, prepareVSCodeConfig } from "./config";
 import { createClient } from "./client";
@@ -82,6 +83,7 @@ export class Ctx {
     private state: PersistentState;
     private commandFactories: Record<string, CommandFactory>;
     private commandDisposables: Disposable[];
+    private unlinkedFiles: vscode.Uri[];
 
     get client() {
         return this._client;
@@ -94,11 +96,11 @@ export class Ctx {
     ) {
         extCtx.subscriptions.push(this);
         this.statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
-        this.statusBar.show();
         this.workspace = workspace;
         this.clientSubscriptions = [];
         this.commandDisposables = [];
         this.commandFactories = commandFactories;
+        this.unlinkedFiles = [];
 
         this.state = new PersistentState(extCtx.globalState);
         this.config = new Config(extCtx);
@@ -191,12 +193,13 @@ export class Ctx {
             const discoverProjectCommand = this.config.discoverProjectCommand;
             if (discoverProjectCommand) {
                 const workspaces: JsonProject[] = await Promise.all(
-                    vscode.workspace.workspaceFolders!.map(async (folder): Promise<JsonProject> => {
-                        const rustDocuments = vscode.workspace.textDocuments.filter(isRustDocument);
-                        return discoverWorkspace(rustDocuments, discoverProjectCommand, {
-                            cwd: folder.uri.fsPath,
-                        });
-                    })
+                    vscode.workspace.textDocuments
+                        .filter(isRustDocument)
+                        .map(async (file): Promise<JsonProject> => {
+                            return discoverWorkspace([file], discoverProjectCommand, {
+                                cwd: path.dirname(file.uri.fsPath),
+                            });
+                        })
                 );
 
                 this.addToDiscoveredWorkspaces(workspaces);
@@ -218,7 +221,8 @@ export class Ctx {
                 this.outputChannel,
                 initializationOptions,
                 serverOptions,
-                this.config
+                this.config,
+                this.unlinkedFiles
             );
             this.pushClientCleanup(
                 this._client.onNotification(ra.serverStatus, (params) =>
@@ -335,6 +339,7 @@ export class Ctx {
     setServerStatus(status: ServerStatusParams | { health: "stopped" }) {
         let icon = "";
         const statusBar = this.statusBar;
+        statusBar.show();
         statusBar.tooltip = new vscode.MarkdownString("", true);
         statusBar.tooltip.isTrusted = true;
         switch (status.health) {
@@ -378,12 +383,15 @@ export class Ctx {
         if (statusBar.tooltip.value) {
             statusBar.tooltip.appendText("\n\n");
         }
+        statusBar.tooltip.appendMarkdown("\n\n[Open logs](command:rust-analyzer.openLogs)");
         statusBar.tooltip.appendMarkdown(
             "\n\n[Reload Workspace](command:rust-analyzer.reloadWorkspace)"
         );
-        statusBar.tooltip.appendMarkdown("\n\n[Open logs](command:rust-analyzer.openLogs)");
+        statusBar.tooltip.appendMarkdown(
+            "\n\n[Rebuild Proc Macros](command:rust-analyzer.rebuildProcMacros)"
+        );
         statusBar.tooltip.appendMarkdown("\n\n[Restart server](command:rust-analyzer.startServer)");
-        statusBar.tooltip.appendMarkdown("[Stop server](command:rust-analyzer.stopServer)");
+        statusBar.tooltip.appendMarkdown("\n\n[Stop server](command:rust-analyzer.stopServer)");
         if (!status.quiescent) icon = "$(sync~spin) ";
         statusBar.text = `${icon}rust-analyzer`;
     }

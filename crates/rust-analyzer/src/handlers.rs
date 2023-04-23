@@ -6,6 +6,7 @@ use std::{
     env,
     io::Write as _,
     process::{self, Stdio},
+    sync::Arc,
 };
 
 use anyhow::Context;
@@ -45,11 +46,18 @@ use crate::{
 };
 
 pub(crate) fn handle_workspace_reload(state: &mut GlobalState, _: ()) -> Result<()> {
-    state.proc_macro_clients.clear();
+    state.proc_macro_clients = Arc::new([]);
     state.proc_macro_changed = false;
 
-    state.fetch_workspaces_queue.request_op("reload workspace request".to_string());
-    state.fetch_build_data_queue.request_op("reload workspace request".to_string());
+    state.fetch_workspaces_queue.request_op("reload workspace request".to_string(), ());
+    Ok(())
+}
+
+pub(crate) fn handle_proc_macros_rebuild(state: &mut GlobalState, _: ()) -> Result<()> {
+    state.proc_macro_clients = Arc::new([]);
+    state.proc_macro_changed = false;
+
+    state.fetch_build_data_queue.request_op("rebuild proc macros request".to_string(), ());
     Ok(())
 }
 
@@ -96,6 +104,7 @@ pub(crate) fn handle_analyzer_status(
                 .collect::<Vec<&AbsPath>>()
         );
     }
+    format_to!(buf, "\nVfs memory usage: {}\n", snap.vfs_memory_usage());
     buf.push_str("\nAnalysis:\n");
     buf.push_str(
         &snap
@@ -770,14 +779,7 @@ pub(crate) fn handle_runnables(
             }
         }
         None => {
-            if !snap.config.linked_projects().is_empty()
-                || !snap
-                    .config
-                    .discovered_projects
-                    .as_ref()
-                    .map(|projects| projects.is_empty())
-                    .unwrap_or(true)
-            {
+            if !snap.config.linked_projects().is_empty() {
                 res.push(lsp_ext::Runnable {
                     label: "cargo check --workspace".to_string(),
                     location: None,
@@ -1266,7 +1268,7 @@ pub(crate) fn handle_code_lens_resolve(
     snap: GlobalStateSnapshot,
     code_lens: CodeLens,
 ) -> Result<CodeLens> {
-    let annotation = from_proto::annotation(&snap, code_lens.clone())?;
+    let Some(annotation) = from_proto::annotation(&snap, code_lens.clone())? else { return Ok(code_lens) };
     let annotation = snap.analysis.resolve_annotation(annotation)?;
 
     let mut acc = Vec::new();

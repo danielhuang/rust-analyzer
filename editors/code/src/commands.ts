@@ -89,7 +89,13 @@ export function shuffleCrateGraph(ctx: CtxInit): Cmd {
 
 export function triggerParameterHints(_: CtxInit): Cmd {
     return async () => {
-        await vscode.commands.executeCommand("editor.action.triggerParameterHints");
+        const parameterHintsEnabled = vscode.workspace
+            .getConfiguration("editor")
+            .get<boolean>("parameterHints.enabled");
+
+        if (parameterHintsEnabled) {
+            await vscode.commands.executeCommand("editor.action.triggerParameterHints");
+        }
     };
 }
 
@@ -663,20 +669,25 @@ function crateGraph(ctx: CtxInit, full: boolean): Cmd {
             </head>
             <body>
                 <script type="text/javascript" src="${uri}/d3/dist/d3.min.js"></script>
-                <script type="text/javascript" src="${uri}/@hpcc-js/wasm/dist/index.min.js"></script>
+                <script type="text/javascript" src="${uri}/@hpcc-js/wasm/dist/graphviz.umd.js"></script>
                 <script type="text/javascript" src="${uri}/d3-graphviz/build/d3-graphviz.min.js"></script>
                 <div id="graph"></div>
                 <script>
+                    let dot = \`${dot}\`;
                     let graph = d3.select("#graph")
-                                  .graphviz()
+                                  .graphviz({ useWorker: false, useSharedWorker: false })
                                   .fit(true)
                                   .zoomScaleExtent([0.1, Infinity])
-                                  .renderDot(\`${dot}\`);
+                                  .renderDot(dot);
 
                     d3.select(window).on("click", (event) => {
                         if (event.ctrlKey) {
                             graph.resetZoom(d3.transition().duration(100));
                         }
+                    });
+                    d3.select(window).on("copy", (event) => {
+                        event.clipboardData.setData("text/plain", dot);
+                        event.preventDefault();
                     });
                 </script>
             </body>
@@ -699,7 +710,7 @@ export function viewFullCrateGraph(ctx: CtxInit): Cmd {
 // The contents of the file come from the `TextDocumentContentProvider`
 export function expandMacro(ctx: CtxInit): Cmd {
     function codeFormat(expanded: ra.ExpandedMacro): string {
-        let result = `// Recursive expansion of ${expanded.name}! macro\n`;
+        let result = `// Recursive expansion of ${expanded.name} macro\n`;
         result += "// " + "=".repeat(result.length - 3);
         result += "\n\n";
         result += expanded.expansion;
@@ -749,6 +760,10 @@ export function reloadWorkspace(ctx: CtxInit): Cmd {
     return async () => ctx.client.sendRequest(ra.reloadWorkspace);
 }
 
+export function rebuildProcMacros(ctx: CtxInit): Cmd {
+    return async () => ctx.client.sendRequest(ra.rebuildProcMacros);
+}
+
 export function addProject(ctx: CtxInit): Cmd {
     return async () => {
         const discoverProjectCommand = ctx.config.discoverProjectCommand;
@@ -757,12 +772,13 @@ export function addProject(ctx: CtxInit): Cmd {
         }
 
         const workspaces: JsonProject[] = await Promise.all(
-            vscode.workspace.workspaceFolders!.map(async (folder): Promise<JsonProject> => {
-                const rustDocuments = vscode.workspace.textDocuments.filter(isRustDocument);
-                return discoverWorkspace(rustDocuments, discoverProjectCommand, {
-                    cwd: folder.uri.fsPath,
-                });
-            })
+            vscode.workspace.textDocuments
+                .filter(isRustDocument)
+                .map(async (file): Promise<JsonProject> => {
+                    return discoverWorkspace([file], discoverProjectCommand, {
+                        cwd: path.dirname(file.uri.fsPath),
+                    });
+                })
         );
 
         ctx.addToDiscoveredWorkspaces(workspaces);

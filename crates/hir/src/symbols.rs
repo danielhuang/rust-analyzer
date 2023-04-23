@@ -32,18 +32,18 @@ pub struct DeclarationLocation {
 }
 
 impl DeclarationLocation {
-    pub fn syntax<DB: HirDatabase>(&self, sema: &Semantics<'_, DB>) -> Option<SyntaxNode> {
-        let root = sema.parse_or_expand(self.hir_file_id)?;
-        Some(self.ptr.to_node(&root))
+    pub fn syntax<DB: HirDatabase>(&self, sema: &Semantics<'_, DB>) -> SyntaxNode {
+        let root = sema.parse_or_expand(self.hir_file_id);
+        self.ptr.to_node(&root)
     }
 
-    pub fn original_range(&self, db: &dyn HirDatabase) -> Option<FileRange> {
-        let node = resolve_node(db, self.hir_file_id, &self.ptr)?;
-        Some(node.as_ref().original_file_range(db.upcast()))
+    pub fn original_range(&self, db: &dyn HirDatabase) -> FileRange {
+        let node = resolve_node(db, self.hir_file_id, &self.ptr);
+        node.as_ref().original_file_range(db.upcast())
     }
 
     pub fn original_name_range(&self, db: &dyn HirDatabase) -> Option<FileRange> {
-        let node = resolve_node(db, self.hir_file_id, &self.name_ptr)?;
+        let node = resolve_node(db, self.hir_file_id, &self.name_ptr);
         node.as_ref().original_file_range_opt(db.upcast())
     }
 }
@@ -52,10 +52,10 @@ fn resolve_node(
     db: &dyn HirDatabase,
     file_id: HirFileId,
     ptr: &SyntaxNodePtr,
-) -> Option<InFile<SyntaxNode>> {
-    let root = db.parse_or_expand(file_id)?;
+) -> InFile<SyntaxNode> {
+    let root = db.parse_or_expand(file_id);
     let node = ptr.to_node(&root);
-    Some(InFile::new(file_id, node))
+    InFile::new(file_id, node)
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
@@ -102,21 +102,33 @@ pub struct SymbolCollector<'a> {
 /// Given a [`ModuleId`] and a [`HirDatabase`], use the DefMap for the module's crate to collect
 /// all symbols that should be indexed for the given module.
 impl<'a> SymbolCollector<'a> {
-    pub fn collect(db: &dyn HirDatabase, module: Module) -> Vec<FileSymbol> {
-        let mut symbol_collector = SymbolCollector {
+    pub fn new(db: &'a dyn HirDatabase) -> Self {
+        SymbolCollector {
             db,
             symbols: Default::default(),
+            work: Default::default(),
             current_container_name: None,
-            // The initial work is the root module we're collecting, additional work will
-            // be populated as we traverse the module's definitions.
-            work: vec![SymbolCollectorWork { module_id: module.into(), parent: None }],
-        };
-
-        while let Some(work) = symbol_collector.work.pop() {
-            symbol_collector.do_work(work);
         }
+    }
 
-        symbol_collector.symbols
+    pub fn collect(&mut self, module: Module) {
+        // The initial work is the root module we're collecting, additional work will
+        // be populated as we traverse the module's definitions.
+        self.work.push(SymbolCollectorWork { module_id: module.into(), parent: None });
+
+        while let Some(work) = self.work.pop() {
+            self.do_work(work);
+        }
+    }
+
+    pub fn finish(self) -> Vec<FileSymbol> {
+        self.symbols
+    }
+
+    pub fn collect_module(db: &dyn HirDatabase, module: Module) -> Vec<FileSymbol> {
+        let mut symbol_collector = SymbolCollector::new(db);
+        symbol_collector.collect(module);
+        symbol_collector.finish()
     }
 
     fn do_work(&mut self, work: SymbolCollectorWork) {

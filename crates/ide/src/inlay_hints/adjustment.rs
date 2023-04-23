@@ -135,6 +135,7 @@ pub(super) fn hints(
                 ))),
                 None,
             ),
+            text_edit: None,
         });
     }
     if !postfix && needs_inner_parens {
@@ -147,7 +148,7 @@ pub(super) fn hints(
     Some(())
 }
 
-/// Returns whatever the hint should be postfix and if we need to add paretheses on the inside and/or outside of `expr`,
+/// Returns whatever the hint should be postfix and if we need to add parentheses on the inside and/or outside of `expr`,
 /// if we are going to add (`postfix`) adjustments hints to it.
 fn mode_and_needs_parens_for_adjustment_hints(
     expr: &ast::Expr,
@@ -182,7 +183,7 @@ fn mode_and_needs_parens_for_adjustment_hints(
     }
 }
 
-/// Returns whatever we need to add paretheses on the inside and/or outside of `expr`,
+/// Returns whatever we need to add parentheses on the inside and/or outside of `expr`,
 /// if we are going to add (`postfix`) adjustments hints to it.
 fn needs_parens_for_adjustment_hints(expr: &ast::Expr, postfix: bool) -> (bool, bool) {
     // This is a very miserable pile of hacks...
@@ -193,10 +194,10 @@ fn needs_parens_for_adjustment_hints(expr: &ast::Expr, postfix: bool) -> (bool, 
     // But we want to check what would happen if we add `*`/`.*` to the inner expression.
     // To check for inner we need `` expr.needs_parens_in(`*expr`) ``,
     // to check for outer we need `` `*expr`.needs_parens_in(parent) ``,
-    // where "expr" is the `expr` parameter, `*expr` is the editted `expr`,
+    // where "expr" is the `expr` parameter, `*expr` is the edited `expr`,
     // and "parent" is the parent of the original expression...
     //
-    // For this we utilize mutable mutable trees, which is a HACK, but it works.
+    // For this we utilize mutable trees, which is a HACK, but it works.
     //
     // FIXME: comeup with a better API for `needs_parens_in`, so that we don't have to do *this*
 
@@ -242,7 +243,7 @@ fn needs_parens_for_adjustment_hints(expr: &ast::Expr, postfix: bool) -> (bool, 
     };
 
     // At this point
-    // - `parent`     is the parrent of the original expression
+    // - `parent`     is the parent of the original expression
     // - `dummy_expr` is the original expression wrapped in the operator we want (`*`/`.*`)
     // - `expr`       is the clone of the original expression (with `dummy_expr` as the parent)
 
@@ -264,7 +265,7 @@ mod tests {
         check_with_config(
             InlayHintsConfig { adjustment_hints: AdjustmentHints::Always, ..DISABLED_CONFIG },
             r#"
-//- minicore: coerce_unsized, fn, eq
+//- minicore: coerce_unsized, fn, eq, index
 fn main() {
     let _: u32         = loop {};
                        //^^^^^^^<never-to-any>
@@ -315,6 +316,8 @@ fn main() {
     (&Struct).consume();
    //^^^^^^^*
     (&Struct).by_ref();
+   //^^^^^^^&
+   //^^^^^^^*
 
     (&mut Struct).consume();
    //^^^^^^^^^^^*
@@ -322,6 +325,8 @@ fn main() {
    //^^^^^^^^^^^&
    //^^^^^^^^^^^*
     (&mut Struct).by_ref_mut();
+   //^^^^^^^^^^^&mut $
+   //^^^^^^^^^^^*
 
     // Check that block-like expressions don't duplicate hints
     let _: &mut [u32] = (&mut []);
@@ -360,6 +365,19 @@ fn main() {
     (()) == {()};
   // ^^&
          // ^^^^&
+    let closure: dyn Fn = || ();
+    closure();
+  //^^^^^^^(
+  //^^^^^^^&
+  //^^^^^^^)
+    Struct[0];
+  //^^^^^^(
+  //^^^^^^&
+  //^^^^^^)
+    &mut Struct[0];
+       //^^^^^^(
+       //^^^^^^&mut $
+       //^^^^^^)
 }
 
 #[derive(Copy, Clone)]
@@ -369,8 +387,13 @@ impl Struct {
     fn by_ref(&self) {}
     fn by_ref_mut(&mut self) {}
 }
+struct StructMut;
+impl core::ops::Index<usize> for Struct {
+    type Output = ();
+}
+impl core::ops::IndexMut for Struct {}
 "#,
-        )
+        );
     }
 
     #[test]
@@ -382,7 +405,7 @@ impl Struct {
                 ..DISABLED_CONFIG
             },
             r#"
-//- minicore: coerce_unsized, fn, eq
+//- minicore: coerce_unsized, fn, eq, index
 fn main() {
 
     Struct.consume();
@@ -396,6 +419,10 @@ fn main() {
    //^^^^^^^)
    //^^^^^^^.*
     (&Struct).by_ref();
+   //^^^^^^^(
+   //^^^^^^^)
+   //^^^^^^^.*
+   //^^^^^^^.&
 
     (&mut Struct).consume();
    //^^^^^^^^^^^(
@@ -407,6 +434,10 @@ fn main() {
    //^^^^^^^^^^^.*
    //^^^^^^^^^^^.&
     (&mut Struct).by_ref_mut();
+   //^^^^^^^^^^^(
+   //^^^^^^^^^^^)
+   //^^^^^^^^^^^.*
+   //^^^^^^^^^^^.&mut
 
     // Check that block-like expressions don't duplicate hints
     let _: &mut [u32] = (&mut []);
@@ -457,6 +488,13 @@ fn main() {
     (()) == {()};
   // ^^.&
          // ^^^^.&
+    let closure: dyn Fn = || ();
+    closure();
+  //^^^^^^^.&
+    Struct[0];
+  //^^^^^^.&
+    &mut Struct[0];
+       //^^^^^^.&mut
 }
 
 #[derive(Copy, Clone)]
@@ -466,6 +504,11 @@ impl Struct {
     fn by_ref(&self) {}
     fn by_ref_mut(&mut self) {}
 }
+struct StructMut;
+impl core::ops::Index<usize> for Struct {
+    type Output = ();
+}
+impl core::ops::IndexMut for Struct {}
 "#,
         );
     }

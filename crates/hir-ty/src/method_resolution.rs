@@ -5,11 +5,13 @@
 use std::{ops::ControlFlow, sync::Arc};
 
 use base_db::{CrateId, Edition};
-use chalk_ir::{cast::Cast, Mutability, TyKind, UniverseIndex};
+use chalk_ir::{cast::Cast, Mutability, TyKind, UniverseIndex, WhereClause};
 use hir_def::{
-    data::ImplData, item_scope::ItemScope, lang_item::LangItem, nameres::DefMap, AssocItemId,
-    BlockId, ConstId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, ModuleDefId,
-    ModuleId, TraitId,
+    data::{adt::StructFlags, ImplData},
+    item_scope::ItemScope,
+    nameres::DefMap,
+    AssocItemId, BlockId, ConstId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup,
+    ModuleDefId, ModuleId, TraitId,
 };
 use hir_expand::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -20,7 +22,7 @@ use crate::{
     autoderef::{self, AutoderefKind},
     db::HirDatabase,
     from_chalk_trait_id, from_foreign_def_id,
-    infer::{unify::InferenceTable, Adjust, Adjustment, AutoBorrow, OverloadedDeref, PointerCast},
+    infer::{unify::InferenceTable, Adjust, Adjustment, OverloadedDeref, PointerCast},
     primitive::{FloatTy, IntTy, UintTy},
     static_lifetime, to_chalk_trait_id,
     utils::all_super_traits,
@@ -147,18 +149,15 @@ impl TraitImpls {
         Arc::new(impls)
     }
 
-    pub(crate) fn trait_impls_in_block_query(
-        db: &dyn HirDatabase,
-        block: BlockId,
-    ) -> Option<Arc<Self>> {
+    pub(crate) fn trait_impls_in_block_query(db: &dyn HirDatabase, block: BlockId) -> Arc<Self> {
         let _p = profile::span("trait_impls_in_block_query");
         let mut impls = Self { map: FxHashMap::default() };
 
-        let block_def_map = db.block_def_map(block)?;
+        let block_def_map = db.block_def_map(block);
         impls.collect_def_map(db, &block_def_map);
         impls.shrink_to_fit();
 
-        Some(Arc::new(impls))
+        Arc::new(impls)
     }
 
     pub(crate) fn trait_impls_in_deps_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
@@ -271,6 +270,7 @@ pub struct InherentImpls {
 
 impl InherentImpls {
     pub(crate) fn inherent_impls_in_crate_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
+        let _p = profile::span("inherent_impls_in_crate_query").detail(|| format!("{krate:?}"));
         let mut impls = Self { map: FxHashMap::default(), invalid_impls: Vec::default() };
 
         let crate_def_map = db.crate_def_map(krate);
@@ -280,17 +280,15 @@ impl InherentImpls {
         Arc::new(impls)
     }
 
-    pub(crate) fn inherent_impls_in_block_query(
-        db: &dyn HirDatabase,
-        block: BlockId,
-    ) -> Option<Arc<Self>> {
+    pub(crate) fn inherent_impls_in_block_query(db: &dyn HirDatabase, block: BlockId) -> Arc<Self> {
+        let _p = profile::span("inherent_impls_in_block_query");
         let mut impls = Self { map: FxHashMap::default(), invalid_impls: Vec::default() };
-        if let Some(block_def_map) = db.block_def_map(block) {
-            impls.collect_def_map(db, &block_def_map);
-            impls.shrink_to_fit();
-            return Some(Arc::new(impls));
-        }
-        None
+
+        let block_def_map = db.block_def_map(block);
+        impls.collect_def_map(db, &block_def_map);
+        impls.shrink_to_fit();
+
+        Arc::new(impls)
     }
 
     fn shrink_to_fit(&mut self) {
@@ -404,12 +402,14 @@ pub fn def_crates(
     match ty.kind(Interner) {
         &TyKind::Adt(AdtId(def_id), _) => {
             let rustc_has_incoherent_inherent_impls = match def_id {
-                hir_def::AdtId::StructId(id) => {
-                    db.struct_data(id).rustc_has_incoherent_inherent_impls
-                }
-                hir_def::AdtId::UnionId(id) => {
-                    db.union_data(id).rustc_has_incoherent_inherent_impls
-                }
+                hir_def::AdtId::StructId(id) => db
+                    .struct_data(id)
+                    .flags
+                    .contains(StructFlags::IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL),
+                hir_def::AdtId::UnionId(id) => db
+                    .union_data(id)
+                    .flags
+                    .contains(StructFlags::IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL),
                 hir_def::AdtId::EnumId(id) => db.enum_data(id).rustc_has_incoherent_inherent_impls,
             };
             Some(if rustc_has_incoherent_inherent_impls {
@@ -447,55 +447,6 @@ pub fn def_crates(
         )),
         _ => None,
     }
-}
-
-pub fn lang_items_for_bin_op(op: syntax::ast::BinaryOp) -> Option<(Name, LangItem)> {
-    use hir_expand::name;
-    use syntax::ast::{ArithOp, BinaryOp, CmpOp, Ordering};
-    Some(match op {
-        BinaryOp::LogicOp(_) => return None,
-        BinaryOp::ArithOp(aop) => match aop {
-            ArithOp::Add => (name![add], LangItem::Add),
-            ArithOp::Mul => (name![mul], LangItem::Mul),
-            ArithOp::Sub => (name![sub], LangItem::Sub),
-            ArithOp::Div => (name![div], LangItem::Div),
-            ArithOp::Rem => (name![rem], LangItem::Rem),
-            ArithOp::Shl => (name![shl], LangItem::Shl),
-            ArithOp::Shr => (name![shr], LangItem::Shr),
-            ArithOp::BitXor => (name![bitxor], LangItem::BitXor),
-            ArithOp::BitOr => (name![bitor], LangItem::BitOr),
-            ArithOp::BitAnd => (name![bitand], LangItem::BitAnd),
-        },
-        BinaryOp::Assignment { op: Some(aop) } => match aop {
-            ArithOp::Add => (name![add_assign], LangItem::AddAssign),
-            ArithOp::Mul => (name![mul_assign], LangItem::MulAssign),
-            ArithOp::Sub => (name![sub_assign], LangItem::SubAssign),
-            ArithOp::Div => (name![div_assign], LangItem::DivAssign),
-            ArithOp::Rem => (name![rem_assign], LangItem::RemAssign),
-            ArithOp::Shl => (name![shl_assign], LangItem::ShlAssign),
-            ArithOp::Shr => (name![shr_assign], LangItem::ShrAssign),
-            ArithOp::BitXor => (name![bitxor_assign], LangItem::BitXorAssign),
-            ArithOp::BitOr => (name![bitor_assign], LangItem::BitOrAssign),
-            ArithOp::BitAnd => (name![bitand_assign], LangItem::BitAndAssign),
-        },
-        BinaryOp::CmpOp(cop) => match cop {
-            CmpOp::Eq { negated: false } => (name![eq], LangItem::PartialEq),
-            CmpOp::Eq { negated: true } => (name![ne], LangItem::PartialEq),
-            CmpOp::Ord { ordering: Ordering::Less, strict: false } => {
-                (name![le], LangItem::PartialOrd)
-            }
-            CmpOp::Ord { ordering: Ordering::Less, strict: true } => {
-                (name![lt], LangItem::PartialOrd)
-            }
-            CmpOp::Ord { ordering: Ordering::Greater, strict: false } => {
-                (name![ge], LangItem::PartialOrd)
-            }
-            CmpOp::Ord { ordering: Ordering::Greater, strict: true } => {
-                (name![gt], LangItem::PartialOrd)
-            }
-        },
-        BinaryOp::Assignment { op: None } => return None,
-    })
 }
 
 /// Look up the method with the given name.
@@ -600,9 +551,9 @@ impl ReceiverAdjustments {
             }
         }
         if let Some(m) = self.autoref {
-            ty = TyKind::Ref(m, static_lifetime(), ty).intern(Interner);
-            adjust
-                .push(Adjustment { kind: Adjust::Borrow(AutoBorrow::Ref(m)), target: ty.clone() });
+            let a = Adjustment::borrow(m, ty);
+            ty = a.target.clone();
+            adjust.push(a);
         }
         if self.unsize_array {
             ty = 'x: {
@@ -692,6 +643,39 @@ pub fn lookup_impl_const(
         .unwrap_or((const_id, subs))
 }
 
+/// Checks if the self parameter of `Trait` method is the `dyn Trait` and we should
+/// call the method using the vtable.
+pub fn is_dyn_method(
+    db: &dyn HirDatabase,
+    _env: Arc<TraitEnvironment>,
+    func: FunctionId,
+    fn_subst: Substitution,
+) -> Option<usize> {
+    let ItemContainerId::TraitId(trait_id) = func.lookup(db.upcast()).container else {
+        return None;
+    };
+    let trait_params = db.generic_params(trait_id.into()).type_or_consts.len();
+    let fn_params = fn_subst.len(Interner) - trait_params;
+    let trait_ref = TraitRef {
+        trait_id: to_chalk_trait_id(trait_id),
+        substitution: Substitution::from_iter(Interner, fn_subst.iter(Interner).skip(fn_params)),
+    };
+    let self_ty = trait_ref.self_type_parameter(Interner);
+    if let TyKind::Dyn(d) = self_ty.kind(Interner) {
+        let is_my_trait_in_bounds =
+            d.bounds.skip_binders().as_slice(Interner).iter().any(|x| match x.skip_binders() {
+                // rustc doesn't accept `impl Foo<2> for dyn Foo<5>`, so if the trait id is equal, no matter
+                // what the generics are, we are sure that the method is come from the vtable.
+                WhereClause::Implemented(tr) => tr.trait_id == trait_ref.trait_id,
+                _ => false,
+            });
+        if is_my_trait_in_bounds {
+            return Some(fn_params);
+        }
+    }
+    None
+}
+
 /// Looks up the impl method that actually runs for the trait method `func`.
 ///
 /// Returns `func` if it's not a method defined in a trait or the lookup failed.
@@ -701,9 +685,8 @@ pub fn lookup_impl_method(
     func: FunctionId,
     fn_subst: Substitution,
 ) -> (FunctionId, Substitution) {
-    let trait_id = match func.lookup(db.upcast()).container {
-        ItemContainerId::TraitId(id) => id,
-        _ => return (func, fn_subst),
+    let ItemContainerId::TraitId(trait_id) = func.lookup(db.upcast()).container else {
+        return (func, fn_subst)
     };
     let trait_params = db.generic_params(trait_id.into()).type_or_consts.len();
     let fn_params = fn_subst.len(Interner) - trait_params;
@@ -824,12 +807,14 @@ fn is_inherent_impl_coherent(
             | TyKind::Scalar(_) => true,
 
             &TyKind::Adt(AdtId(adt), _) => match adt {
-                hir_def::AdtId::StructId(it) => {
-                    db.struct_data(it).rustc_has_incoherent_inherent_impls
-                }
-                hir_def::AdtId::UnionId(it) => {
-                    db.union_data(it).rustc_has_incoherent_inherent_impls
-                }
+                hir_def::AdtId::StructId(id) => db
+                    .struct_data(id)
+                    .flags
+                    .contains(StructFlags::IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL),
+                hir_def::AdtId::UnionId(id) => db
+                    .union_data(id)
+                    .flags
+                    .contains(StructFlags::IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL),
                 hir_def::AdtId::EnumId(it) => db.enum_data(it).rustc_has_incoherent_inherent_impls,
             },
             TyKind::Dyn(it) => it.principal().map_or(false, |trait_ref| {
@@ -963,7 +948,14 @@ fn iterate_method_candidates_with_autoref(
         )
     };
 
-    iterate_method_candidates_by_receiver(receiver_ty, first_adjustment.clone())?;
+    let mut maybe_reborrowed = first_adjustment.clone();
+    if let Some((_, _, m)) = receiver_ty.value.as_reference() {
+        // Prefer reborrow of references to move
+        maybe_reborrowed.autoref = Some(m);
+        maybe_reborrowed.autoderefs += 1;
+    }
+
+    iterate_method_candidates_by_receiver(receiver_ty, maybe_reborrowed)?;
 
     let refed = Canonical {
         value: TyKind::Ref(Mutability::Not, static_lifetime(), receiver_ty.value.clone())
@@ -1108,7 +1100,7 @@ fn iterate_trait_method_candidates(
             };
             if !known_implemented {
                 let goal = generic_implements_goal(db, env.clone(), t, &canonical_self_ty);
-                if db.trait_solve(env.krate, goal.cast(Interner)).is_none() {
+                if db.trait_solve(env.krate, env.block, goal.cast(Interner)).is_none() {
                     continue 'traits;
                 }
             }
@@ -1180,23 +1172,19 @@ fn iterate_inherent_methods(
     };
 
     while let Some(block_id) = block {
-        if let Some(impls) = db.inherent_impls_in_block(block_id) {
-            impls_for_self_ty(
-                &impls,
-                self_ty,
-                table,
-                name,
-                receiver_ty,
-                receiver_adjustments.clone(),
-                module,
-                callback,
-            )?;
-        }
+        let impls = db.inherent_impls_in_block(block_id);
+        impls_for_self_ty(
+            &impls,
+            self_ty,
+            table,
+            name,
+            receiver_ty,
+            receiver_adjustments.clone(),
+            module,
+            callback,
+        )?;
 
-        block = db
-            .block_def_map(block_id)
-            .and_then(|map| map.parent())
-            .and_then(|module| module.containing_block());
+        block = db.block_def_map(block_id).parent().and_then(|module| module.containing_block());
     }
 
     for krate in def_crates {
@@ -1274,7 +1262,7 @@ fn iterate_inherent_methods(
 }
 
 /// Returns the receiver type for the index trait call.
-pub fn resolve_indexing_op(
+pub(crate) fn resolve_indexing_op(
     db: &dyn HirDatabase,
     env: Arc<TraitEnvironment>,
     ty: Canonical<Ty>,
@@ -1284,8 +1272,11 @@ pub fn resolve_indexing_op(
     let ty = table.instantiate_canonical(ty);
     let deref_chain = autoderef_method_receiver(&mut table, ty);
     for (ty, adj) in deref_chain {
-        let goal = generic_implements_goal(db, env.clone(), index_trait, &ty);
-        if db.trait_solve(env.krate, goal.cast(Interner)).is_some() {
+        let goal = generic_implements_goal(db, table.trait_env.clone(), index_trait, &ty);
+        if db
+            .trait_solve(table.trait_env.krate, table.trait_env.block, goal.cast(Interner))
+            .is_some()
+        {
             return Some(adj);
         }
     }
@@ -1310,14 +1301,12 @@ fn is_valid_candidate(
 ) -> IsValidCandidate {
     let db = table.db;
     match item {
-        AssocItemId::FunctionId(m) => {
-            is_valid_fn_candidate(table, m, name, receiver_ty, self_ty, visible_from_module)
+        AssocItemId::FunctionId(f) => {
+            is_valid_fn_candidate(table, f, name, receiver_ty, self_ty, visible_from_module)
         }
         AssocItemId::ConstId(c) => {
-            let data = db.const_data(c);
             check_that!(receiver_ty.is_none());
-
-            check_that!(name.map_or(true, |n| data.name.as_ref() == Some(n)));
+            check_that!(name.map_or(true, |n| db.const_data(c).name.as_ref() == Some(n)));
 
             if let Some(from_module) = visible_from_module {
                 if !db.const_visibility(c).is_visible_from(db.upcast(), from_module) {
@@ -1441,7 +1430,7 @@ pub fn implements_trait(
     trait_: TraitId,
 ) -> bool {
     let goal = generic_implements_goal(db, env.clone(), trait_, ty);
-    let solution = db.trait_solve(env.krate, goal.cast(Interner));
+    let solution = db.trait_solve(env.krate, env.block, goal.cast(Interner));
 
     solution.is_some()
 }
@@ -1453,7 +1442,7 @@ pub fn implements_trait_unique(
     trait_: TraitId,
 ) -> bool {
     let goal = generic_implements_goal(db, env.clone(), trait_, ty);
-    let solution = db.trait_solve(env.krate, goal.cast(Interner));
+    let solution = db.trait_solve(env.krate, env.block, goal.cast(Interner));
 
     matches!(solution, Some(crate::Solution::Unique(_)))
 }

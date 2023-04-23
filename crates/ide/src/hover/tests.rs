@@ -225,7 +225,7 @@ fn main() {
                 *iter*
 
                 ```rust
-                let mut iter: Iter<Scan<OtherStruct<OtherStruct<i32>>, |&mut u32, &u32, &mut u32| -> Option<u32>, u32>>
+                let mut iter: Iter<Scan<OtherStruct<OtherStruct<i32>>, impl Fn(&mut u32, &u32, &mut u32) -> Option<u32>, u32>>
                 ```
             "#]],
     );
@@ -3115,7 +3115,7 @@ mod Foo$0 {
 }
 
 #[test]
-fn hover_doc_outer_inner_attribue() {
+fn hover_doc_outer_inner_attribute() {
     check(
         r#"
 #[doc = "Be quick;"]
@@ -3146,7 +3146,7 @@ mod Foo$0 {
 }
 
 #[test]
-fn hover_doc_block_style_indentend() {
+fn hover_doc_block_style_indent_end() {
     check(
         r#"
 /**
@@ -4242,7 +4242,7 @@ fn foo() {
 /// [threads]: ../book/ch16-01-threads.html#using-move-closures-with-threads
 mod move_keyword {}
 "#,
-        expect![[r##"
+        expect![[r#"
             *move*
 
             ```rust
@@ -4251,11 +4251,11 @@ mod move_keyword {}
 
             ---
 
-            [closure](https://doc.rust-lang.org/nightly/book/ch13-01-closures.html)
-            [closures](https://doc.rust-lang.org/nightly/book/ch13-01-closures.html)
-            [threads](https://doc.rust-lang.org/nightly/book/ch16-01-threads.html#using-move-closures-with-threads)
+            [closure](https://doc.rust-lang.org/stable/book/ch13-01-closures.html)
+            [closures](https://doc.rust-lang.org/stable/book/ch13-01-closures.html)
+            [threads](https://doc.rust-lang.org/stable/book/ch16-01-threads.html#using-move-closures-with-threads)
             <https://doc.rust-lang.org/nightly/book/ch13-01-closures.html>
-        "##]],
+        "#]],
     );
 }
 
@@ -4288,7 +4288,7 @@ fn hover_builtin() {
     check(
         r#"
 //- /main.rs crate:main deps:std
-cosnt _: &str$0 = ""; }
+const _: &str$0 = ""; }
 
 //- /libstd.rs crate:std
 /// Docs for prim_str
@@ -5009,7 +5009,7 @@ fn foo() {
 fn hover_try_expr_res() {
     check_hover_range(
         r#"
-//- minicore:result
+//- minicore: try, from, result
 struct FooError;
 
 fn foo() -> Result<(), FooError> {
@@ -5023,7 +5023,7 @@ fn foo() -> Result<(), FooError> {
     );
     check_hover_range(
         r#"
-//- minicore:result
+//- minicore: try, from, result
 struct FooError;
 struct BarError;
 
@@ -5044,6 +5044,7 @@ fn foo() -> Result<(), FooError> {
 fn hover_try_expr() {
     check_hover_range(
         r#"
+//- minicore: try
 struct NotResult<T, U>(T, U);
 struct Short;
 struct Looooong;
@@ -5061,6 +5062,7 @@ fn foo() -> NotResult<(), Looooong> {
     );
     check_hover_range(
         r#"
+//- minicore: try
 struct NotResult<T, U>(T, U);
 struct Short;
 struct Looooong;
@@ -5092,7 +5094,7 @@ fn foo() -> Option<()> {
 "#,
         expect![[r#"
                 ```rust
-                <Option<i32> as Try>::Output
+                i32
                 ```"#]],
     );
 }

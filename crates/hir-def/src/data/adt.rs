@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use base_db::CrateId;
+use bitflags::bitflags;
 use cfg::CfgOptions;
 use either::Either;
 
@@ -12,15 +13,16 @@ use hir_expand::{
 };
 use intern::Interned;
 use la_arena::{Arena, ArenaMap};
-use rustc_abi::{Integer, IntegerType};
+use rustc_abi::{Align, Integer, IntegerType, ReprFlags, ReprOptions};
 use syntax::ast::{self, HasName, HasVisibility};
 
 use crate::{
-    body::{CfgExpander, LowerCtx},
     builtin_type::{BuiltinInt, BuiltinUint},
     db::DefDatabase,
+    expander::CfgExpander,
     item_tree::{AttrOwner, Field, FieldAstId, Fields, ItemTree, ModItem, RawVisibilityId},
-    layout::{Align, ReprFlags, ReprOptions},
+    lang_item::LangItem,
+    lower::LowerCtx,
     nameres::diagnostics::DefDiagnostic,
     src::HasChildSource,
     src::HasSource,
@@ -39,8 +41,27 @@ pub struct StructData {
     pub variant_data: Arc<VariantData>,
     pub repr: Option<ReprOptions>,
     pub visibility: RawVisibility,
-    pub rustc_has_incoherent_inherent_impls: bool,
-    pub fundamental: bool,
+    pub flags: StructFlags,
+}
+
+bitflags! {
+#[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct StructFlags: u8 {
+        const NO_FLAGS         = 0;
+        /// Indicates whether the struct is `PhantomData`.
+        const IS_PHANTOM_DATA  = 1 << 2;
+        /// Indicates whether the struct has a `#[fundamental]` attribute.
+        const IS_FUNDAMENTAL   = 1 << 3;
+        // FIXME: should this be a flag?
+        /// Indicates whether the struct has a `#[rustc_has_incoherent_inherent_impls]` attribute.
+        const IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL      = 1 << 4;
+        /// Indicates whether this struct is `Box`.
+        const IS_BOX           = 1 << 5;
+        /// Indicates whether this struct is `ManuallyDrop`.
+        const IS_MANUALLY_DROP = 1 << 6;
+        /// Indicates whether this struct is `UnsafeCell`.
+        const IS_UNSAFE_CELL   = 1 << 6;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,10 +195,25 @@ impl StructData {
         let item_tree = loc.id.item_tree(db);
         let repr = repr_from_value(db, krate, &item_tree, ModItem::from(loc.id.value).into());
         let cfg_options = db.crate_graph()[loc.container.krate].cfg_options.clone();
+
         let attrs = item_tree.attrs(db, loc.container.krate, ModItem::from(loc.id.value).into());
-        let rustc_has_incoherent_inherent_impls =
-            attrs.by_key("rustc_has_incoherent_inherent_impls").exists();
-        let fundamental = attrs.by_key("fundamental").exists();
+
+        let mut flags = StructFlags::NO_FLAGS;
+        if attrs.by_key("rustc_has_incoherent_inherent_impls").exists() {
+            flags |= StructFlags::IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL;
+        }
+        if attrs.by_key("fundamental").exists() {
+            flags |= StructFlags::IS_FUNDAMENTAL;
+        }
+        if let Some(lang) = attrs.lang_item() {
+            match lang {
+                LangItem::PhantomData => flags |= StructFlags::IS_PHANTOM_DATA,
+                LangItem::OwnedBox => flags |= StructFlags::IS_BOX,
+                LangItem::ManuallyDrop => flags |= StructFlags::IS_MANUALLY_DROP,
+                LangItem::UnsafeCell => flags |= StructFlags::IS_UNSAFE_CELL,
+                _ => (),
+            }
+        }
 
         let strukt = &item_tree[loc.id.value];
         let (variant_data, diagnostics) = lower_fields(
@@ -196,8 +232,7 @@ impl StructData {
                 variant_data: Arc::new(variant_data),
                 repr,
                 visibility: item_tree[strukt.visibility].clone(),
-                rustc_has_incoherent_inherent_impls,
-                fundamental,
+                flags,
             }),
             diagnostics.into(),
         )
@@ -218,9 +253,13 @@ impl StructData {
         let cfg_options = db.crate_graph()[loc.container.krate].cfg_options.clone();
 
         let attrs = item_tree.attrs(db, loc.container.krate, ModItem::from(loc.id.value).into());
-        let rustc_has_incoherent_inherent_impls =
-            attrs.by_key("rustc_has_incoherent_inherent_impls").exists();
-        let fundamental = attrs.by_key("fundamental").exists();
+        let mut flags = StructFlags::NO_FLAGS;
+        if attrs.by_key("rustc_has_incoherent_inherent_impls").exists() {
+            flags |= StructFlags::IS_RUSTC_HAS_INCOHERENT_INHERENT_IMPL;
+        }
+        if attrs.by_key("fundamental").exists() {
+            flags |= StructFlags::IS_FUNDAMENTAL;
+        }
 
         let union = &item_tree[loc.id.value];
         let (variant_data, diagnostics) = lower_fields(
@@ -239,8 +278,7 @@ impl StructData {
                 variant_data: Arc::new(variant_data),
                 repr,
                 visibility: item_tree[union.visibility].clone(),
-                rustc_has_incoherent_inherent_impls,
-                fundamental,
+                flags,
             }),
             diagnostics.into(),
         )
@@ -436,7 +474,7 @@ fn lower_struct(
     trace: &mut Trace<FieldData, Either<ast::TupleField, ast::RecordField>>,
     ast: &InFile<ast::StructKind>,
 ) -> StructKind {
-    let ctx = LowerCtx::new(db, ast.file_id);
+    let ctx = LowerCtx::new(db, &expander.hygiene(), ast.file_id);
 
     match &ast.value {
         ast::StructKind::Tuple(fl) => {

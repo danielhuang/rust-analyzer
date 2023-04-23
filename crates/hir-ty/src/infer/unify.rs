@@ -7,17 +7,18 @@ use chalk_ir::{
     IntTy, TyVariableKind, UniverseIndex,
 };
 use chalk_solve::infer::ParameterEnaVariableExt;
+use either::Either;
 use ena::unify::UnifyKey;
-use hir_def::{FunctionId, TraitId};
 use hir_expand::name;
 use stdx::never;
 
 use super::{InferOk, InferResult, InferenceContext, TypeError};
 use crate::{
-    db::HirDatabase, fold_tys, static_lifetime, traits::FnTrait, AliasEq, AliasTy, BoundVar,
-    Canonical, Const, DebruijnIndex, GenericArg, GenericArgData, Goal, Guidance, InEnvironment,
-    InferenceVar, Interner, Lifetime, ParamKind, ProjectionTy, ProjectionTyExt, Scalar, Solution,
-    Substitution, TraitEnvironment, Ty, TyBuilder, TyExt, TyKind, VariableKind,
+    db::HirDatabase, fold_tys, fold_tys_and_consts, static_lifetime, to_chalk_trait_id,
+    traits::FnTrait, AliasEq, AliasTy, BoundVar, Canonical, Const, ConstValue, DebruijnIndex,
+    GenericArg, GenericArgData, Goal, Guidance, InEnvironment, InferenceVar, Interner, Lifetime,
+    ParamKind, ProjectionTy, ProjectionTyExt, Scalar, Solution, Substitution, TraitEnvironment, Ty,
+    TyBuilder, TyExt, TyKind, VariableKind,
 };
 
 impl<'a> InferenceContext<'a> {
@@ -130,7 +131,7 @@ pub(crate) fn unify(
 }
 
 bitflags::bitflags! {
-    #[derive(Default)]
+    #[derive(Default, Clone, Copy)]
     pub(crate) struct TypeVariableFlags: u8 {
         const DIVERGING = 1 << 0;
         const INTEGER = 1 << 1;
@@ -463,7 +464,8 @@ impl<'a> InferenceTable<'a> {
     pub(crate) fn try_obligation(&mut self, goal: Goal) -> Option<Solution> {
         let in_env = InEnvironment::new(&self.trait_env.env, goal);
         let canonicalized = self.canonicalize(in_env);
-        let solution = self.db.trait_solve(self.trait_env.krate, canonicalized.value);
+        let solution =
+            self.db.trait_solve(self.trait_env.krate, self.trait_env.block, canonicalized.value);
         solution
     }
 
@@ -598,7 +600,11 @@ impl<'a> InferenceTable<'a> {
         &mut self,
         canonicalized: &Canonicalized<InEnvironment<Goal>>,
     ) -> bool {
-        let solution = self.db.trait_solve(self.trait_env.krate, canonicalized.value.clone());
+        let solution = self.db.trait_solve(
+            self.trait_env.krate,
+            self.trait_env.block,
+            canonicalized.value.clone(),
+        );
 
         match solution {
             Some(Solution::Unique(canonical_subst)) => {
@@ -631,10 +637,13 @@ impl<'a> InferenceTable<'a> {
         &mut self,
         ty: &Ty,
         num_args: usize,
-    ) -> Option<(Option<(TraitId, FunctionId)>, Vec<Ty>, Ty)> {
+    ) -> Option<(Option<FnTrait>, Vec<Ty>, Ty)> {
         match ty.callable_sig(self.db) {
             Some(sig) => Some((None, sig.params().to_vec(), sig.ret().clone())),
-            None => self.callable_sig_from_fn_trait(ty, num_args),
+            None => {
+                let (f, args_ty, return_ty) = self.callable_sig_from_fn_trait(ty, num_args)?;
+                Some((Some(f), args_ty, return_ty))
+            }
         }
     }
 
@@ -642,7 +651,7 @@ impl<'a> InferenceTable<'a> {
         &mut self,
         ty: &Ty,
         num_args: usize,
-    ) -> Option<(Option<(TraitId, FunctionId)>, Vec<Ty>, Ty)> {
+    ) -> Option<(FnTrait, Vec<Ty>, Ty)> {
         let krate = self.trait_env.krate;
         let fn_once_trait = FnTrait::FnOnce.get_id(self.db, krate)?;
         let trait_data = self.db.trait_data(fn_once_trait);
@@ -676,21 +685,77 @@ impl<'a> InferenceTable<'a> {
         };
 
         let trait_env = self.trait_env.env.clone();
+        let mut trait_ref = projection.trait_ref(self.db);
         let obligation = InEnvironment {
-            goal: projection.trait_ref(self.db).cast(Interner),
-            environment: trait_env,
+            goal: trait_ref.clone().cast(Interner),
+            environment: trait_env.clone(),
         };
         let canonical = self.canonicalize(obligation.clone());
-        if self.db.trait_solve(krate, canonical.value.cast(Interner)).is_some() {
+        if self
+            .db
+            .trait_solve(krate, self.trait_env.block, canonical.value.cast(Interner))
+            .is_some()
+        {
             self.register_obligation(obligation.goal);
             let return_ty = self.normalize_projection_ty(projection);
-            Some((
-                Some(fn_once_trait).zip(trait_data.method_by_name(&name!(call_once))),
-                arg_tys,
-                return_ty,
-            ))
+            for fn_x in [FnTrait::Fn, FnTrait::FnMut, FnTrait::FnOnce] {
+                let fn_x_trait = fn_x.get_id(self.db, krate)?;
+                trait_ref.trait_id = to_chalk_trait_id(fn_x_trait);
+                let obligation: chalk_ir::InEnvironment<chalk_ir::Goal<Interner>> = InEnvironment {
+                    goal: trait_ref.clone().cast(Interner),
+                    environment: trait_env.clone(),
+                };
+                let canonical = self.canonicalize(obligation.clone());
+                if self
+                    .db
+                    .trait_solve(krate, self.trait_env.block, canonical.value.cast(Interner))
+                    .is_some()
+                {
+                    return Some((fn_x, arg_tys, return_ty));
+                }
+            }
+            unreachable!("It should at least implement FnOnce at this point");
         } else {
             None
+        }
+    }
+
+    pub(super) fn insert_type_vars(&mut self, ty: Ty) -> Ty {
+        fold_tys_and_consts(
+            ty,
+            |x, _| match x {
+                Either::Left(ty) => Either::Left(self.insert_type_vars_shallow(ty)),
+                Either::Right(c) => Either::Right(self.insert_const_vars_shallow(c)),
+            },
+            DebruijnIndex::INNERMOST,
+        )
+    }
+
+    /// Replaces `Ty::Error` by a new type var, so we can maybe still infer it.
+    pub(super) fn insert_type_vars_shallow(&mut self, ty: Ty) -> Ty {
+        match ty.kind(Interner) {
+            TyKind::Error => self.new_type_var(),
+            TyKind::InferenceVar(..) => {
+                let ty_resolved = self.resolve_ty_shallow(&ty);
+                if ty_resolved.is_unknown() {
+                    self.new_type_var()
+                } else {
+                    ty
+                }
+            }
+            _ => ty,
+        }
+    }
+
+    /// Replaces ConstScalar::Unknown by a new type var, so we can maybe still infer it.
+    pub(super) fn insert_const_vars_shallow(&mut self, c: Const) -> Const {
+        let data = c.data(Interner);
+        match &data.value {
+            ConstValue::Concrete(cc) => match cc.interned {
+                crate::ConstScalar::Unknown => self.new_const_var(data.ty.clone()),
+                _ => c,
+            },
+            _ => c,
         }
     }
 }

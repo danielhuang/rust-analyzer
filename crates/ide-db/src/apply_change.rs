@@ -64,6 +64,7 @@ impl RootDatabase {
             // SourceDatabase
             base_db::ParseQuery
             base_db::CrateGraphQuery
+            base_db::ProcMacrosQuery
 
             // SourceDatabaseExt
             base_db::FileTextQuery
@@ -79,7 +80,6 @@ impl RootDatabase {
             hir::db::MacroDefQuery
             hir::db::MacroExpandQuery
             hir::db::ExpandProcMacroQuery
-            hir::db::MacroExpandErrorQuery
             hir::db::HygieneFrameQuery
 
             // DefDatabase

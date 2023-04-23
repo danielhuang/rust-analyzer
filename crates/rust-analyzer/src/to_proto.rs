@@ -279,7 +279,7 @@ fn completion_item(
 
     let mut lsp_item = lsp_types::CompletionItem {
         label: item.label.to_string(),
-        detail: item.detail.map(|it| it.to_string()),
+        detail: item.detail,
         filter_text: Some(lookup),
         kind: Some(completion_item_kind(item.kind)),
         text_edit: Some(text_edit),
@@ -510,7 +510,7 @@ pub(crate) fn inlay_hint(
             | InlayKind::AdjustmentPostfix
             | InlayKind::ClosingBrace => None,
         },
-        text_edits: None,
+        text_edits: inlay_hint.text_edit.map(|it| text_edit_vec(line_index, it)),
         data: None,
         tooltip,
         label,
@@ -1257,7 +1257,16 @@ pub(crate) fn code_lens(
             acc.push(lsp_types::CodeLens {
                 range: annotation_range,
                 command,
-                data: Some(to_value(lsp_ext::CodeLensResolveData::Impls(goto_params)).unwrap()),
+                data: (|| {
+                    let version = snap.url_file_version(&url)?;
+                    Some(
+                        to_value(lsp_ext::CodeLensResolveData {
+                            version,
+                            kind: lsp_ext::CodeLensResolveDataKind::Impls(goto_params),
+                        })
+                        .unwrap(),
+                    )
+                })(),
             })
         }
         AnnotationKind::HasReferences { pos: file_range, data } => {
@@ -1287,7 +1296,16 @@ pub(crate) fn code_lens(
             acc.push(lsp_types::CodeLens {
                 range: annotation_range,
                 command,
-                data: Some(to_value(lsp_ext::CodeLensResolveData::References(doc_pos)).unwrap()),
+                data: (|| {
+                    let version = snap.url_file_version(&url)?;
+                    Some(
+                        to_value(lsp_ext::CodeLensResolveData {
+                            version,
+                            kind: lsp_ext::CodeLensResolveDataKind::References(doc_pos),
+                        })
+                        .unwrap(),
+                    )
+                })(),
             })
         }
     }

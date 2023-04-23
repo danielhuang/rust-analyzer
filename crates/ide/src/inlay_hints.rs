@@ -5,7 +5,8 @@ use std::{
 
 use either::Either;
 use hir::{
-    known, HasVisibility, HirDisplay, HirDisplayError, HirWrite, ModuleDef, ModuleDefId, Semantics,
+    known, ClosureStyle, HasVisibility, HirDisplay, HirDisplayError, HirWrite, ModuleDef,
+    ModuleDefId, Semantics,
 };
 use ide_db::{base_db::FileRange, famous_defs::FamousDefs, RootDatabase};
 use itertools::Itertools;
@@ -13,8 +14,9 @@ use smallvec::{smallvec, SmallVec};
 use stdx::never;
 use syntax::{
     ast::{self, AstNode},
-    match_ast, NodeOrToken, SyntaxNode, TextRange,
+    match_ast, NodeOrToken, SyntaxNode, TextRange, TextSize,
 };
+use text_edit::TextEdit;
 
 use crate::{navigation_target::TryToNav, FileId};
 
@@ -45,6 +47,7 @@ pub struct InlayHintsConfig {
     pub param_names_for_lifetime_elision_hints: bool,
     pub hide_named_constructor_hints: bool,
     pub hide_closure_initialization_hints: bool,
+    pub closure_style: ClosureStyle,
     pub max_length: Option<usize>,
     pub closing_brace_hints_min_lines: Option<usize>,
 }
@@ -111,14 +114,26 @@ pub struct InlayHint {
     pub kind: InlayKind,
     /// The actual label to show in the inlay hint.
     pub label: InlayHintLabel,
+    /// Text edit to apply when "accepting" this inlay hint.
+    pub text_edit: Option<TextEdit>,
 }
 
 impl InlayHint {
     fn closing_paren(range: TextRange) -> InlayHint {
-        InlayHint { range, kind: InlayKind::ClosingParenthesis, label: InlayHintLabel::from(")") }
+        InlayHint {
+            range,
+            kind: InlayKind::ClosingParenthesis,
+            label: InlayHintLabel::from(")"),
+            text_edit: None,
+        }
     }
     fn opening_paren(range: TextRange) -> InlayHint {
-        InlayHint { range, kind: InlayKind::OpeningParenthesis, label: InlayHintLabel::from("(") }
+        InlayHint {
+            range,
+            kind: InlayKind::OpeningParenthesis,
+            label: InlayHintLabel::from("("),
+            text_edit: None,
+        }
     }
 }
 
@@ -291,6 +306,7 @@ fn label_of_ty(
         mut max_length: Option<usize>,
         ty: hir::Type,
         label_builder: &mut InlayHintLabelBuilder<'_>,
+        config: &InlayHintsConfig,
     ) -> Result<(), HirDisplayError> {
         let iter_item_type = hint_iterator(sema, famous_defs, &ty);
         match iter_item_type {
@@ -321,11 +337,14 @@ fn label_of_ty(
                 label_builder.write_str(LABEL_ITEM)?;
                 label_builder.end_location_link();
                 label_builder.write_str(LABEL_MIDDLE2)?;
-                rec(sema, famous_defs, max_length, ty, label_builder)?;
+                rec(sema, famous_defs, max_length, ty, label_builder, config)?;
                 label_builder.write_str(LABEL_END)?;
                 Ok(())
             }
-            None => ty.display_truncated(sema.db, max_length).write_to(label_builder),
+            None => ty
+                .display_truncated(sema.db, max_length)
+                .with_closure_style(config.closure_style)
+                .write_to(label_builder),
         }
     }
 
@@ -335,9 +354,26 @@ fn label_of_ty(
         location: None,
         result: InlayHintLabel::default(),
     };
-    let _ = rec(sema, famous_defs, config.max_length, ty, &mut label_builder);
+    let _ = rec(sema, famous_defs, config.max_length, ty, &mut label_builder, config);
     let r = label_builder.finish();
     Some(r)
+}
+
+fn ty_to_text_edit(
+    sema: &Semantics<'_, RootDatabase>,
+    node_for_hint: &SyntaxNode,
+    ty: &hir::Type,
+    offset_to_insert: TextSize,
+    prefix: String,
+) -> Option<TextEdit> {
+    let scope = sema.scope(node_for_hint)?;
+    // FIXME: Limit the length and bail out on excess somehow?
+    let rendered = ty.display_source_code(scope.db, scope.module().into(), false).ok()?;
+
+    let mut builder = TextEdit::builder();
+    builder.insert(offset_to_insert, prefix);
+    builder.insert(offset_to_insert, rendered);
+    Some(builder.finish())
 }
 
 // Feature: Inlay Hints
@@ -481,6 +517,7 @@ fn closure_has_block_body(closure: &ast::ClosureExpr) -> bool {
 #[cfg(test)]
 mod tests {
     use expect_test::Expect;
+    use hir::ClosureStyle;
     use itertools::Itertools;
     use test_utils::extract_annotations;
 
@@ -504,6 +541,7 @@ mod tests {
         binding_mode_hints: false,
         hide_named_constructor_hints: false,
         hide_closure_initialization_hints: false,
+        closure_style: ClosureStyle::ImplFn,
         param_names_for_lifetime_elision_hints: false,
         max_length: None,
         closing_brace_hints_min_lines: None,
@@ -543,6 +581,37 @@ mod tests {
         let (analysis, file_id) = fixture::file(ra_fixture);
         let inlay_hints = analysis.inlay_hints(&config, file_id, None).unwrap();
         expect.assert_debug_eq(&inlay_hints)
+    }
+
+    /// Computes inlay hints for the fixture, applies all the provided text edits and then runs
+    /// expect test.
+    #[track_caller]
+    pub(super) fn check_edit(config: InlayHintsConfig, ra_fixture: &str, expect: Expect) {
+        let (analysis, file_id) = fixture::file(ra_fixture);
+        let inlay_hints = analysis.inlay_hints(&config, file_id, None).unwrap();
+
+        let edits = inlay_hints
+            .into_iter()
+            .filter_map(|hint| hint.text_edit)
+            .reduce(|mut acc, next| {
+                acc.union(next).expect("merging text edits failed");
+                acc
+            })
+            .expect("no edit returned");
+
+        let mut actual = analysis.file_text(file_id).unwrap().to_string();
+        edits.apply(&mut actual);
+        expect.assert_eq(&actual);
+    }
+
+    #[track_caller]
+    pub(super) fn check_no_edit(config: InlayHintsConfig, ra_fixture: &str) {
+        let (analysis, file_id) = fixture::file(ra_fixture);
+        let inlay_hints = analysis.inlay_hints(&config, file_id, None).unwrap();
+
+        let edits: Vec<_> = inlay_hints.into_iter().filter_map(|hint| hint.text_edit).collect();
+
+        assert!(edits.is_empty(), "unexpected edits: {edits:?}");
     }
 
     #[test]

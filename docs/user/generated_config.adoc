@@ -474,6 +474,11 @@ to always show them).
 --
 Whether to show inlay type hints for return types of closures.
 --
+[[rust-analyzer.inlayHints.closureStyle]]rust-analyzer.inlayHints.closureStyle (default: `"impl_fn"`)::
++
+--
+Closure notation in type and chaining inlay hints.
+--
 [[rust-analyzer.inlayHints.discriminantHints.enable]]rust-analyzer.inlayHints.discriminantHints.enable (default: `"never"`)::
 +
 --
@@ -639,6 +644,11 @@ Elements must be paths pointing to `Cargo.toml`,
 --
 Number of syntax trees rust-analyzer keeps in memory. Defaults to 128.
 --
+[[rust-analyzer.lru.query.capacities]]rust-analyzer.lru.query.capacities (default: `{}`)::
++
+--
+Sets the LRU capacity of the specified queries.
+--
 [[rust-analyzer.notifications.cargoTomlNotFound]]rust-analyzer.notifications.cargoTomlNotFound (default: `true`)::
 +
 --
@@ -748,7 +758,7 @@ of the generic `operator` token type.
 [[rust-analyzer.semanticHighlighting.punctuation.enable]]rust-analyzer.semanticHighlighting.punctuation.enable (default: `false`)::
 +
 --
-Use semantic tokens for punctuations.
+Use semantic tokens for punctuation.
 
 When disabled, rust-analyzer will emit semantic tokens only for punctuation tokens when
 they are tagged with modifiers or have a special role.
@@ -762,7 +772,7 @@ calls.
 [[rust-analyzer.semanticHighlighting.punctuation.specialization.enable]]rust-analyzer.semanticHighlighting.punctuation.specialization.enable (default: `false`)::
 +
 --
-Use specialized semantic tokens for punctuations.
+Use specialized semantic tokens for punctuation.
 
 When enabled, rust-analyzer will emit special token types for punctuation tokens instead
 of the generic `punctuation` token type.

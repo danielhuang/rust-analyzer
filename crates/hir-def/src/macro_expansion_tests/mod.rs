@@ -125,21 +125,15 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
 
     for macro_call in source_file.syntax().descendants().filter_map(ast::MacroCall::cast) {
         let macro_call = InFile::new(source.file_id, &macro_call);
-        let mut error = None;
-        let macro_call_id = macro_call
-            .as_call_id_with_errors(
-                &db,
-                krate,
-                |path| {
-                    resolver.resolve_path_as_macro(&db, &path).map(|it| macro_id_to_def_id(&db, it))
-                },
-                &mut |err| error = Some(err),
-            )
-            .unwrap()
+        let res = macro_call
+            .as_call_id_with_errors(&db, krate, |path| {
+                resolver.resolve_path_as_macro(&db, &path).map(|it| macro_id_to_def_id(&db, it))
+            })
             .unwrap();
+        let macro_call_id = res.value.unwrap();
         let macro_file = MacroFile { macro_call_id };
         let mut expansion_result = db.parse_macro_expansion(macro_file);
-        expansion_result.err = expansion_result.err.or(error);
+        expansion_result.err = expansion_result.err.or(res.err);
         expansions.push((macro_call.value.clone(), expansion_result, db.macro_arg(macro_call_id)));
     }
 
@@ -157,34 +151,33 @@ pub fn identity_when_valid(_attr: TokenStream, item: TokenStream) -> TokenStream
         if let Some(err) = exp.err {
             format_to!(expn_text, "/* error: {} */", err);
         }
-        if let Some((parse, token_map)) = exp.value {
-            if expect_errors {
-                assert!(!parse.errors().is_empty(), "no parse errors in expansion");
-                for e in parse.errors() {
-                    format_to!(expn_text, "/* parse error: {} */\n", e);
-                }
-            } else {
-                assert!(
-                    parse.errors().is_empty(),
-                    "parse errors in expansion: \n{:#?}",
-                    parse.errors()
-                );
+        let (parse, token_map) = exp.value;
+        if expect_errors {
+            assert!(!parse.errors().is_empty(), "no parse errors in expansion");
+            for e in parse.errors() {
+                format_to!(expn_text, "/* parse error: {} */\n", e);
             }
-            let pp = pretty_print_macro_expansion(
-                parse.syntax_node(),
-                show_token_ids.then_some(&*token_map),
+        } else {
+            assert!(
+                parse.errors().is_empty(),
+                "parse errors in expansion: \n{:#?}",
+                parse.errors()
             );
-            let indent = IndentLevel::from_node(call.syntax());
-            let pp = reindent(indent, pp);
-            format_to!(expn_text, "{}", pp);
+        }
+        let pp = pretty_print_macro_expansion(
+            parse.syntax_node(),
+            show_token_ids.then_some(&*token_map),
+        );
+        let indent = IndentLevel::from_node(call.syntax());
+        let pp = reindent(indent, pp);
+        format_to!(expn_text, "{}", pp);
 
-            if tree {
-                let tree = format!("{:#?}", parse.syntax_node())
-                    .split_inclusive('\n')
-                    .map(|line| format!("// {line}"))
-                    .collect::<String>();
-                format_to!(expn_text, "\n{}", tree)
-            }
+        if tree {
+            let tree = format!("{:#?}", parse.syntax_node())
+                .split_inclusive('\n')
+                .map(|line| format!("// {line}"))
+                .collect::<String>();
+            format_to!(expn_text, "\n{}", tree)
         }
         let range = call.syntax().text_range();
         let range: Range<usize> = range.into();

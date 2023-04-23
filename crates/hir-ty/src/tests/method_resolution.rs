@@ -389,6 +389,24 @@ mod bar_test {
 }
 
 #[test]
+fn infer_trait_method_multiple_mutable_reference() {
+    check_types(
+        r#"
+trait Trait {
+    fn method(&mut self) -> i32 { 5 }
+}
+struct S;
+impl Trait for &mut &mut S {}
+fn test() {
+    let s = &mut &mut &mut S;
+    s.method();
+  //^^^^^^^^^^ i32
+}
+        "#,
+    );
+}
+
+#[test]
 fn infer_trait_method_generic_1() {
     // the trait implementation is intentionally incomplete -- it shouldn't matter
     check_types(
@@ -1255,7 +1273,6 @@ fn foo<T: Trait>(a: &T) {
 
 #[test]
 fn autoderef_visibility_field() {
-    // FIXME: We should know mutability in overloaded deref
     check(
         r#"
 //- minicore: deref
@@ -1277,7 +1294,7 @@ mod a {
 mod b {
     fn foo() {
         let x = super::a::Bar::new().0;
-             // ^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(None)))
+             // ^^^^^^^^^^^^^^^^^^^^ adjustments: Deref(Some(OverloadedDeref(Some(Not))))
              // ^^^^^^^^^^^^^^^^^^^^^^ type: char
     }
 }
@@ -1723,7 +1740,7 @@ fn test() {
     Foo.foo();
   //^^^ adjustments: Borrow(Ref(Not))
     (&Foo).foo();
-  // ^^^^ adjustments: ,
+  // ^^^^ adjustments: Deref(None), Borrow(Ref(Not))
 }
 "#,
     );

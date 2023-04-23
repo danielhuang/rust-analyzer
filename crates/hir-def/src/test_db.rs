@@ -6,11 +6,12 @@ use std::{
 };
 
 use base_db::{
-    salsa, AnchoredPath, CrateId, FileId, FileLoader, FileLoaderDelegate, FilePosition,
-    SourceDatabase, Upcast,
+    salsa::{self, Durability},
+    AnchoredPath, CrateId, FileId, FileLoader, FileLoaderDelegate, FilePosition, SourceDatabase,
+    Upcast,
 };
 use hir_expand::{db::ExpandDatabase, InFile};
-use stdx::hash::NoHashHashSet;
+use rustc_hash::FxHashSet;
 use syntax::{algo, ast, AstNode};
 
 use crate::{
@@ -35,7 +36,7 @@ pub(crate) struct TestDB {
 impl Default for TestDB {
     fn default() -> Self {
         let mut this = Self { storage: Default::default(), events: Default::default() };
-        this.set_enable_proc_attr_macros(true);
+        this.set_expand_proc_attr_macros_with_durability(true, Durability::HIGH);
         this
     }
 }
@@ -70,13 +71,13 @@ impl fmt::Debug for TestDB {
 impl panic::RefUnwindSafe for TestDB {}
 
 impl FileLoader for TestDB {
-    fn file_text(&self, file_id: FileId) -> Arc<String> {
+    fn file_text(&self, file_id: FileId) -> Arc<str> {
         FileLoaderDelegate(self).file_text(file_id)
     }
     fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
         FileLoaderDelegate(self).resolve_path(path)
     }
-    fn relevant_crates(&self, file_id: FileId) -> Arc<NoHashHashSet<CrateId>> {
+    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
         FileLoaderDelegate(self).relevant_crates(file_id)
     }
 }
@@ -209,13 +210,11 @@ impl TestDB {
             });
 
         for scope in scope_iter {
-            let containing_blocks =
+            let mut containing_blocks =
                 scopes.scope_chain(Some(scope)).filter_map(|scope| scopes.block(scope));
 
-            for block in containing_blocks {
-                if let Some(def_map) = self.block_def_map(block) {
-                    return Some(def_map);
-                }
+            if let Some(block) = containing_blocks.next().map(|block| self.block_def_map(block)) {
+                return Some(block);
             }
         }
 

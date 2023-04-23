@@ -17,7 +17,7 @@ use ide_db::{
 };
 use syntax::{
     ast::{self, AttrKind, NameOrNameRef},
-    AstNode,
+    AstNode, SmolStr,
     SyntaxKind::{self, *},
     SyntaxToken, TextRange, TextSize, T,
 };
@@ -367,6 +367,8 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) krate: hir::Crate,
     /// The module of the `scope`.
     pub(super) module: hir::Module,
+    /// Whether nightly toolchain is used. Cached since this is looked up a lot.
+    is_nightly: bool,
 
     /// The expected name of what we are completing.
     /// This is usually the parameter name of the function argument we are completing.
@@ -386,7 +388,7 @@ pub(crate) struct CompletionContext<'a> {
     pub(super) depth_from_crate_root: usize,
 }
 
-impl<'a> CompletionContext<'a> {
+impl CompletionContext<'_> {
     /// The range of the identifier that is being completed.
     pub(crate) fn source_range(&self) -> TextRange {
         let kind = self.original_token.kind();
@@ -451,6 +453,12 @@ impl<'a> CompletionContext<'a> {
         }
     }
 
+    /// Checks whether this item should be listed in regards to stability. Returns `true` if we should.
+    pub(crate) fn check_stability(&self, attrs: Option<&hir::Attrs>) -> bool {
+        let Some(attrs) = attrs else { return true; };
+        !attrs.is_unstable() || self.is_nightly
+    }
+
     /// Whether the given trait is an operator trait or not.
     pub(crate) fn is_ops_trait(&self, trait_: hir::Trait) -> bool {
         match trait_.attrs(self.db).lang() {
@@ -491,21 +499,22 @@ impl<'a> CompletionContext<'a> {
         );
     }
 
-    /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items.
-    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
+    /// A version of [`SemanticsScope::process_all_names`] that filters out `#[doc(hidden)]` items and
+    /// passes all doc-aliases along, to funnel it into [`Completions::add_path_resolution`].
+    pub(crate) fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef, Vec<SmolStr>)) {
         let _p = profile::span("CompletionContext::process_all_names");
         self.scope.process_all_names(&mut |name, def| {
             if self.is_scope_def_hidden(def) {
                 return;
             }
-
-            f(name, def);
+            let doc_aliases = self.doc_aliases(def);
+            f(name, def, doc_aliases);
         });
     }
 
     pub(crate) fn process_all_names_raw(&self, f: &mut dyn FnMut(Name, ScopeDef)) {
         let _p = profile::span("CompletionContext::process_all_names_raw");
-        self.scope.process_all_names(&mut |name, def| f(name, def));
+        self.scope.process_all_names(f);
     }
 
     fn is_scope_def_hidden(&self, scope_def: ScopeDef) -> bool {
@@ -544,6 +553,14 @@ impl<'a> CompletionContext<'a> {
     fn is_doc_hidden(&self, attrs: &hir::Attrs, defining_crate: hir::Crate) -> bool {
         // `doc(hidden)` items are only completed within the defining crate.
         self.krate != defining_crate && attrs.has_doc_hidden()
+    }
+
+    fn doc_aliases(&self, scope_def: ScopeDef) -> Vec<SmolStr> {
+        if let Some(attrs) = scope_def.attrs(self.db) {
+            attrs.doc_aliases().collect()
+        } else {
+            vec![]
+        }
     }
 }
 
@@ -615,6 +632,11 @@ impl<'a> CompletionContext<'a> {
         let krate = scope.krate();
         let module = scope.module();
 
+        let toolchain = db.crate_graph()[krate.into()].channel;
+        // `toolchain == None` means we're in some detached files. Since we have no information on
+        // the toolchain being used, let's just allow unstable items to be listed.
+        let is_nightly = matches!(toolchain, Some(base_db::ReleaseChannel::Nightly) | None);
+
         let mut locals = FxHashMap::default();
         scope.process_all_names(&mut |name, scope| {
             if let ScopeDef::Local(local) = scope {
@@ -634,6 +656,7 @@ impl<'a> CompletionContext<'a> {
             token,
             krate,
             module,
+            is_nightly,
             expected_name,
             expected_type,
             qualifier_ctx,

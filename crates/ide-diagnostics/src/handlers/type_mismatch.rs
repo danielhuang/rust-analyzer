@@ -1,5 +1,5 @@
 use either::Either;
-use hir::{db::ExpandDatabase, HirDisplay, InFile, Type};
+use hir::{db::ExpandDatabase, ClosureStyle, HirDisplay, InFile, Type};
 use ide_db::{famous_defs::FamousDefs, source_change::SourceChange};
 use syntax::{
     ast::{self, BlockExpr, ExprStmt},
@@ -32,8 +32,8 @@ pub(crate) fn type_mismatch(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch)
         "type-mismatch",
         format!(
             "expected {}, found {}",
-            d.expected.display(ctx.sema.db),
-            d.actual.display(ctx.sema.db)
+            d.expected.display(ctx.sema.db).with_closure_style(ClosureStyle::ClosureWithId),
+            d.actual.display(ctx.sema.db).with_closure_style(ClosureStyle::ClosureWithId),
         ),
         display_range,
     )
@@ -93,7 +93,7 @@ fn add_missing_ok_or_some(
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
-    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id)?;
+    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id);
     let expr = expr_ptr.value.to_node(&root);
     let expr_range = expr.syntax().text_range();
     let scope = ctx.sema.scope(expr.syntax())?;
@@ -133,7 +133,7 @@ fn remove_semicolon(
     expr_ptr: &InFile<AstPtr<ast::Expr>>,
     acc: &mut Vec<Assist>,
 ) -> Option<()> {
-    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id)?;
+    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id);
     let expr = expr_ptr.value.to_node(&root);
     if !d.actual.is_unit() {
         return None;
@@ -169,7 +169,7 @@ fn str_ref_to_owned(
         return None;
     }
 
-    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id)?;
+    let root = ctx.sema.db.parse_or_expand(expr_ptr.file_id);
     let expr = expr_ptr.value.to_node(&root);
     let expr_range = expr.syntax().text_range();
 
@@ -591,6 +591,19 @@ struct String;
 
 fn test() -> String {
     "a".to_owned()
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn closure_mismatch_show_different_type() {
+        check_diagnostics(
+            r#"
+fn f() {
+    let mut x = (|| 1, 2);
+    x = (|| 3, 4);
+       //^^^^ error: expected {closure#0}, found {closure#1}
 }
             "#,
         );

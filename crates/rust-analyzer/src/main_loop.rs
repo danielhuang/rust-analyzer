@@ -24,7 +24,7 @@ use crate::{
     handlers, lsp_ext,
     lsp_utils::{apply_document_changes, notification_is, Progress},
     mem_docs::DocumentData,
-    reload::{self, BuildDataProgress, ProjectWorkspaceProgress},
+    reload::{self, BuildDataProgress, ProcMacroProgress, ProjectWorkspaceProgress},
     Result,
 };
 
@@ -36,7 +36,7 @@ pub fn main_loop(config: Config, connection: Connection) -> Result<()> {
     // temporary bumped. This optimization backfires in our case: each time the
     // `main_loop` schedules a task to run on a threadpool, the worker threads
     // gets a higher priority, and (on a machine with fewer cores) displaces the
-    // main loop! We work-around this by marking the main loop as a
+    // main loop! We work around this by marking the main loop as a
     // higher-priority thread.
     //
     // https://docs.microsoft.com/en-us/windows/win32/procthread/scheduling-priorities
@@ -68,6 +68,7 @@ pub(crate) enum Task {
     PrimeCaches(PrimeCachesProgress),
     FetchWorkspace(ProjectWorkspaceProgress),
     FetchBuildData(BuildDataProgress),
+    LoadProcMacros(ProcMacroProgress),
 }
 
 #[derive(Debug)]
@@ -148,8 +149,8 @@ impl GlobalState {
             );
         }
 
-        self.fetch_workspaces_queue.request_op("startup".to_string());
-        if let Some(cause) = self.fetch_workspaces_queue.should_start_op() {
+        self.fetch_workspaces_queue.request_op("startup".to_string(), ());
+        if let Some((cause, ())) = self.fetch_workspaces_queue.should_start_op() {
             self.fetch_workspaces(cause);
         }
 
@@ -247,7 +248,7 @@ impl GlobalState {
                             self.prime_caches_queue.op_completed(());
                             if cancelled {
                                 self.prime_caches_queue
-                                    .request_op("restart after cancellation".to_string());
+                                    .request_op("restart after cancellation".to_string(), ());
                             }
                         }
                     };
@@ -279,7 +280,8 @@ impl GlobalState {
         if self.is_quiescent() {
             let became_quiescent = !(was_quiescent
                 || self.fetch_workspaces_queue.op_requested()
-                || self.fetch_build_data_queue.op_requested());
+                || self.fetch_build_data_queue.op_requested()
+                || self.fetch_proc_macros_queue.op_requested());
 
             if became_quiescent {
                 if self.config.check_on_save() {
@@ -287,7 +289,7 @@ impl GlobalState {
                     self.flycheck.iter().for_each(FlycheckHandle::restart);
                 }
                 if self.config.prefill_caches() {
-                    self.prime_caches_queue.request_op("became quiescent".to_string());
+                    self.prime_caches_queue.request_op("became quiescent".to_string(), ());
                 }
             }
 
@@ -357,18 +359,20 @@ impl GlobalState {
         }
 
         if self.config.cargo_autoreload() {
-            if let Some(cause) = self.fetch_workspaces_queue.should_start_op() {
+            if let Some((cause, ())) = self.fetch_workspaces_queue.should_start_op() {
                 self.fetch_workspaces(cause);
             }
         }
 
         if !self.fetch_workspaces_queue.op_in_progress() {
-            if let Some(cause) = self.fetch_build_data_queue.should_start_op() {
+            if let Some((cause, ())) = self.fetch_build_data_queue.should_start_op() {
                 self.fetch_build_data(cause);
+            } else if let Some((cause, paths)) = self.fetch_proc_macros_queue.should_start_op() {
+                self.fetch_proc_macros(cause, paths);
             }
         }
 
-        if let Some(cause) = self.prime_caches_queue.should_start_op() {
+        if let Some((cause, ())) = self.prime_caches_queue.should_start_op() {
             tracing::debug!(%cause, "will prime caches");
             let num_worker_threads = self.config.prime_caches_num_threads();
 
@@ -462,7 +466,8 @@ impl GlobalState {
                         let workspaces_updated = !Arc::ptr_eq(&old, &self.workspaces);
 
                         if self.config.run_build_scripts() && workspaces_updated {
-                            self.fetch_build_data_queue.request_op(format!("workspace updated"));
+                            self.fetch_build_data_queue
+                                .request_op(format!("workspace updated"), ());
                         }
 
                         (Progress::End, None)
@@ -482,6 +487,22 @@ impl GlobalState {
                         }
 
                         self.switch_workspaces("fetched build data".to_string());
+
+                        (Some(Progress::End), None)
+                    }
+                };
+
+                if let Some(state) = state {
+                    self.report_progress("Building", state, msg, None, None);
+                }
+            }
+            Task::LoadProcMacros(progress) => {
+                let (state, msg) = match progress {
+                    ProcMacroProgress::Begin => (Some(Progress::Begin), None),
+                    ProcMacroProgress::Report(msg) => (Some(Progress::Report), Some(msg)),
+                    ProcMacroProgress::End(proc_macro_load_result) => {
+                        self.fetch_proc_macros_queue.op_completed(true);
+                        self.set_proc_macros(proc_macro_load_result);
 
                         (Some(Progress::End), None)
                     }
@@ -633,6 +654,7 @@ impl GlobalState {
 
         dispatcher
             .on_sync_mut::<lsp_ext::ReloadWorkspace>(handlers::handle_workspace_reload)
+            .on_sync_mut::<lsp_ext::RebuildProcMacros>(handlers::handle_proc_macros_rebuild)
             .on_sync_mut::<lsp_ext::MemoryUsage>(handlers::handle_memory_usage)
             .on_sync_mut::<lsp_ext::ShuffleCrateGraph>(handlers::handle_shuffle_crate_graph)
             .on_sync::<lsp_ext::JoinLines>(handlers::handle_join_lines)
@@ -886,8 +908,10 @@ impl GlobalState {
                     // Re-fetch workspaces if a workspace related file has changed
                     if let Some(abs_path) = vfs_path.as_path() {
                         if reload::should_refresh_for_change(abs_path, ChangeKind::Modify) {
-                            this.fetch_workspaces_queue
-                                .request_op(format!("DidSaveTextDocument {}", abs_path.display()));
+                            this.fetch_workspaces_queue.request_op(
+                                format!("DidSaveTextDocument {}", abs_path.display()),
+                                (),
+                            );
                         }
                     }
 
@@ -950,8 +974,7 @@ impl GlobalState {
                 for workspace in params.event.removed {
                     let Ok(path) = workspace.uri.to_file_path() else { continue };
                     let Ok(path) = AbsPathBuf::try_from(path) else { continue };
-                    let Some(position) = config.workspace_roots.iter().position(|it| it == &path) else { continue };
-                    config.workspace_roots.remove(position);
+                    config.remove_workspace(&path);
                 }
 
                 let added = params
@@ -960,11 +983,12 @@ impl GlobalState {
                     .into_iter()
                     .filter_map(|it| it.uri.to_file_path().ok())
                     .filter_map(|it| AbsPathBuf::try_from(it).ok());
-                config.workspace_roots.extend(added);
-                    if !config.has_linked_projects() && config.detached_files().is_empty() {
-                        config.rediscover_workspaces();
-                        this.fetch_workspaces_queue.request_op("client workspaces changed".to_string())
-                    }
+                config.add_workspaces(added);
+                if !config.has_linked_projects() && config.detached_files().is_empty() {
+                    config.rediscover_workspaces();
+                    this.fetch_workspaces_queue
+                        .request_op("client workspaces changed".to_string(), ())
+                }
 
                 Ok(())
             })?

@@ -1,6 +1,7 @@
 //! MIR lowering for places
 
 use super::*;
+use hir_def::FunctionId;
 use hir_expand::name;
 
 macro_rules! not_supported {
@@ -125,7 +126,7 @@ impl MirLowerCtx<'_> {
         match &self.body.exprs[expr_id] {
             Expr::Path(p) => {
                 let resolver = resolver_for_expr(self.db.upcast(), self.owner, expr_id);
-                let Some(pr) = resolver.resolve_path_in_value_ns(self.db.upcast(), p.mod_path()) else {
+                let Some(pr) = resolver.resolve_path_in_value_ns(self.db.upcast(), p) else {
                     return Err(MirLowerError::unresolved_path(self.db, p));
                 };
                 let pr = match pr {
@@ -140,15 +141,37 @@ impl MirLowerCtx<'_> {
                 }
             }
             Expr::UnaryOp { expr, op } => match op {
-                hir_def::expr::UnaryOp::Deref => {
+                hir_def::hir::UnaryOp::Deref => {
                     if !matches!(
                         self.expr_ty(*expr).kind(Interner),
                         TyKind::Ref(..) | TyKind::Raw(..)
                     ) {
-                        let Some(_) = self.lower_expr_as_place(current, *expr, true)? else {
+                        let Some((p, current)) = self.lower_expr_as_place(current, *expr, true)? else {
                             return Ok(None);
                         };
-                        not_supported!("explicit overloaded deref");
+                        return self.lower_overloaded_deref(
+                            current,
+                            p,
+                            self.expr_ty_after_adjustments(*expr),
+                            self.expr_ty(expr_id),
+                            expr_id.into(),
+                            'b: {
+                                if let Some((f, _)) = self.infer.method_resolution(expr_id) {
+                                    if let Some(deref_trait) =
+                                        self.resolve_lang_item(LangItem::DerefMut)?.as_trait()
+                                    {
+                                        if let Some(deref_fn) = self
+                                            .db
+                                            .trait_data(deref_trait)
+                                            .method_by_name(&name![deref_mut])
+                                        {
+                                            break 'b deref_fn == f;
+                                        }
+                                    }
+                                }
+                                false
+                            },
+                        );
                     }
                     let Some((mut r, current)) = self.lower_expr_as_place(current, *expr, true)? else {
                         return Ok(None);
@@ -169,12 +192,40 @@ impl MirLowerCtx<'_> {
                 let base_ty = self.expr_ty_after_adjustments(*base);
                 let index_ty = self.expr_ty_after_adjustments(*index);
                 if index_ty != TyBuilder::usize()
-                    || !matches!(base_ty.kind(Interner), TyKind::Array(..) | TyKind::Slice(..))
+                    || !matches!(
+                        base_ty.strip_reference().kind(Interner),
+                        TyKind::Array(..) | TyKind::Slice(..)
+                    )
                 {
-                    not_supported!("overloaded index");
+                    let Some(index_fn) = self.infer.method_resolution(expr_id) else {
+                        return Err(MirLowerError::UnresolvedMethod);
+                    };
+                    let Some((base_place, current)) = self.lower_expr_as_place(current, *base, true)? else {
+                        return Ok(None);
+                    };
+                    let Some((index_operand, current)) = self.lower_expr_to_some_operand(*index, current)? else {
+                        return Ok(None);
+                    };
+                    return self.lower_overloaded_index(
+                        current,
+                        base_place,
+                        base_ty,
+                        self.expr_ty(expr_id),
+                        index_operand,
+                        expr_id.into(),
+                        index_fn,
+                    );
                 }
+                let adjusts = self
+                    .infer
+                    .expr_adjustments
+                    .get(base)
+                    .and_then(|x| x.split_last())
+                    .map(|x| x.1)
+                    .unwrap_or(&[]);
                 let Some((mut p_base, current)) =
-                    self.lower_expr_as_place(current, *base, true)? else {
+                    self.lower_expr_as_place_with_adjust(current, *base, true, adjusts)?
+                else {
                     return Ok(None);
                 };
                 let l_index = self.temp(self.expr_ty_after_adjustments(*index))?;
@@ -186,6 +237,40 @@ impl MirLowerCtx<'_> {
             }
             _ => try_rvalue(self),
         }
+    }
+
+    fn lower_overloaded_index(
+        &mut self,
+        current: BasicBlockId,
+        place: Place,
+        base_ty: Ty,
+        result_ty: Ty,
+        index_operand: Operand,
+        span: MirSpan,
+        index_fn: (FunctionId, Substitution),
+    ) -> Result<Option<(Place, BasicBlockId)>> {
+        let (mutability, borrow_kind) = match base_ty.as_reference() {
+            Some((_, _, mutability)) => {
+                (mutability, BorrowKind::Mut { allow_two_phase_borrow: false })
+            }
+            None => (Mutability::Not, BorrowKind::Shared),
+        };
+        let result_ref = TyKind::Ref(mutability, static_lifetime(), result_ty).intern(Interner);
+        let ref_place: Place = self.temp(base_ty)?.into();
+        self.push_assignment(current, ref_place.clone(), Rvalue::Ref(borrow_kind, place), span);
+        let mut result: Place = self.temp(result_ref)?.into();
+        let index_fn_op = Operand::const_zst(
+            TyKind::FnDef(
+                self.db.intern_callable_def(CallableDefId::FunctionId(index_fn.0)).into(),
+                index_fn.1,
+            )
+            .intern(Interner),
+        );
+        let Some(current) = self.lower_call(index_fn_op, vec![Operand::Copy(ref_place), index_operand], result.clone(), current, false)? else {
+            return Ok(None);
+        };
+        result.projection.push(ProjectionElem::Deref);
+        Ok(Some((result, current)))
     }
 
     fn lower_overloaded_deref(

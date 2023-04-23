@@ -4,7 +4,8 @@ use std::{mem, str::FromStr, sync::Arc};
 use cfg::CfgOptions;
 use rustc_hash::FxHashMap;
 use test_utils::{
-    extract_range_or_offset, Fixture, RangeOrOffset, CURSOR_MARKER, ESCAPED_CURSOR_MARKER,
+    extract_range_or_offset, Fixture, FixtureWithProjectMeta, RangeOrOffset, CURSOR_MARKER,
+    ESCAPED_CURSOR_MARKER,
 };
 use tt::token_id::{Leaf, Subtree, TokenTree};
 use vfs::{file_set::FileSet, VfsPath};
@@ -12,8 +13,8 @@ use vfs::{file_set::FileSet, VfsPath};
 use crate::{
     input::{CrateName, CrateOrigin, LangCrateOrigin},
     Change, CrateDisplayName, CrateGraph, CrateId, Dependency, Edition, Env, FileId, FilePosition,
-    FileRange, ProcMacro, ProcMacroExpander, ProcMacroExpansionError, SourceDatabaseExt,
-    SourceRoot, SourceRootId,
+    FileRange, ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacros, ReleaseChannel,
+    SourceDatabaseExt, SourceRoot, SourceRootId,
 };
 
 pub const WORKSPACE: SourceRootId = SourceRootId(0);
@@ -100,9 +101,16 @@ impl ChangeFixture {
 
     pub fn parse_with_proc_macros(
         ra_fixture: &str,
-        mut proc_macros: Vec<(String, ProcMacro)>,
+        mut proc_macro_defs: Vec<(String, ProcMacro)>,
     ) -> ChangeFixture {
-        let (mini_core, proc_macro_names, fixture) = Fixture::parse(ra_fixture);
+        let FixtureWithProjectMeta { fixture, mini_core, proc_macro_names, toolchain } =
+            FixtureWithProjectMeta::parse(ra_fixture);
+        let toolchain = toolchain
+            .map(|it| {
+                ReleaseChannel::from_str(&it)
+                    .unwrap_or_else(|| panic!("unknown release channel found: {it}"))
+            })
+            .unwrap_or(ReleaseChannel::Stable);
         let mut change = Change::new();
 
         let mut files = Vec::new();
@@ -157,16 +165,16 @@ impl ChangeFixture {
                     meta.edition,
                     Some(crate_name.clone().into()),
                     version,
-                    meta.cfg.clone(),
                     meta.cfg,
+                    Default::default(),
                     meta.env,
-                    Ok(Vec::new()),
                     false,
                     origin,
                     meta.target_data_layout
                         .as_deref()
                         .map(Arc::from)
                         .ok_or_else(|| "target_data_layout unset".into()),
+                    Some(toolchain),
                 );
                 let prev = crates.insert(crate_name.clone(), crate_id);
                 assert!(prev.is_none());
@@ -182,7 +190,7 @@ impl ChangeFixture {
                 default_target_data_layout = meta.target_data_layout;
             }
 
-            change.change_file(file_id, Some(Arc::new(text)));
+            change.change_file(file_id, Some(Arc::from(text)));
             let path = VfsPath::new_virtual_path(meta.path);
             file_set.insert(file_id, path);
             files.push(file_id);
@@ -197,15 +205,15 @@ impl ChangeFixture {
                 Edition::CURRENT,
                 Some(CrateName::new("test").unwrap().into()),
                 None,
-                default_cfg.clone(),
                 default_cfg,
+                Default::default(),
                 Env::default(),
-                Ok(Vec::new()),
                 false,
-                CrateOrigin::CratesIo { repo: None, name: None },
+                CrateOrigin::Local { repo: None, name: None },
                 default_target_data_layout
                     .map(|x| x.into())
                     .ok_or_else(|| "target_data_layout unset".into()),
+                Some(toolchain),
             );
         } else {
             for (from, to, prelude) in crate_deps {
@@ -232,7 +240,7 @@ impl ChangeFixture {
             fs.insert(core_file, VfsPath::new_virtual_path("/sysroot/core/lib.rs".to_string()));
             roots.push(SourceRoot::new_library(fs));
 
-            change.change_file(core_file, Some(Arc::new(mini_core.source_code())));
+            change.change_file(core_file, Some(Arc::from(mini_core.source_code())));
 
             let all_crates = crate_graph.crates_in_topological_order();
 
@@ -241,13 +249,13 @@ impl ChangeFixture {
                 Edition::Edition2021,
                 Some(CrateDisplayName::from_canonical_name("core".to_string())),
                 None,
-                CfgOptions::default(),
-                CfgOptions::default(),
+                Default::default(),
+                Default::default(),
                 Env::default(),
-                Ok(Vec::new()),
                 false,
                 CrateOrigin::Lang(LangCrateOrigin::Core),
                 target_layout.clone(),
+                Some(toolchain),
             );
 
             for krate in all_crates {
@@ -257,12 +265,13 @@ impl ChangeFixture {
             }
         }
 
+        let mut proc_macros = ProcMacros::default();
         if !proc_macro_names.is_empty() {
             let proc_lib_file = file_id;
             file_id.0 += 1;
 
-            proc_macros.extend(default_test_proc_macros());
-            let (proc_macro, source) = filter_test_proc_macros(&proc_macro_names, proc_macros);
+            proc_macro_defs.extend(default_test_proc_macros());
+            let (proc_macro, source) = filter_test_proc_macros(&proc_macro_names, proc_macro_defs);
             let mut fs = FileSet::default();
             fs.insert(
                 proc_lib_file,
@@ -270,7 +279,7 @@ impl ChangeFixture {
             );
             roots.push(SourceRoot::new_library(fs));
 
-            change.change_file(proc_lib_file, Some(Arc::new(source)));
+            change.change_file(proc_lib_file, Some(Arc::from(source)));
 
             let all_crates = crate_graph.crates_in_topological_order();
 
@@ -279,14 +288,15 @@ impl ChangeFixture {
                 Edition::Edition2021,
                 Some(CrateDisplayName::from_canonical_name("proc_macros".to_string())),
                 None,
-                CfgOptions::default(),
-                CfgOptions::default(),
+                Default::default(),
+                Default::default(),
                 Env::default(),
-                Ok(proc_macro),
                 true,
-                CrateOrigin::CratesIo { repo: None, name: None },
+                CrateOrigin::Local { repo: None, name: None },
                 target_layout,
+                Some(toolchain),
             );
+            proc_macros.insert(proc_macros_crate, Ok(proc_macro));
 
             for krate in all_crates {
                 crate_graph
@@ -305,6 +315,7 @@ impl ChangeFixture {
         roots.push(root);
         change.set_roots(roots);
         change.set_crate_graph(crate_graph);
+        change.set_proc_macros(proc_macros);
 
         ChangeFixture { file_position, files, change }
     }
@@ -428,7 +439,7 @@ fn parse_crate(crate_str: String) -> (String, CrateOrigin, Option<String>) {
         let (version, origin) = match b.split_once(':') {
             Some(("CratesIo", data)) => match data.split_once(',') {
                 Some((version, url)) => {
-                    (version, CrateOrigin::CratesIo { repo: Some(url.to_owned()), name: None })
+                    (version, CrateOrigin::Local { repo: Some(url.to_owned()), name: None })
                 }
                 _ => panic!("Bad crates.io parameter: {data}"),
             },
@@ -436,10 +447,9 @@ fn parse_crate(crate_str: String) -> (String, CrateOrigin, Option<String>) {
         };
         (a.to_owned(), origin, Some(version.to_string()))
     } else {
-        let crate_origin = match &*crate_str {
-            "std" => CrateOrigin::Lang(LangCrateOrigin::Std),
-            "core" => CrateOrigin::Lang(LangCrateOrigin::Core),
-            _ => CrateOrigin::CratesIo { repo: None, name: None },
+        let crate_origin = match LangCrateOrigin::from(&*crate_str) {
+            LangCrateOrigin::Other => CrateOrigin::Local { repo: None, name: None },
+            origin => CrateOrigin::Lang(origin),
         };
         (crate_str, crate_origin, None)
     }

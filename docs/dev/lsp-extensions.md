@@ -1,5 +1,5 @@
 <!---
-lsp_ext.rs hash: 37f31ae648632897
+lsp_ext.rs hash: be2f663a78beb7bd
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -333,7 +333,7 @@ Moreover, it would be cool if editors didn't need to implement even basic langua
 
 ### Unresolved Question
 
-* Should we return a nested brace structure, to allow paredit-like actions of jump *out* of the current brace pair?
+* Should we return a nested brace structure, to allow [paredit](https://paredit.org/)-like actions of jump *out* of the current brace pair?
   This is how `SelectionRange` request works.
 * Alternatively, should we perhaps flag certain `SelectionRange`s as being brace pairs?
 
@@ -421,6 +421,16 @@ Returns internal status message, mostly for debugging purposes.
 **Response:** `null`
 
 Reloads project information (that is, re-executes `cargo metadata`).
+
+## Rebuild proc-macros
+
+**Method:** `rust-analyzer/rebuildProcMacros`
+
+**Request:** `null`
+
+**Response:** `null`
+
+Rebuilds build scripts and proc-macros, and runs the build scripts to reseed the build data.
 
 ## Server Status
 

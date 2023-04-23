@@ -20,6 +20,7 @@ pub mod mod_path;
 pub mod attrs;
 mod fixup;
 
+use mbe::TokenMap;
 pub use mbe::{Origin, ValueResult};
 
 use ::tt::token_id as tt;
@@ -51,11 +52,11 @@ use crate::{
 
 pub type ExpandResult<T> = ValueResult<T, ExpandError>;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum ExpandError {
     UnresolvedProcMacro(CrateId),
     Mbe(mbe::ExpandError),
-    RecursionOverflowPosioned,
+    RecursionOverflowPoisoned,
     Other(Box<str>),
 }
 
@@ -70,7 +71,7 @@ impl fmt::Display for ExpandError {
         match self {
             ExpandError::UnresolvedProcMacro(_) => f.write_str("unresolved proc-macro"),
             ExpandError::Mbe(it) => it.fmt(f),
-            ExpandError::RecursionOverflowPosioned => {
+            ExpandError::RecursionOverflowPoisoned => {
                 f.write_str("overflow expanding the original macro")
             }
             ExpandError::Other(it) => f.write_str(it),
@@ -113,7 +114,7 @@ impl_intern_key!(MacroCallId);
 pub struct MacroCallLoc {
     pub def: MacroDefId,
     pub(crate) krate: CrateId,
-    eager: Option<EagerCallInfo>,
+    eager: Option<Box<EagerCallInfo>>,
     pub kind: MacroCallKind,
 }
 
@@ -139,7 +140,8 @@ pub enum MacroDefKind {
 struct EagerCallInfo {
     /// NOTE: This can be *either* the expansion result, *or* the argument to the eager macro!
     arg_or_expansion: Arc<tt::Subtree>,
-    included_file: Option<FileId>,
+    included_file: Option<(FileId, TokenMap)>,
+    error: Option<ExpandError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -205,8 +207,8 @@ impl HirFileId {
                 HirFileIdRepr::FileId(id) => break id,
                 HirFileIdRepr::MacroFile(MacroFile { macro_call_id }) => {
                     let loc: MacroCallLoc = db.lookup_intern_macro_call(macro_call_id);
-                    file_id = match loc.eager {
-                        Some(EagerCallInfo { included_file: Some(file), .. }) => file.into(),
+                    file_id = match loc.eager.as_deref() {
+                        Some(&EagerCallInfo { included_file: Some((file, _)), .. }) => file.into(),
                         _ => loc.kind.file_id(),
                     };
                 }
@@ -255,8 +257,14 @@ impl HirFileId {
         let arg_tt = loc.kind.arg(db)?;
 
         let macro_def = db.macro_def(loc.def).ok()?;
-        let (parse, exp_map) = db.parse_macro_expansion(macro_file).value?;
-        let macro_arg = db.macro_arg(macro_file.macro_call_id)?;
+        let (parse, exp_map) = db.parse_macro_expansion(macro_file).value;
+        let macro_arg = db.macro_arg(macro_file.macro_call_id).unwrap_or_else(|| {
+            Arc::new((
+                tt::Subtree { delimiter: tt::Delimiter::UNSPECIFIED, token_trees: Vec::new() },
+                Default::default(),
+                Default::default(),
+            ))
+        });
 
         let def = loc.def.ast_id().left().and_then(|id| {
             let def_tt = match id.to_node(db) {
@@ -319,7 +327,7 @@ impl HirFileId {
         match self.macro_file() {
             Some(macro_file) => {
                 let loc: MacroCallLoc = db.lookup_intern_macro_call(macro_file.macro_call_id);
-                matches!(loc.eager, Some(EagerCallInfo { included_file: Some(_), .. }))
+                matches!(loc.eager.as_deref(), Some(EagerCallInfo { included_file: Some(..), .. }))
             }
             _ => false,
         }
@@ -677,13 +685,23 @@ impl ExpansionInfo {
         let call_id = self.expanded.file_id.macro_file()?.macro_call_id;
         let loc = db.lookup_intern_macro_call(call_id);
 
+        if let Some((file, map)) = loc.eager.and_then(|e| e.included_file) {
+            // Special case: map tokens from `include!` expansions to the included file
+            let range = map.first_range_by_token(token_id, token.value.kind())?;
+            let source = db.parse(file);
+
+            let token = source.syntax_node().covering_element(range).into_token()?;
+
+            return Some((InFile::new(file.into(), token), Origin::Call));
+        }
+
         // Attributes are a bit special for us, they have two inputs, the input tokentree and the annotated item.
         let (token_map, tt) = match &loc.kind {
             MacroCallKind::Attr { attr_args, is_derive: true, .. } => {
                 (&attr_args.1, self.attr_input_or_mac_def.clone()?.syntax().cloned())
             }
             MacroCallKind::Attr { attr_args, .. } => {
-                // try unshifting the the token id, if unshifting fails, the token resides in the non-item attribute input
+                // try unshifting the token id, if unshifting fails, the token resides in the non-item attribute input
                 // note that the `TokenExpander::map_id_up` earlier only unshifts for declarative macros, so we don't double unshift with this
                 match self.macro_arg_shift.unshift(token_id) {
                     Some(unshifted) => {
@@ -718,7 +736,7 @@ pub type AstId<N> = InFile<FileAstId<N>>;
 
 impl<N: AstNode> AstId<N> {
     pub fn to_node(&self, db: &dyn db::ExpandDatabase) -> N {
-        let root = db.parse_or_expand(self.file_id).unwrap();
+        let root = db.parse_or_expand(self.file_id);
         db.ast_id_map(self.file_id).get(self.value).to_node(&root)
     }
 }
@@ -754,7 +772,7 @@ impl<T> InFile<T> {
     }
 
     pub fn file_syntax(&self, db: &dyn db::ExpandDatabase) -> SyntaxNode {
-        db.parse_or_expand(self.file_id).expect("source created from invalid file")
+        db.parse_or_expand(self.file_id)
     }
 }
 
@@ -977,6 +995,7 @@ impl<N: AstNode> InFile<N> {
         self.value.syntax().descendants().filter_map(T::cast).map(move |n| self.with_value(n))
     }
 
+    // FIXME: this should return `Option<InFileNotHirFile<N>>`
     pub fn original_ast_node(self, db: &dyn db::ExpandDatabase) -> Option<InFile<N>> {
         // This kind of upmapping can only be achieved in attribute expanded files,
         // as we don't have node inputs otherwise and therefore can't find an `N` node in the input

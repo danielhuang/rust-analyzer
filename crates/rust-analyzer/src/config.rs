@@ -7,7 +7,7 @@
 //! configure the server itself, feature flags are passed into analysis, and
 //! tweak things like automatic insertion of `()` in completions.
 
-use std::{fmt, iter, path::PathBuf};
+use std::{fmt, iter, ops::Not, path::PathBuf};
 
 use flycheck::FlycheckConfig;
 use ide::{
@@ -27,7 +27,7 @@ use project_model::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{de::DeserializeOwned, Deserialize};
-use vfs::AbsPathBuf;
+use vfs::{AbsPath, AbsPathBuf};
 
 use crate::{
     caps::completion_item_edit_resolve,
@@ -338,6 +338,8 @@ config_data! {
         inlayHints_closingBraceHints_minLines: usize               = "25",
         /// Whether to show inlay type hints for return types of closures.
         inlayHints_closureReturnTypeHints_enable: ClosureReturnTypeHintsDef  = "\"never\"",
+        /// Closure notation in type and chaining inlay hints.
+        inlayHints_closureStyle: ClosureStyle                                = "\"impl_fn\"",
         /// Whether to show enum variant discriminant hints.
         inlayHints_discriminantHints_enable: DiscriminantHintsDef            = "\"never\"",
         /// Whether to show inlay hints for type adjustments.
@@ -418,6 +420,8 @@ config_data! {
 
         /// Number of syntax trees rust-analyzer keeps in memory. Defaults to 128.
         lru_capacity: Option<usize>                 = "null",
+        /// Sets the LRU capacity of the specified queries.
+        lru_query_capacities: FxHashMap<Box<str>, usize> = "{}",
 
         /// Whether to show `can't find Cargo.toml` error message.
         notifications_cargoTomlNotFound: bool      = "true",
@@ -484,7 +488,7 @@ config_data! {
         /// When enabled, rust-analyzer will emit special token types for operator tokens instead
         /// of the generic `operator` token type.
         semanticHighlighting_operator_specialization_enable: bool = "false",
-        /// Use semantic tokens for punctuations.
+        /// Use semantic tokens for punctuation.
         ///
         /// When disabled, rust-analyzer will emit semantic tokens only for punctuation tokens when
         /// they are tagged with modifiers or have a special role.
@@ -492,7 +496,7 @@ config_data! {
         /// When enabled, rust-analyzer will emit a punctuation semantic token for the `!` of macro
         /// calls.
         semanticHighlighting_punctuation_separate_macro_bang: bool = "false",
-        /// Use specialized semantic tokens for punctuations.
+        /// Use specialized semantic tokens for punctuation.
         ///
         /// When enabled, rust-analyzer will emit special token types for punctuation tokens instead
         /// of the generic `punctuation` token type.
@@ -531,8 +535,9 @@ impl Default for ConfigData {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub discovered_projects: Option<Vec<ProjectManifest>>,
-    pub workspace_roots: Vec<AbsPathBuf>,
+    discovered_projects: Vec<ProjectManifest>,
+    /// The workspace roots as registered by the LSP client
+    workspace_roots: Vec<AbsPathBuf>,
     caps: lsp_types::ClientCapabilities,
     root_path: AbsPathBuf,
     data: ConfigData,
@@ -738,7 +743,7 @@ impl Config {
             caps,
             data: ConfigData::default(),
             detached_files: Vec::new(),
-            discovered_projects: None,
+            discovered_projects: Vec::new(),
             root_path,
             snippets: Default::default(),
             workspace_roots,
@@ -751,7 +756,17 @@ impl Config {
         if discovered.is_empty() {
             tracing::error!("failed to find any projects in {:?}", &self.workspace_roots);
         }
-        self.discovered_projects = Some(discovered);
+        self.discovered_projects = discovered;
+    }
+
+    pub fn remove_workspace(&mut self, path: &AbsPath) {
+        if let Some(position) = self.workspace_roots.iter().position(|it| it == path) {
+            self.workspace_roots.remove(position);
+        }
+    }
+
+    pub fn add_workspaces(&mut self, paths: impl Iterator<Item = AbsPathBuf>) {
+        self.workspace_roots.extend(paths);
     }
 
     pub fn update(&mut self, mut json: serde_json::Value) -> Result<(), ConfigUpdateError> {
@@ -856,25 +871,19 @@ impl Config {
     pub fn linked_projects(&self) -> Vec<LinkedProject> {
         match self.data.linkedProjects.as_slice() {
             [] => {
-                match self.discovered_projects.as_ref() {
-                    Some(discovered_projects) => {
-                        let exclude_dirs: Vec<_> = self
-                            .data
-                            .files_excludeDirs
-                            .iter()
-                            .map(|p| self.root_path.join(p))
-                            .collect();
-                        discovered_projects
-                        .iter()
-                        .filter(|(ProjectManifest::ProjectJson(path) | ProjectManifest::CargoToml(path))| {
+                let exclude_dirs: Vec<_> =
+                    self.data.files_excludeDirs.iter().map(|p| self.root_path.join(p)).collect();
+                self.discovered_projects
+                    .iter()
+                    .filter(
+                        |(ProjectManifest::ProjectJson(path)
+                         | ProjectManifest::CargoToml(path))| {
                             !exclude_dirs.iter().any(|p| path.starts_with(p))
-                        })
-                        .cloned()
-                        .map(LinkedProject::from)
-                        .collect()
-                    }
-                    None => Vec::new(),
-                }
+                        },
+                    )
+                    .cloned()
+                    .map(LinkedProject::from)
+                    .collect()
             }
             linked_projects => linked_projects
                 .iter()
@@ -1085,8 +1094,12 @@ impl Config {
         extra_env
     }
 
-    pub fn lru_capacity(&self) -> Option<usize> {
+    pub fn lru_parse_query_capacity(&self) -> Option<usize> {
         self.data.lru_capacity
+    }
+
+    pub fn lru_query_capacities(&self) -> Option<&FxHashMap<Box<str>, usize>> {
+        self.data.lru_query_capacities.is_empty().not().then(|| &self.data.lru_query_capacities)
     }
 
     pub fn proc_macro_srv(&self) -> Option<(AbsPathBuf, /* is path explicitly set */ bool)> {
@@ -1104,6 +1117,10 @@ impl Config {
 
     pub fn dummy_replacements(&self) -> &FxHashMap<Box<str>, Box<[Box<str>]>> {
         &self.data.procMacro_ignored
+    }
+
+    pub fn expand_proc_macros(&self) -> bool {
+        self.data.procMacro_enable
     }
 
     pub fn expand_proc_attr_macros(&self) -> bool {
@@ -1291,6 +1308,12 @@ impl Config {
             hide_closure_initialization_hints: self
                 .data
                 .inlayHints_typeHints_hideClosureInitialization,
+            closure_style: match self.data.inlayHints_closureStyle {
+                ClosureStyle::ImplFn => hir::ClosureStyle::ImplFn,
+                ClosureStyle::RustAnalyzer => hir::ClosureStyle::RANotation,
+                ClosureStyle::WithId => hir::ClosureStyle::ClosureWithId,
+                ClosureStyle::Hide => hir::ClosureStyle::Hide,
+            },
             adjustment_hints: match self.data.inlayHints_expressionAdjustmentHints_enable {
                 AdjustmentHintsDef::Always => ide::AdjustmentHints::Always,
                 AdjustmentHintsDef::Never => match self.data.inlayHints_reborrowHints_enable {
@@ -1798,6 +1821,15 @@ enum ClosureReturnTypeHintsDef {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "snake_case")]
+enum ClosureStyle {
+    ImplFn,
+    RustAnalyzer,
+    WithId,
+    Hide,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 enum ReborrowHintsDef {
     #[serde(deserialize_with = "true_or_always")]
@@ -1940,7 +1972,7 @@ fn get_field<T: DeserializeOwned>(
     alias: Option<&'static str>,
     default: &str,
 ) -> T {
-    // XXX: check alias first, to work-around the VS Code where it pre-fills the
+    // XXX: check alias first, to work around the VS Code where it pre-fills the
     // defaults instead of sending an empty object.
     alias
         .into_iter()
@@ -2018,6 +2050,9 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "type": "object",
         },
         "FxHashMap<String, String>" => set! {
+            "type": "object",
+        },
+        "FxHashMap<Box<str>, usize>" => set! {
             "type": "object",
         },
         "Option<usize>" => set! {
@@ -2169,8 +2204,8 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
             "enumDescriptions": [
                 "Always show adjustment hints as prefix (`*expr`).",
                 "Always show adjustment hints as postfix (`expr.*`).",
-                "Show prefix or postfix depending on which uses less parenthesis, prefering prefix.",
-                "Show prefix or postfix depending on which uses less parenthesis, prefering postfix.",
+                "Show prefix or postfix depending on which uses less parenthesis, preferring prefix.",
+                "Show prefix or postfix depending on which uses less parenthesis, preferring postfix.",
             ]
         },
         "CargoFeaturesDef" => set! {
@@ -2273,6 +2308,16 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                     "type": "array",
                     "items": { "type": "string" }
                 },
+            ],
+        },
+        "ClosureStyle" => set! {
+            "type": "string",
+            "enum": ["impl_fn", "rust_analyzer", "with_id", "hide"],
+            "enumDescriptions": [
+                "`impl_fn`: `impl FnMut(i32, u64) -> i8`",
+                "`rust_analyzer`: `|i32, u64| -> i8`",
+                "`with_id`: `{closure#14352}`, where that id is the unique number of the closure in r-a internals",
+                "`hide`: Shows `...` for every closure type",
             ],
         },
         _ => panic!("missing entry for {ty}: {default}"),

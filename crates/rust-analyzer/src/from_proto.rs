@@ -98,13 +98,18 @@ pub(crate) fn assist_kind(kind: lsp_types::CodeActionKind) -> Option<AssistKind>
 pub(crate) fn annotation(
     snap: &GlobalStateSnapshot,
     code_lens: lsp_types::CodeLens,
-) -> Result<Annotation> {
+) -> Result<Option<Annotation>> {
     let data =
         code_lens.data.ok_or_else(|| invalid_params_error("code lens without data".to_string()))?;
     let resolve = from_json::<lsp_ext::CodeLensResolveData>("CodeLensResolveData", &data)?;
 
-    match resolve {
-        lsp_ext::CodeLensResolveData::Impls(params) => {
+    match resolve.kind {
+        lsp_ext::CodeLensResolveDataKind::Impls(params) => {
+            if snap.url_file_version(&params.text_document_position_params.text_document.uri)
+                != Some(resolve.version)
+            {
+                return Ok(None);
+            }
             let pos @ FilePosition { file_id, .. } =
                 file_position(snap, params.text_document_position_params)?;
             let line_index = snap.file_line_index(file_id)?;
@@ -114,7 +119,10 @@ pub(crate) fn annotation(
                 kind: AnnotationKind::HasImpls { pos, data: None },
             })
         }
-        lsp_ext::CodeLensResolveData::References(params) => {
+        lsp_ext::CodeLensResolveDataKind::References(params) => {
+            if snap.url_file_version(&params.text_document.uri) != Some(resolve.version) {
+                return Ok(None);
+            }
             let pos @ FilePosition { file_id, .. } = file_position(snap, params)?;
             let line_index = snap.file_line_index(file_id)?;
 
@@ -124,4 +132,5 @@ pub(crate) fn annotation(
             })
         }
     }
+    .map(Some)
 }

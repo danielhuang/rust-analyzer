@@ -53,7 +53,6 @@ use hir::{
     db::{DefDatabase, ExpandDatabase, HirDatabase},
     symbols::FileSymbolKind,
 };
-use stdx::hash::NoHashHashSet;
 
 use crate::{line_index::LineIndex, symbol_index::SymbolsDatabase};
 pub use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -114,13 +113,13 @@ impl Upcast<dyn HirDatabase> for RootDatabase {
 }
 
 impl FileLoader for RootDatabase {
-    fn file_text(&self, file_id: FileId) -> Arc<String> {
+    fn file_text(&self, file_id: FileId) -> Arc<str> {
         FileLoaderDelegate(self).file_text(file_id)
     }
     fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
         FileLoaderDelegate(self).resolve_path(path)
     }
-    fn relevant_crates(&self, file_id: FileId) -> Arc<NoHashHashSet<CrateId>> {
+    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
         FileLoaderDelegate(self).relevant_crates(file_id)
     }
 }
@@ -137,18 +136,186 @@ impl RootDatabase {
     pub fn new(lru_capacity: Option<usize>) -> RootDatabase {
         let mut db = RootDatabase { storage: ManuallyDrop::new(salsa::Storage::default()) };
         db.set_crate_graph_with_durability(Default::default(), Durability::HIGH);
+        db.set_proc_macros_with_durability(Default::default(), Durability::HIGH);
         db.set_local_roots_with_durability(Default::default(), Durability::HIGH);
         db.set_library_roots_with_durability(Default::default(), Durability::HIGH);
-        db.set_enable_proc_attr_macros(false);
-        db.update_lru_capacity(lru_capacity);
+        db.set_expand_proc_attr_macros_with_durability(false, Durability::HIGH);
+        db.update_parse_query_lru_capacity(lru_capacity);
         db
     }
 
-    pub fn update_lru_capacity(&mut self, lru_capacity: Option<usize>) {
-        let lru_capacity = lru_capacity.unwrap_or(base_db::DEFAULT_LRU_CAP);
+    pub fn enable_proc_attr_macros(&mut self) {
+        self.set_expand_proc_attr_macros_with_durability(true, Durability::HIGH);
+    }
+
+    pub fn update_parse_query_lru_capacity(&mut self, lru_capacity: Option<usize>) {
+        let lru_capacity = lru_capacity.unwrap_or(base_db::DEFAULT_PARSE_LRU_CAP);
         base_db::ParseQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
-        hir::db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
-        hir::db::MacroExpandQuery.in_db_mut(self).set_lru_capacity(lru_capacity);
+        // macro expansions are usually rather small, so we can afford to keep more of them alive
+        hir::db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(4 * lru_capacity);
+        hir::db::MacroExpandQuery.in_db_mut(self).set_lru_capacity(4 * lru_capacity);
+    }
+
+    pub fn update_lru_capacities(&mut self, lru_capacities: &FxHashMap<Box<str>, usize>) {
+        use hir::db as hir_db;
+
+        base_db::ParseQuery.in_db_mut(self).set_lru_capacity(
+            lru_capacities
+                .get(stringify!(ParseQuery))
+                .copied()
+                .unwrap_or(base_db::DEFAULT_PARSE_LRU_CAP),
+        );
+        hir_db::ParseMacroExpansionQuery.in_db_mut(self).set_lru_capacity(
+            lru_capacities
+                .get(stringify!(ParseMacroExpansionQuery))
+                .copied()
+                .unwrap_or(4 * base_db::DEFAULT_PARSE_LRU_CAP),
+        );
+        hir_db::MacroExpandQuery.in_db_mut(self).set_lru_capacity(
+            lru_capacities
+                .get(stringify!(MacroExpandQuery))
+                .copied()
+                .unwrap_or(4 * base_db::DEFAULT_PARSE_LRU_CAP),
+        );
+
+        macro_rules! update_lru_capacity_per_query {
+            ($( $module:ident :: $query:ident )*) => {$(
+                if let Some(&cap) = lru_capacities.get(stringify!($query)) {
+                    $module::$query.in_db_mut(self).set_lru_capacity(cap);
+                }
+            )*}
+        }
+        update_lru_capacity_per_query![
+            // SourceDatabase
+            // base_db::ParseQuery
+            // base_db::CrateGraphQuery
+            // base_db::ProcMacrosQuery
+
+            // SourceDatabaseExt
+            // base_db::FileTextQuery
+            // base_db::FileSourceRootQuery
+            // base_db::SourceRootQuery
+            base_db::SourceRootCratesQuery
+
+            // ExpandDatabase
+            hir_db::AstIdMapQuery
+            // hir_db::ParseMacroExpansionQuery
+            // hir_db::InternMacroCallQuery
+            hir_db::MacroArgTextQuery
+            hir_db::MacroDefQuery
+            // hir_db::MacroExpandQuery
+            hir_db::ExpandProcMacroQuery
+            hir_db::HygieneFrameQuery
+            hir_db::ParseMacroExpansionErrorQuery
+
+            // DefDatabase
+            hir_db::FileItemTreeQuery
+            hir_db::CrateDefMapQueryQuery
+            hir_db::BlockDefMapQuery
+            hir_db::StructDataQuery
+            hir_db::StructDataWithDiagnosticsQuery
+            hir_db::UnionDataQuery
+            hir_db::UnionDataWithDiagnosticsQuery
+            hir_db::EnumDataQuery
+            hir_db::EnumDataWithDiagnosticsQuery
+            hir_db::ImplDataQuery
+            hir_db::ImplDataWithDiagnosticsQuery
+            hir_db::TraitDataQuery
+            hir_db::TraitDataWithDiagnosticsQuery
+            hir_db::TraitAliasDataQuery
+            hir_db::TypeAliasDataQuery
+            hir_db::FunctionDataQuery
+            hir_db::ConstDataQuery
+            hir_db::StaticDataQuery
+            hir_db::Macro2DataQuery
+            hir_db::MacroRulesDataQuery
+            hir_db::ProcMacroDataQuery
+            hir_db::BodyWithSourceMapQuery
+            hir_db::BodyQuery
+            hir_db::ExprScopesQuery
+            hir_db::GenericParamsQuery
+            hir_db::VariantsAttrsQuery
+            hir_db::FieldsAttrsQuery
+            hir_db::VariantsAttrsSourceMapQuery
+            hir_db::FieldsAttrsSourceMapQuery
+            hir_db::AttrsQuery
+            hir_db::CrateLangItemsQuery
+            hir_db::LangItemQuery
+            hir_db::ImportMapQuery
+            hir_db::FieldVisibilitiesQuery
+            hir_db::FunctionVisibilityQuery
+            hir_db::ConstVisibilityQuery
+            hir_db::CrateSupportsNoStdQuery
+
+            // HirDatabase
+            hir_db::InferQueryQuery
+            hir_db::MirBodyQuery
+            hir_db::BorrowckQuery
+            hir_db::TyQuery
+            hir_db::ValueTyQuery
+            hir_db::ImplSelfTyQuery
+            hir_db::ConstParamTyQuery
+            hir_db::ConstEvalQuery
+            hir_db::ConstEvalDiscriminantQuery
+            hir_db::ImplTraitQuery
+            hir_db::FieldTypesQuery
+            hir_db::LayoutOfAdtQuery
+            hir_db::TargetDataLayoutQuery
+            hir_db::CallableItemSignatureQuery
+            hir_db::ReturnTypeImplTraitsQuery
+            hir_db::GenericPredicatesForParamQuery
+            hir_db::GenericPredicatesQuery
+            hir_db::TraitEnvironmentQuery
+            hir_db::GenericDefaultsQuery
+            hir_db::InherentImplsInCrateQuery
+            hir_db::InherentImplsInBlockQuery
+            hir_db::IncoherentInherentImplCratesQuery
+            hir_db::TraitImplsInCrateQuery
+            hir_db::TraitImplsInBlockQuery
+            hir_db::TraitImplsInDepsQuery
+            // hir_db::InternCallableDefQuery
+            // hir_db::InternLifetimeParamIdQuery
+            // hir_db::InternImplTraitIdQuery
+            // hir_db::InternTypeOrConstParamIdQuery
+            // hir_db::InternClosureQuery
+            // hir_db::InternGeneratorQuery
+            hir_db::AssociatedTyDataQuery
+            hir_db::TraitDatumQuery
+            hir_db::StructDatumQuery
+            hir_db::ImplDatumQuery
+            hir_db::FnDefDatumQuery
+            hir_db::FnDefVarianceQuery
+            hir_db::AdtVarianceQuery
+            hir_db::AssociatedTyValueQuery
+            hir_db::TraitSolveQueryQuery
+            hir_db::ProgramClausesForChalkEnvQuery
+
+            // SymbolsDatabase
+            symbol_index::ModuleSymbolsQuery
+            symbol_index::LibrarySymbolsQuery
+            // symbol_index::LocalRootsQuery
+            // symbol_index::LibraryRootsQuery
+
+            // LineIndexDatabase
+            crate::LineIndexQuery
+
+            // InternDatabase
+            // hir_db::InternFunctionQuery
+            // hir_db::InternStructQuery
+            // hir_db::InternUnionQuery
+            // hir_db::InternEnumQuery
+            // hir_db::InternConstQuery
+            // hir_db::InternStaticQuery
+            // hir_db::InternTraitQuery
+            // hir_db::InternTraitAliasQuery
+            // hir_db::InternTypeAliasQuery
+            // hir_db::InternImplQuery
+            // hir_db::InternExternBlockQuery
+            // hir_db::InternBlockQuery
+            // hir_db::InternMacro2Query
+            // hir_db::InternProcMacroQuery
+            // hir_db::InternMacroRulesQuery
+        ];
     }
 }
 

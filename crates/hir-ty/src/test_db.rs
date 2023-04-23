@@ -6,11 +6,13 @@ use std::{
 };
 
 use base_db::{
-    salsa, AnchoredPath, CrateId, FileId, FileLoader, FileLoaderDelegate, SourceDatabase, Upcast,
+    salsa::{self, Durability},
+    AnchoredPath, CrateId, FileId, FileLoader, FileLoaderDelegate, SourceDatabase, Upcast,
 };
 use hir_def::{db::DefDatabase, ModuleId};
 use hir_expand::db::ExpandDatabase;
-use stdx::hash::{NoHashHashMap, NoHashHashSet};
+use rustc_hash::FxHashSet;
+use stdx::hash::NoHashHashMap;
 use syntax::TextRange;
 use test_utils::extract_annotations;
 
@@ -30,7 +32,7 @@ pub(crate) struct TestDB {
 impl Default for TestDB {
     fn default() -> Self {
         let mut this = Self { storage: Default::default(), events: Default::default() };
-        this.set_enable_proc_attr_macros(true);
+        this.set_expand_proc_attr_macros_with_durability(true, Durability::HIGH);
         this
     }
 }
@@ -74,13 +76,13 @@ impl salsa::ParallelDatabase for TestDB {
 impl panic::RefUnwindSafe for TestDB {}
 
 impl FileLoader for TestDB {
-    fn file_text(&self, file_id: FileId) -> Arc<String> {
+    fn file_text(&self, file_id: FileId) -> Arc<str> {
         FileLoaderDelegate(self).file_text(file_id)
     }
     fn resolve_path(&self, path: AnchoredPath<'_>) -> Option<FileId> {
         FileLoaderDelegate(self).resolve_path(path)
     }
-    fn relevant_crates(&self, file_id: FileId) -> Arc<NoHashHashSet<CrateId>> {
+    fn relevant_crates(&self, file_id: FileId) -> Arc<FxHashSet<CrateId>> {
         FileLoaderDelegate(self).relevant_crates(file_id)
     }
 }
