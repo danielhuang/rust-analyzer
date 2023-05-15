@@ -52,6 +52,8 @@ pub fn items_with_name<'a>(
             limit,
         )
     });
+
+    let (mut local_query, mut external_query) = match name {
         NameToImport::Exact(exact_name, case_sensitive) => {
             let mut local_query = symbol_index::Query::new(exact_name.clone());
             local_query.exact();
