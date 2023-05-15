@@ -11,6 +11,8 @@
 //!     add:
 //!     as_ref: sized
 //!     bool_impl: option, fn
+//!     builtin_impls:
+//!     cell: copy, drop
 //!     clone: sized
 //!     coerce_unsized: unsize
 //!     copy: clone
@@ -31,6 +33,7 @@
 //!     infallible:
 //!     iterator: option
 //!     iterators: iterator, fn
+//!     manually_drop: drop
 //!     non_zero:
 //!     option: panic
 //!     ord: eq, option
@@ -125,6 +128,27 @@ pub mod default {
     #[rustc_builtin_macro(Default, attributes(default))]
     pub macro Default($item:item) {}
     // endregion:derive
+
+    // region:builtin_impls
+    macro_rules! impl_default {
+        ($v:literal; $($t:ty)*) => {
+            $(
+                impl const Default for $t {
+                    fn default() -> Self {
+                        $v
+                    }
+                }
+            )*
+        }
+    }
+
+    impl_default! {
+        0; usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128
+    }
+    impl_default! {
+        0.0; f32 f64
+    }
+    // endregion:builtin_impls
 }
 // endregion:default
 
@@ -135,8 +159,59 @@ pub mod hash {
     pub trait Hash {
         fn hash<H: Hasher>(&self, state: &mut H);
     }
+
+    // region:derive
+    #[rustc_builtin_macro]
+    pub macro Hash($item:item) {}
+    // endregion:derive
 }
 // endregion:hash
+
+// region:cell
+pub mod cell {
+    use crate::mem;
+
+    #[lang = "unsafe_cell"]
+    pub struct UnsafeCell<T: ?Sized> {
+        value: T,
+    }
+
+    impl<T> UnsafeCell<T> {
+        pub const fn new(value: T) -> UnsafeCell<T> {
+            UnsafeCell { value }
+        }
+
+        pub const fn get(&self) -> *mut T {
+            self as *const UnsafeCell<T> as *const T as *mut T
+        }
+    }
+
+    pub struct Cell<T: ?Sized> {
+        value: UnsafeCell<T>,
+    }
+
+    impl<T> Cell<T> {
+        pub const fn new(value: T) -> Cell<T> {
+            Cell { value: UnsafeCell::new(value) }
+        }
+
+        pub fn set(&self, val: T) {
+            let old = self.replace(val);
+            mem::drop(old);
+        }
+
+        pub fn replace(&self, val: T) -> T {
+            mem::replace(unsafe { &mut *self.value.get() }, val)
+        }
+    }
+
+    impl<T: Copy> Cell<T> {
+        pub fn get(&self) -> T {
+            unsafe { *self.value.get() }
+        }
+    }
+}
+// endregion:cell
 
 // region:clone
 pub mod clone {
@@ -150,6 +225,28 @@ pub mod clone {
             *self
         }
     }
+
+    // region:builtin_impls
+    macro_rules! impl_clone {
+        ($($t:ty)*) => {
+            $(
+                impl const Clone for $t {
+                    fn clone(&self) -> Self {
+                        *self
+                    }
+                }
+            )*
+        }
+    }
+
+    impl_clone! {
+        usize u8 u16 u32 u64 u128
+        isize i8 i16 i32 i64 i128
+        f32 f64
+        bool char
+    }
+    // endregion:builtin_impls
+
     // region:derive
     #[rustc_builtin_macro]
     pub macro Clone($item:item) {}
@@ -194,7 +291,38 @@ pub mod convert {
 
 // region:drop
 pub mod mem {
+    // region:manually_drop
+    #[lang = "manually_drop"]
+    #[repr(transparent)]
+    pub struct ManuallyDrop<T: ?Sized> {
+        value: T,
+    }
+
+    impl<T> ManuallyDrop<T> {
+        pub const fn new(value: T) -> ManuallyDrop<T> {
+            ManuallyDrop { value }
+        }
+    }
+
+    // region:deref
+    impl<T: ?Sized> crate::ops::Deref for ManuallyDrop<T> {
+        type Target = T;
+        fn deref(&self) -> &T {
+            &self.value
+        }
+    }
+    // endregion:deref
+
+    // endregion:manually_drop
+
     pub fn drop<T>(_x: T) {}
+    pub const fn replace<T>(dest: &mut T, src: T) -> T {
+        unsafe {
+            let result = *dest;
+            *dest = src;
+            result
+        }
+    }
 }
 // endregion:drop
 
@@ -638,12 +766,82 @@ pub mod fmt {
     pub struct Error;
     pub type Result = Result<(), Error>;
     pub struct Formatter<'a>;
+    pub struct DebugTuple;
+    pub struct DebugStruct;
+    impl Formatter<'_> {
+        pub fn debug_tuple(&mut self, name: &str) -> DebugTuple {
+            DebugTuple
+        }
+
+        pub fn debug_struct(&mut self, name: &str) -> DebugStruct {
+            DebugStruct
+        }
+    }
+
+    impl DebugTuple {
+        pub fn field(&mut self, value: &dyn Debug) -> &mut Self {
+            self
+        }
+
+        pub fn finish(&mut self) -> Result {
+            Ok(())
+        }
+    }
+
+    impl DebugStruct {
+        pub fn field(&mut self, name: &str, value: &dyn Debug) -> &mut Self {
+            self
+        }
+
+        pub fn finish(&mut self) -> Result {
+            Ok(())
+        }
+    }
+
     pub trait Debug {
         fn fmt(&self, f: &mut Formatter<'_>) -> Result;
     }
     pub trait Display {
         fn fmt(&self, f: &mut Formatter<'_>) -> Result;
     }
+
+    // region:derive
+    #[rustc_builtin_macro]
+    pub macro Debug($item:item) {}
+    // endregion:derive
+
+    // region:builtin_impls
+    macro_rules! impl_debug {
+        ($($t:ty)*) => {
+            $(
+                impl const Debug for $t {
+                    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+                        Ok(())
+                    }
+                }
+            )*
+        }
+    }
+
+    impl_debug! {
+        usize u8 u16 u32 u64 u128
+        isize i8 i16 i32 i64 i128
+        f32 f64
+        bool char
+    }
+
+    impl<T: Debug> Debug for [T] {
+        fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+            Ok(())
+        }
+    }
+
+    impl<T: Debug + ?Sized> Debug for &T {
+        fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+            (&**self).fmt(f)
+        }
+    }
+    // endregion:builtin_impls
 }
 // endregion:fmt
 
@@ -685,6 +883,14 @@ pub mod option {
                 None => default,
             }
         }
+        // region:result
+        pub const fn ok_or<E>(self, err: E) -> Result<T, E> {
+            match self {
+                Some(v) => Ok(v),
+                None => Err(err),
+            }
+        }
+        // endregion:result
         // region:fn
         pub fn and_then<U, F>(self, f: F) -> Option<U>
         where
@@ -934,10 +1140,8 @@ pub mod iter {
 
 // region:panic
 mod panic {
-    pub macro panic_2021 {
-        ($($t:tt)+) => (
-            /* Nothing yet */
-        ),
+    pub macro panic_2021($($t:tt)+) {
+        /* Nothing yet */
     }
 }
 // endregion:panic
@@ -1017,8 +1221,8 @@ pub mod prelude {
             ops::Drop,                          // :drop
             ops::{Fn, FnMut, FnOnce},           // :fn
             option::Option::{self, None, Some}, // :option
-            result::Result::{self, Err, Ok},    // :result
             panic,                              // :panic
+            result::Result::{self, Err, Ok},    // :result
         };
     }
 

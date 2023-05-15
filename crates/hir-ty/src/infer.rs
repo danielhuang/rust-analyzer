@@ -13,10 +13,12 @@
 //! to certain types. To record this, we use the union-find implementation from
 //! the `ena` crate, which is extracted from rustc.
 
-use std::sync::Arc;
 use std::{convert::identity, ops::Index};
 
-use chalk_ir::{cast::Cast, DebruijnIndex, Mutability, Safety, Scalar, TypeFlags};
+use chalk_ir::{
+    cast::Cast, fold::TypeFoldable, interner::HasInterner, DebruijnIndex, Mutability, Safety,
+    Scalar, TyKind, TypeFlags,
+};
 use either::Either;
 use hir_def::{
     body::Body,
@@ -36,12 +38,13 @@ use hir_expand::name::{name, Name};
 use la_arena::{ArenaMap, Entry};
 use rustc_hash::{FxHashMap, FxHashSet};
 use stdx::{always, never};
+use triomphe::Arc;
 
 use crate::{
     db::HirDatabase, fold_tys, infer::coerce::CoerceMany, lower::ImplTraitLoweringMode,
     static_lifetime, to_assoc_type_id, traits::FnTrait, AliasEq, AliasTy, ClosureId, DomainGoal,
     GenericArg, Goal, ImplTraitId, InEnvironment, Interner, ProjectionTy, RpitId, Substitution,
-    TraitRef, Ty, TyBuilder, TyExt, TyKind,
+    TraitEnvironment, TraitRef, Ty, TyBuilder, TyExt,
 };
 
 // This lint has a false positive here. See the link below for details.
@@ -59,7 +62,7 @@ mod path;
 mod expr;
 mod pat;
 mod coerce;
-mod closure;
+pub(crate) mod closure;
 mod mutability;
 
 /// The entry point of type inference.
@@ -114,11 +117,15 @@ pub(crate) fn infer_query(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<Infer
 ///
 /// This is appropriate to use only after type-check: it assumes
 /// that normalization will succeed, for example.
-pub(crate) fn normalize(db: &dyn HirDatabase, owner: DefWithBodyId, ty: Ty) -> Ty {
-    if !ty.data(Interner).flags.intersects(TypeFlags::HAS_PROJECTION) {
+pub(crate) fn normalize(db: &dyn HirDatabase, trait_env: Arc<TraitEnvironment>, ty: Ty) -> Ty {
+    // FIXME: TypeFlags::HAS_CT_PROJECTION is not implemented in chalk, so TypeFlags::HAS_PROJECTION only
+    // works for the type case, so we check array unconditionally. Remove the array part
+    // when the bug in chalk becomes fixed.
+    if !ty.data(Interner).flags.intersects(TypeFlags::HAS_PROJECTION)
+        && !matches!(ty.kind(Interner), TyKind::Array(..))
+    {
         return ty;
     }
-    let trait_env = db.trait_environment_for_body(owner);
     let mut table = unify::InferenceTable::new(db, trait_env);
 
     let ty_with_vars = table.normalize_associated_types_in(ty);
@@ -423,7 +430,7 @@ impl InferenceResult {
             _ => None,
         })
     }
-    pub(crate) fn closure_info(&self, closure: &ClosureId) -> &(Vec<CapturedItem>, FnTrait) {
+    pub fn closure_info(&self, closure: &ClosureId) -> &(Vec<CapturedItem>, FnTrait) {
         self.closure_info.get(closure).unwrap()
     }
 }
@@ -798,7 +805,10 @@ impl<'a> InferenceContext<'a> {
         self.table.insert_type_vars_shallow(ty)
     }
 
-    fn insert_type_vars(&mut self, ty: Ty) -> Ty {
+    fn insert_type_vars<T>(&mut self, ty: T) -> T
+    where
+        T: HasInterner<Interner = Interner> + TypeFoldable<Interner>,
+    {
         self.table.insert_type_vars(ty)
     }
 
@@ -875,7 +885,10 @@ impl<'a> InferenceContext<'a> {
     /// type annotation (e.g. from a let type annotation, field type or function
     /// call). `make_ty` handles this already, but e.g. for field types we need
     /// to do it as well.
-    fn normalize_associated_types_in(&mut self, ty: Ty) -> Ty {
+    fn normalize_associated_types_in<T>(&mut self, ty: T) -> T
+    where
+        T: HasInterner<Interner = Interner> + TypeFoldable<Interner>,
+    {
         self.table.normalize_associated_types_in(ty)
     }
 

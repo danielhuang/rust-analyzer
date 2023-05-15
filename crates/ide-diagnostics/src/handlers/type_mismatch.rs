@@ -15,15 +15,25 @@ use crate::{adjusted_display_range, fix, Assist, Diagnostic, DiagnosticsContext}
 // the expected type.
 pub(crate) fn type_mismatch(ctx: &DiagnosticsContext<'_>, d: &hir::TypeMismatch) -> Diagnostic {
     let display_range = match &d.expr_or_pat {
-        Either::Left(expr) => adjusted_display_range::<ast::BlockExpr>(
-            ctx,
-            expr.clone().map(|it| it.into()),
-            &|block| {
-                let r_curly_range = block.stmt_list()?.r_curly_token()?.text_range();
-                cov_mark::hit!(type_mismatch_on_block);
-                Some(r_curly_range)
-            },
-        ),
+        Either::Left(expr) => {
+            adjusted_display_range::<ast::Expr>(ctx, expr.clone().map(|it| it.into()), &|expr| {
+                let salient_token_range = match expr {
+                    ast::Expr::IfExpr(it) => it.if_token()?.text_range(),
+                    ast::Expr::LoopExpr(it) => it.loop_token()?.text_range(),
+                    ast::Expr::ForExpr(it) => it.for_token()?.text_range(),
+                    ast::Expr::WhileExpr(it) => it.while_token()?.text_range(),
+                    ast::Expr::BlockExpr(it) => it.stmt_list()?.r_curly_token()?.text_range(),
+                    ast::Expr::MatchExpr(it) => it.match_token()?.text_range(),
+                    ast::Expr::MethodCallExpr(it) => it.name_ref()?.ident_token()?.text_range(),
+                    ast::Expr::FieldExpr(it) => it.name_ref()?.ident_token()?.text_range(),
+                    ast::Expr::AwaitExpr(it) => it.await_token()?.text_range(),
+                    _ => return None,
+                };
+
+                cov_mark::hit!(type_mismatch_range_adjustment);
+                Some(salient_token_range)
+            })
+        }
         Either::Right(pat) => {
             ctx.sema.diagnostics_display_range(pat.clone().map(|it| it.into())).range
         }
@@ -610,8 +620,8 @@ fn f() {
     }
 
     #[test]
-    fn type_mismatch_on_block() {
-        cov_mark::check!(type_mismatch_on_block);
+    fn type_mismatch_range_adjustment() {
+        cov_mark::check!(type_mismatch_range_adjustment);
         check_diagnostics(
             r#"
 fn f() -> i32 {
@@ -620,6 +630,16 @@ fn f() -> i32 {
     let _ = x + y;
   }
 //^ error: expected i32, found ()
+
+fn g() -> i32 {
+    while true {}
+} //^^^^^ error: expected i32, found ()
+
+struct S;
+impl S { fn foo(&self) -> &S { self } }
+fn h() {
+    let _: i32 = S.foo().foo().foo();
+}                            //^^^ error: expected i32, found &S
 "#,
         );
     }
@@ -630,10 +650,33 @@ fn f() -> i32 {
             r#"
 fn f() {
     let &() = &mut ();
+      //^^^ error: expected &mut (), found &()
     match &() {
+        // FIXME: we should only show the deep one.
         &9 => ()
+      //^^ error: expected &(), found &i32
        //^ error: expected (), found i32
     }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn regression_14768() {
+        check_diagnostics(
+            r#"
+//- minicore: derive, fmt, slice, coerce_unsized, builtin_impls
+use core::fmt::Debug;
+
+#[derive(Debug)]
+struct Foo(u8, u16, [u8]);
+
+#[derive(Debug)]
+struct Bar {
+    f1: u8,
+    f2: &[u16],
+    f3: dyn Debug,
 }
 "#,
         );

@@ -1,9 +1,10 @@
 //! Defines a unit of change that can applied to the database to get the next
 //! state. Changes are transactional.
 
-use std::{fmt, sync::Arc};
+use std::fmt;
 
 use salsa::Durability;
+use triomphe::Arc;
 use vfs::FileId;
 
 use crate::{CrateGraph, ProcMacros, SourceDatabaseExt, SourceRoot, SourceRootId};
@@ -34,7 +35,7 @@ impl fmt::Debug for Change {
 }
 
 impl Change {
-    pub fn new() -> Change {
+    pub fn new() -> Self {
         Change::default()
     }
 
@@ -76,10 +77,10 @@ impl Change {
             db.set_file_text_with_durability(file_id, text, durability)
         }
         if let Some(crate_graph) = self.crate_graph {
-            db.set_crate_graph_with_durability(Arc::new(crate_graph), Durability::HIGH)
+            db.set_crate_graph_with_durability(Arc::new(crate_graph), Durability::HIGH);
         }
         if let Some(proc_macros) = self.proc_macros {
-            db.set_proc_macros_with_durability(Arc::new(proc_macros), Durability::HIGH)
+            db.set_proc_macros_with_durability(Arc::new(proc_macros), Durability::HIGH);
         }
     }
 }

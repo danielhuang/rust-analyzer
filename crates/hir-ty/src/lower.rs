@@ -8,7 +8,6 @@
 use std::{
     cell::{Cell, RefCell, RefMut},
     iter,
-    sync::Arc,
 };
 
 use base_db::CrateId;
@@ -25,6 +24,7 @@ use hir_def::{
         TypeOrConstParamData, TypeParamProvenance, WherePredicate, WherePredicateTypeTarget,
     },
     lang_item::{lang_attr, LangItem},
+    nameres::MacroSubNs,
     path::{GenericArg, GenericArgs, ModPath, Path, PathKind, PathSegment, PathSegments},
     resolver::{HasResolver, Resolver, TypeNs},
     type_ref::{ConstRefOrPath, TraitBoundModifier, TraitRef as HirTraitRef, TypeBound, TypeRef},
@@ -39,6 +39,7 @@ use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use stdx::{impl_from, never};
 use syntax::ast;
+use triomphe::Arc;
 
 use crate::{
     all_super_traits,
@@ -378,9 +379,15 @@ impl<'a> TyLoweringContext<'a> {
                 };
                 let ty = {
                     let macro_call = macro_call.to_node(self.db.upcast());
-                    match expander.enter_expand::<ast::Type>(self.db.upcast(), macro_call, |path| {
-                        self.resolver.resolve_path_as_macro(self.db.upcast(), &path)
-                    }) {
+                    let resolver = |path| {
+                        self.resolver.resolve_path_as_macro(
+                            self.db.upcast(),
+                            &path,
+                            Some(MacroSubNs::Bang),
+                        )
+                    };
+                    match expander.enter_expand::<ast::Type>(self.db.upcast(), macro_call, resolver)
+                    {
                         Ok(ExpandResult { value: Some((mark, expanded)), .. }) => {
                             let ctx = expander.ctx(self.db.upcast());
                             // FIXME: Report syntax errors in expansion here
@@ -1441,7 +1448,8 @@ pub(crate) fn generic_predicates_for_param_recover(
     _param_id: &TypeOrConstParamId,
     _assoc_name: &Option<Name>,
 ) -> Arc<[Binders<QuantifiedWhereClause>]> {
-    Arc::new([])
+    // FIXME: use `Arc::from_iter` when it becomes available
+    Arc::from(vec![])
 }
 
 pub(crate) fn trait_environment_for_body_query(
@@ -1579,30 +1587,33 @@ pub(crate) fn generic_defaults_query(
     let generic_params = generics(db.upcast(), def);
     let parent_start_idx = generic_params.len_self();
 
-    let defaults = generic_params
-        .iter()
-        .enumerate()
-        .map(|(idx, (id, p))| {
-            let p = match p {
-                TypeOrConstParamData::TypeParamData(p) => p,
-                TypeOrConstParamData::ConstParamData(_) => {
-                    // FIXME: implement const generic defaults
-                    let val = unknown_const_as_generic(
-                        db.const_param_ty(ConstParamId::from_unchecked(id)),
-                    );
-                    return make_binders(db, &generic_params, val);
-                }
-            };
-            let mut ty =
-                p.default.as_ref().map_or(TyKind::Error.intern(Interner), |t| ctx.lower_ty(t));
+    let defaults = Arc::from(
+        generic_params
+            .iter()
+            .enumerate()
+            .map(|(idx, (id, p))| {
+                let p = match p {
+                    TypeOrConstParamData::TypeParamData(p) => p,
+                    TypeOrConstParamData::ConstParamData(_) => {
+                        // FIXME: implement const generic defaults
+                        let val = unknown_const_as_generic(
+                            db.const_param_ty(ConstParamId::from_unchecked(id)),
+                        );
+                        return make_binders(db, &generic_params, val);
+                    }
+                };
+                let mut ty =
+                    p.default.as_ref().map_or(TyKind::Error.intern(Interner), |t| ctx.lower_ty(t));
 
-            // Each default can only refer to previous parameters.
-            // Type variable default referring to parameter coming
-            // after it is forbidden (FIXME: report diagnostic)
-            ty = fallback_bound_vars(ty, idx, parent_start_idx);
-            crate::make_binders(db, &generic_params, ty.cast(Interner))
-        })
-        .collect();
+                // Each default can only refer to previous parameters.
+                // Type variable default referring to parameter coming
+                // after it is forbidden (FIXME: report diagnostic)
+                ty = fallback_bound_vars(ty, idx, parent_start_idx);
+                crate::make_binders(db, &generic_params, ty.cast(Interner))
+            })
+            // FIXME: use `Arc::from_iter` when it becomes available
+            .collect::<Vec<_>>(),
+    );
 
     defaults
 }
@@ -1615,18 +1626,21 @@ pub(crate) fn generic_defaults_recover(
     let generic_params = generics(db.upcast(), *def);
     // FIXME: this code is not covered in tests.
     // we still need one default per parameter
-    let defaults = generic_params
-        .iter_id()
-        .map(|id| {
-            let val = match id {
-                Either::Left(_) => {
-                    GenericArgData::Ty(TyKind::Error.intern(Interner)).intern(Interner)
-                }
-                Either::Right(id) => unknown_const_as_generic(db.const_param_ty(id)),
-            };
-            crate::make_binders(db, &generic_params, val)
-        })
-        .collect();
+    let defaults = Arc::from(
+        generic_params
+            .iter_id()
+            .map(|id| {
+                let val = match id {
+                    Either::Left(_) => {
+                        GenericArgData::Ty(TyKind::Error.intern(Interner)).intern(Interner)
+                    }
+                    Either::Right(id) => unknown_const_as_generic(db.const_param_ty(id)),
+                };
+                crate::make_binders(db, &generic_params, val)
+            })
+            // FIXME: use `Arc::from_iter` when it becomes available
+            .collect::<Vec<_>>(),
+    );
 
     defaults
 }
@@ -2016,6 +2030,7 @@ pub(crate) fn const_or_path_to_chalk(
                 mode,
                 args,
                 debruijn,
+                expected_ty.clone(),
             )
             .unwrap_or_else(|| unknown_const(expected_ty))
         }

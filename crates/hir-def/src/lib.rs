@@ -49,6 +49,7 @@ pub mod find_path;
 pub mod import_map;
 
 pub use rustc_abi as layout;
+use triomphe::Arc;
 
 #[cfg(test)]
 mod test_db;
@@ -56,10 +57,7 @@ mod test_db;
 mod macro_expansion_tests;
 mod pretty;
 
-use std::{
-    hash::{Hash, Hasher},
-    sync::Arc,
-};
+use std::hash::{Hash, Hasher};
 
 use base_db::{impl_intern_key, salsa, CrateId, ProcMacroKind};
 use hir_expand::{
@@ -984,7 +982,6 @@ fn attr_macro_as_call_id(
     macro_attr: &Attr,
     krate: CrateId,
     def: MacroDefId,
-    is_derive: bool,
 ) -> MacroCallId {
     let arg = match macro_attr.input.as_deref() {
         Some(AttrInput::TokenTree(tt, map)) => (
@@ -1005,7 +1002,6 @@ fn attr_macro_as_call_id(
             ast_id: item_attr.ast_id,
             attr_args: Arc::new(arg),
             invoc_attr_index: macro_attr.id,
-            is_derive,
         },
     )
 }

@@ -2,7 +2,7 @@
 //! metadata` or `rust-project.json`) into representation stored in the salsa
 //! database -- `CrateGraph`.
 
-use std::{collections::VecDeque, fmt, fs, process::Command, sync::Arc};
+use std::{collections::VecDeque, fmt, fs, process::Command, sync};
 
 use anyhow::{format_err, Context, Result};
 use base_db::{
@@ -14,6 +14,7 @@ use paths::{AbsPath, AbsPathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use semver::Version;
 use stdx::always;
+use triomphe::Arc;
 
 use crate::{
     build_scripts::BuildScriptOutput,
@@ -178,7 +179,6 @@ impl ProjectWorkspace {
         };
         let res = match manifest {
             ProjectManifest::ProjectJson(project_json) => {
-                let project_json = project_json.canonicalize()?;
                 let file = fs::read_to_string(&project_json).with_context(|| {
                     format!("Failed to read json file {}", project_json.display())
                 })?;
@@ -422,7 +422,7 @@ impl ProjectWorkspace {
         let outputs = &mut match WorkspaceBuildScripts::run_once(config, &cargo_ws, progress) {
             Ok(it) => Ok(it.into_iter()),
             // io::Error is not Clone?
-            Err(e) => Err(Arc::new(e)),
+            Err(e) => Err(sync::Arc::new(e)),
         };
 
         workspaces
@@ -459,18 +459,35 @@ impl ProjectWorkspace {
         }
     }
 
-    pub fn find_sysroot_proc_macro_srv(&self) -> Option<AbsPathBuf> {
+    pub fn find_sysroot_proc_macro_srv(&self) -> Result<AbsPathBuf> {
         match self {
             ProjectWorkspace::Cargo { sysroot: Ok(sysroot), .. }
-            | ProjectWorkspace::Json { sysroot: Ok(sysroot), .. } => {
+            | ProjectWorkspace::Json { sysroot: Ok(sysroot), .. }
+            | ProjectWorkspace::DetachedFiles { sysroot: Ok(sysroot), .. } => {
                 let standalone_server_name =
                     format!("rust-analyzer-proc-macro-srv{}", std::env::consts::EXE_SUFFIX);
                 ["libexec", "lib"]
                     .into_iter()
                     .map(|segment| sysroot.root().join(segment).join(&standalone_server_name))
                     .find(|server_path| std::fs::metadata(server_path).is_ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cannot find proc-macro server in sysroot `{}`",
+                            sysroot.root().display()
+                        )
+                    })
             }
-            _ => None,
+            ProjectWorkspace::DetachedFiles { .. } => {
+                Err(anyhow::anyhow!("cannot find proc-macro server, no sysroot was found"))
+            }
+            ProjectWorkspace::Cargo { cargo, .. } => Err(anyhow::anyhow!(
+                "cannot find proc-macro-srv, the workspace `{}` is missing a sysroot",
+                cargo.workspace_root().display()
+            )),
+            ProjectWorkspace::Json { project, .. } => Err(anyhow::anyhow!(
+                "cannot find proc-macro-srv, the workspace `{}` is missing a sysroot",
+                project.path().display()
+            )),
         }
     }
 
@@ -1249,7 +1266,7 @@ fn add_target_crate_root(
     if is_proc_macro {
         let proc_macro = match build_data.as_ref().map(|it| it.proc_macro_dylib_path.as_ref()) {
             Some(it) => it.cloned().map(|path| Ok((Some(cargo_name.to_owned()), path))),
-            None => Some(Err("crate has not yet been build".to_owned())),
+            None => Some(Err("crate has not yet been built".to_owned())),
         };
         if let Some(proc_macro) = proc_macro {
             proc_macros.insert(crate_id, proc_macro);

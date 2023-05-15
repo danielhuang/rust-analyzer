@@ -94,6 +94,7 @@ dependencies = [
  "stdx",
  "syntax",
  "test-utils",
+ "triomphe",
  "tt",
  "vfs",
 ]
@@ -498,6 +499,7 @@ dependencies = [
  "smallvec",
  "stdx",
  "syntax",
+ "triomphe",
  "tt",
 ]
 
@@ -534,6 +536,7 @@ dependencies = [
  "syntax",
  "test-utils",
  "tracing",
+ "triomphe",
  "tt",
 ]
 
@@ -558,6 +561,7 @@ dependencies = [
  "stdx",
  "syntax",
  "tracing",
+ "triomphe",
  "tt",
 ]
 
@@ -583,6 +587,7 @@ dependencies = [
  "itertools",
  "la-arena",
  "limit",
+ "nohash-hasher",
  "once_cell",
  "profile",
  "project-model",
@@ -595,6 +600,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-tree",
+ "triomphe",
  "typed-arena",
 ]
 
@@ -645,6 +651,7 @@ dependencies = [
  "ide-diagnostics",
  "ide-ssr",
  "itertools",
+ "nohash-hasher",
  "oorandom",
  "profile",
  "pulldown-cmark",
@@ -656,6 +663,7 @@ dependencies = [
  "text-edit",
  "toolchain",
  "tracing",
+ "triomphe",
  "url",
 ]
 
@@ -711,7 +719,9 @@ dependencies = [
  "indexmap",
  "itertools",
  "limit",
+ "line-index",
  "memchr",
+ "nohash-hasher",
  "once_cell",
  "oorandom",
  "parser",
@@ -724,6 +734,7 @@ dependencies = [
  "test-utils",
  "text-edit",
  "tracing",
+ "triomphe",
  "xshell",
 ]
 
@@ -756,11 +767,13 @@ dependencies = [
  "hir",
  "ide-db",
  "itertools",
+ "nohash-hasher",
  "parser",
  "stdx",
  "syntax",
  "test-utils",
  "text-edit",
+ "triomphe",
 ]
 
 [[package]]
@@ -820,6 +833,7 @@ dependencies = [
  "hashbrown",
  "once_cell",
  "rustc-hash",
+ "triomphe",
 ]
 
 [[package]]
@@ -902,6 +916,14 @@ dependencies = [
 [[package]]
 name = "limit"
 version = "0.0.0"
+
+[[package]]
+name = "line-index"
+version = "0.1.0-pre.1"
+dependencies = [
+ "nohash-hasher",
+ "text-size",
+]
 
 [[package]]
 name = "lock_api"
@@ -1044,6 +1066,12 @@ dependencies = [
  "libc",
  "static_assertions",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "notify"
@@ -1234,6 +1262,7 @@ dependencies = [
  "snap",
  "stdx",
  "tracing",
+ "triomphe",
  "tt",
 ]
 
@@ -1315,6 +1344,7 @@ dependencies = [
  "stdx",
  "toolchain",
  "tracing",
+ "triomphe",
 ]
 
 [[package]]
@@ -1459,12 +1489,12 @@ dependencies = [
  "mbe",
  "mimalloc",
  "mio",
+ "nohash-hasher",
  "num_cpus",
  "oorandom",
  "parking_lot 0.12.1",
  "parking_lot_core 0.9.6",
  "proc-macro-api",
- "proc-macro-srv-cli",
  "profile",
  "project-model",
  "rayon",
@@ -1485,6 +1515,7 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "tracing-tree",
+ "triomphe",
  "tt",
  "vfs",
  "vfs-notify",
@@ -1731,6 +1762,7 @@ dependencies = [
  "stdx",
  "test-utils",
  "text-edit",
+ "triomphe",
  "ungrammar",
 ]
 
@@ -1941,6 +1973,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "triomphe"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1ee9bd9239c339d714d657fac840c6d2a4f9c45f4f9ec7b0975113458be78db"
+
+[[package]]
 name = "tt"
 version = "0.0.0"
 dependencies = [
@@ -2032,6 +2070,7 @@ version = "0.0.0"
 dependencies = [
  "fst",
  "indexmap",
+ "nohash-hasher",
  "paths",
  "rustc-hash",
  "stdx",

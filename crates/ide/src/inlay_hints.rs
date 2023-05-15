@@ -20,16 +20,17 @@ use text_edit::TextEdit;
 
 use crate::{navigation_target::TryToNav, FileId};
 
-mod closing_brace;
-mod implicit_static;
-mod fn_lifetime_fn;
-mod closure_ret;
 mod adjustment;
-mod chaining;
-mod param_name;
-mod binding_mode;
 mod bind_pat;
+mod binding_mode;
+mod chaining;
+mod closing_brace;
+mod closure_ret;
+mod closure_captures;
 mod discriminant;
+mod fn_lifetime_fn;
+mod implicit_static;
+mod param_name;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlayHintsConfig {
@@ -42,6 +43,7 @@ pub struct InlayHintsConfig {
     pub adjustment_hints_mode: AdjustmentHintsMode,
     pub adjustment_hints_hide_outside_unsafe: bool,
     pub closure_return_type_hints: ClosureReturnTypeHints,
+    pub closure_capture_hints: bool,
     pub binding_mode_hints: bool,
     pub lifetime_elision_hints: LifetimeElisionHints,
     pub param_names_for_lifetime_elision_hints: bool,
@@ -90,27 +92,32 @@ pub enum AdjustmentHintsMode {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InlayKind {
+    Adjustment,
     BindingMode,
     Chaining,
     ClosingBrace,
-    ClosureReturnType,
+    ClosureCapture,
+    Discriminant,
     GenericParamList,
-    Adjustment,
-    AdjustmentPostfix,
     Lifetime,
     Parameter,
     Type,
-    Discriminant,
-    OpeningParenthesis,
-    ClosingParenthesis,
+}
+
+#[derive(Debug)]
+pub enum InlayHintPosition {
+    Before,
+    After,
 }
 
 #[derive(Debug)]
 pub struct InlayHint {
     /// The text range this inlay hint applies to.
     pub range: TextRange,
-    /// The kind of this inlay hint. This is used to determine side and padding of the hint for
-    /// rendering purposes.
+    pub position: InlayHintPosition,
+    pub pad_left: bool,
+    pub pad_right: bool,
+    /// The kind of this inlay hint.
     pub kind: InlayKind,
     /// The actual label to show in the inlay hint.
     pub label: InlayHintLabel,
@@ -119,20 +126,26 @@ pub struct InlayHint {
 }
 
 impl InlayHint {
-    fn closing_paren(range: TextRange) -> InlayHint {
+    fn closing_paren_after(kind: InlayKind, range: TextRange) -> InlayHint {
         InlayHint {
             range,
-            kind: InlayKind::ClosingParenthesis,
+            kind,
             label: InlayHintLabel::from(")"),
             text_edit: None,
+            position: InlayHintPosition::After,
+            pad_left: false,
+            pad_right: false,
         }
     }
-    fn opening_paren(range: TextRange) -> InlayHint {
+    fn opening_paren_before(kind: InlayKind, range: TextRange) -> InlayHint {
         InlayHint {
             range,
-            kind: InlayKind::OpeningParenthesis,
+            kind,
             label: InlayHintLabel::from("("),
             text_edit: None,
+            position: InlayHintPosition::Before,
+            pad_left: false,
+            pad_right: false,
         }
     }
 }
@@ -298,13 +311,13 @@ impl InlayHintLabelBuilder<'_> {
 fn label_of_ty(
     famous_defs @ FamousDefs(sema, _): &FamousDefs<'_, '_>,
     config: &InlayHintsConfig,
-    ty: hir::Type,
+    ty: &hir::Type,
 ) -> Option<InlayHintLabel> {
     fn rec(
         sema: &Semantics<'_, RootDatabase>,
         famous_defs: &FamousDefs<'_, '_>,
         mut max_length: Option<usize>,
-        ty: hir::Type,
+        ty: &hir::Type,
         label_builder: &mut InlayHintLabelBuilder<'_>,
         config: &InlayHintsConfig,
     ) -> Result<(), HirDisplayError> {
@@ -337,7 +350,7 @@ fn label_of_ty(
                 label_builder.write_str(LABEL_ITEM)?;
                 label_builder.end_location_link();
                 label_builder.write_str(LABEL_MIDDLE2)?;
-                rec(sema, famous_defs, max_length, ty, label_builder, config)?;
+                rec(sema, famous_defs, max_length, &ty, label_builder, config)?;
                 label_builder.write_str(LABEL_END)?;
                 Ok(())
             }
@@ -444,10 +457,10 @@ fn hints(
                     ast::Expr::MethodCallExpr(it) => {
                         param_name::hints(hints, sema, config, ast::Expr::from(it))
                     }
-                    ast::Expr::ClosureExpr(it) => closure_ret::hints(hints, famous_defs, config, file_id, it),
-                    // We could show reborrows for all expressions, but usually that is just noise to the user
-                    // and the main point here is to show why "moving" a mutable reference doesn't necessarily move it
-                    // ast::Expr::PathExpr(_) => reborrow_hints(hints, sema, config, &expr),
+                    ast::Expr::ClosureExpr(it) => {
+                        closure_captures::hints(hints, famous_defs, config, file_id, it.clone());
+                        closure_ret::hints(hints, famous_defs, config, file_id, it)
+                    },
                     _ => None,
                 }
             },
@@ -535,6 +548,7 @@ mod tests {
         chaining_hints: false,
         lifetime_elision_hints: LifetimeElisionHints::Never,
         closure_return_type_hints: ClosureReturnTypeHints::Never,
+        closure_capture_hints: false,
         adjustment_hints: AdjustmentHints::Never,
         adjustment_hints_mode: AdjustmentHintsMode::Prefix,
         adjustment_hints_hide_outside_unsafe: false,
@@ -568,7 +582,8 @@ mod tests {
         let inlay_hints = analysis.inlay_hints(&config, file_id, None).unwrap();
         let actual = inlay_hints
             .into_iter()
-            .map(|it| (it.range, it.label.to_string()))
+            // FIXME: We trim the start because some inlay produces leading whitespace which is not properly supported by our annotation extraction
+            .map(|it| (it.range, it.label.to_string().trim_start().to_owned()))
             .sorted_by_key(|(range, _)| range.start())
             .collect::<Vec<_>>();
         expected.sort_by_key(|(range, _)| range.start());

@@ -5,7 +5,7 @@
 //! See <https://doc.rust-lang.org/nomicon/coercions.html> and
 //! `rustc_hir_analysis/check/coercion.rs`.
 
-use std::{iter, sync::Arc};
+use std::iter;
 
 use chalk_ir::{cast::Cast, BoundVar, Goal, Mutability, TyKind, TyVariableKind};
 use hir_def::{
@@ -13,6 +13,7 @@ use hir_def::{
     lang_item::{LangItem, LangItemTarget},
 };
 use stdx::always;
+use triomphe::Arc;
 
 use crate::{
     autoderef::{Autoderef, AutoderefKind},
@@ -21,8 +22,10 @@ use crate::{
         Adjust, Adjustment, AutoBorrow, InferOk, InferenceContext, OverloadedDeref, PointerCast,
         TypeError, TypeMismatch,
     },
-    static_lifetime, Canonical, DomainGoal, FnPointer, FnSig, Guidance, InEnvironment, Interner,
-    Solution, Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
+    static_lifetime,
+    utils::ClosureSubst,
+    Canonical, DomainGoal, FnPointer, FnSig, Guidance, InEnvironment, Interner, Solution,
+    Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
 };
 
 use super::unify::InferenceTable;
@@ -670,7 +673,7 @@ impl<'a> InferenceTable<'a> {
 }
 
 fn coerce_closure_fn_ty(closure_substs: &Substitution, safety: chalk_ir::Safety) -> Ty {
-    let closure_sig = closure_substs.at(Interner, 0).assert_ty_ref(Interner).clone();
+    let closure_sig = ClosureSubst(closure_substs).sig_ty().clone();
     match closure_sig.kind(Interner) {
         TyKind::Function(fn_ty) => TyKind::Function(FnPointer {
             num_binders: fn_ty.num_binders,

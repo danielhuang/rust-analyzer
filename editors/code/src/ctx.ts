@@ -7,6 +7,7 @@ import { Config, prepareVSCodeConfig } from "./config";
 import { createClient } from "./client";
 import {
     executeDiscoverProject,
+    isDocumentInWorkspace,
     isRustDocument,
     isRustEditor,
     LazyOutputChannel,
@@ -14,6 +15,13 @@ import {
     RustEditor,
 } from "./util";
 import { ServerStatusParams } from "./lsp_ext";
+import {
+    Dependency,
+    DependencyFile,
+    RustDependenciesProvider,
+    DependencyId,
+} from "./dependencies_provider";
+import { execRevealDependency } from "./commands";
 import { PersistentState } from "./persistent_state";
 import { bootstrap } from "./bootstrap";
 import { ExecOptions } from "child_process";
@@ -84,9 +92,19 @@ export class Ctx {
     private commandFactories: Record<string, CommandFactory>;
     private commandDisposables: Disposable[];
     private unlinkedFiles: vscode.Uri[];
+    private _dependencies: RustDependenciesProvider | undefined;
+    private _treeView: vscode.TreeView<Dependency | DependencyFile | DependencyId> | undefined;
 
     get client() {
         return this._client;
+    }
+
+    get treeView() {
+        return this._treeView;
+    }
+
+    get dependencies() {
+        return this._dependencies;
     }
 
     constructor(
@@ -101,7 +119,6 @@ export class Ctx {
         this.commandDisposables = [];
         this.commandFactories = commandFactories;
         this.unlinkedFiles = [];
-
         this.state = new PersistentState(extCtx.globalState);
         this.config = new Config(extCtx);
 
@@ -246,6 +263,53 @@ export class Ctx {
         }
         await client.start();
         this.updateCommands();
+        this.prepareTreeDependenciesView(client);
+    }
+
+    private prepareTreeDependenciesView(client: lc.LanguageClient) {
+        const ctxInit: CtxInit = {
+            ...this,
+            client: client,
+        };
+        this._dependencies = new RustDependenciesProvider(ctxInit);
+        this._treeView = vscode.window.createTreeView("rustDependencies", {
+            treeDataProvider: this._dependencies,
+            showCollapseAll: true,
+        });
+
+        this.pushExtCleanup(this._treeView);
+        vscode.window.onDidChangeActiveTextEditor(async (e) => {
+            // we should skip documents that belong to the current workspace
+            if (this.shouldRevealDependency(e)) {
+                try {
+                    await execRevealDependency(e);
+                } catch (reason) {
+                    await vscode.window.showErrorMessage(`Dependency error: ${reason}`);
+                }
+            }
+        });
+
+        this.treeView?.onDidChangeVisibility(async (e) => {
+            if (e.visible) {
+                const activeEditor = vscode.window.activeTextEditor;
+                if (this.shouldRevealDependency(activeEditor)) {
+                    try {
+                        await execRevealDependency(activeEditor);
+                    } catch (reason) {
+                        await vscode.window.showErrorMessage(`Dependency error: ${reason}`);
+                    }
+                }
+            }
+        });
+    }
+
+    private shouldRevealDependency(e: vscode.TextEditor | undefined): e is RustEditor {
+        return (
+            e !== undefined &&
+            isRustEditor(e) &&
+            !isDocumentInWorkspace(e.document) &&
+            (this.treeView?.visible || false)
+        );
     }
 
     async restart() {
@@ -348,6 +412,7 @@ export class Ctx {
                 statusBar.color = undefined;
                 statusBar.backgroundColor = undefined;
                 statusBar.command = "rust-analyzer.stopServer";
+                this.dependencies?.refresh();
                 break;
             case "warning":
                 if (status.message) {
@@ -390,7 +455,9 @@ export class Ctx {
         statusBar.tooltip.appendMarkdown(
             "\n\n[Rebuild Proc Macros](command:rust-analyzer.rebuildProcMacros)"
         );
-        statusBar.tooltip.appendMarkdown("\n\n[Restart server](command:rust-analyzer.startServer)");
+        statusBar.tooltip.appendMarkdown(
+            "\n\n[Restart server](command:rust-analyzer.restartServer)"
+        );
         statusBar.tooltip.appendMarkdown("\n\n[Stop server](command:rust-analyzer.stopServer)");
         if (!status.quiescent) icon = "$(sync~spin) ";
         statusBar.text = `${icon}rust-analyzer`;
@@ -408,4 +475,5 @@ export class Ctx {
 export interface Disposable {
     dispose(): void;
 }
+
 export type Cmd = (...args: any[]) => unknown;

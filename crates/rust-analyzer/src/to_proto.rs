@@ -24,7 +24,7 @@ use crate::{
     line_index::{LineEndings, LineIndex, PositionEncoding},
     lsp_ext,
     lsp_utils::invalid_params_error,
-    semantic_tokens,
+    semantic_tokens::{self, standard_fallback_type},
 };
 
 pub(crate) fn position(line_index: &LineIndex, offset: TextSize) -> lsp_types::Position {
@@ -32,7 +32,7 @@ pub(crate) fn position(line_index: &LineIndex, offset: TextSize) -> lsp_types::P
     match line_index.encoding {
         PositionEncoding::Utf8 => lsp_types::Position::new(line_col.line, line_col.col),
         PositionEncoding::Wide(enc) => {
-            let line_col = line_index.index.to_wide(enc, line_col);
+            let line_col = line_index.index.to_wide(enc, line_col).unwrap();
             lsp_types::Position::new(line_col.line, line_col.col)
         }
     }
@@ -434,81 +434,21 @@ pub(crate) fn signature_help(
 pub(crate) fn inlay_hint(
     snap: &GlobalStateSnapshot,
     line_index: &LineIndex,
-    render_colons: bool,
-    mut inlay_hint: InlayHint,
+    inlay_hint: InlayHint,
 ) -> Cancellable<lsp_types::InlayHint> {
-    match inlay_hint.kind {
-        InlayKind::Parameter if render_colons => inlay_hint.label.append_str(":"),
-        InlayKind::Type if render_colons => inlay_hint.label.prepend_str(": "),
-        InlayKind::ClosureReturnType => inlay_hint.label.prepend_str(" -> "),
-        InlayKind::Discriminant => inlay_hint.label.prepend_str(" = "),
-        _ => {}
-    }
-
     let (label, tooltip) = inlay_hint_label(snap, inlay_hint.label)?;
 
     Ok(lsp_types::InlayHint {
-        position: match inlay_hint.kind {
-            // before annotated thing
-            InlayKind::OpeningParenthesis
-            | InlayKind::Parameter
-            | InlayKind::Adjustment
-            | InlayKind::BindingMode => position(line_index, inlay_hint.range.start()),
-            // after annotated thing
-            InlayKind::ClosureReturnType
-            | InlayKind::Type
-            | InlayKind::Discriminant
-            | InlayKind::Chaining
-            | InlayKind::GenericParamList
-            | InlayKind::ClosingParenthesis
-            | InlayKind::AdjustmentPostfix
-            | InlayKind::Lifetime
-            | InlayKind::ClosingBrace => position(line_index, inlay_hint.range.end()),
+        position: match inlay_hint.position {
+            ide::InlayHintPosition::Before => position(line_index, inlay_hint.range.start()),
+            ide::InlayHintPosition::After => position(line_index, inlay_hint.range.end()),
         },
-        padding_left: Some(match inlay_hint.kind {
-            InlayKind::Type => !render_colons,
-            InlayKind::Chaining | InlayKind::ClosingBrace => true,
-            InlayKind::ClosingParenthesis
-            | InlayKind::Discriminant
-            | InlayKind::OpeningParenthesis
-            | InlayKind::BindingMode
-            | InlayKind::ClosureReturnType
-            | InlayKind::GenericParamList
-            | InlayKind::Adjustment
-            | InlayKind::AdjustmentPostfix
-            | InlayKind::Lifetime
-            | InlayKind::Parameter => false,
-        }),
-        padding_right: Some(match inlay_hint.kind {
-            InlayKind::ClosingParenthesis
-            | InlayKind::OpeningParenthesis
-            | InlayKind::Chaining
-            | InlayKind::ClosureReturnType
-            | InlayKind::GenericParamList
-            | InlayKind::Adjustment
-            | InlayKind::AdjustmentPostfix
-            | InlayKind::Type
-            | InlayKind::Discriminant
-            | InlayKind::ClosingBrace => false,
-            InlayKind::BindingMode => {
-                matches!(&label, lsp_types::InlayHintLabel::String(s) if s != "&")
-            }
-            InlayKind::Parameter | InlayKind::Lifetime => true,
-        }),
+        padding_left: Some(inlay_hint.pad_left),
+        padding_right: Some(inlay_hint.pad_right),
         kind: match inlay_hint.kind {
             InlayKind::Parameter => Some(lsp_types::InlayHintKind::PARAMETER),
-            InlayKind::ClosureReturnType | InlayKind::Type | InlayKind::Chaining => {
-                Some(lsp_types::InlayHintKind::TYPE)
-            }
-            InlayKind::ClosingParenthesis
-            | InlayKind::Discriminant
-            | InlayKind::OpeningParenthesis
-            | InlayKind::BindingMode
-            | InlayKind::GenericParamList
-            | InlayKind::Lifetime
-            | InlayKind::Adjustment
-            | InlayKind::AdjustmentPostfix
-            | InlayKind::ClosingBrace => None,
+            InlayKind::Type | InlayKind::Chaining => Some(lsp_types::InlayHintKind::TYPE),
+            _ => None,
         },
         text_edits: inlay_hint.text_edit.map(|it| text_edit_vec(line_index, it)),
         data: None,
@@ -580,6 +520,8 @@ pub(crate) fn semantic_tokens(
     text: &str,
     line_index: &LineIndex,
     highlights: Vec<HlRange>,
+    semantics_tokens_augments_syntax_tokens: bool,
+    non_standard_tokens: bool,
 ) -> lsp_types::SemanticTokens {
     let id = TOKEN_RESULT_COUNTER.fetch_add(1, Ordering::SeqCst).to_string();
     let mut builder = semantic_tokens::SemanticTokensBuilder::new(id);
@@ -589,7 +531,35 @@ pub(crate) fn semantic_tokens(
             continue;
         }
 
-        let (ty, mods) = semantic_token_type_and_modifiers(highlight_range.highlight);
+        if semantics_tokens_augments_syntax_tokens {
+            match highlight_range.highlight.tag {
+                HlTag::BoolLiteral
+                | HlTag::ByteLiteral
+                | HlTag::CharLiteral
+                | HlTag::Comment
+                | HlTag::Keyword
+                | HlTag::NumericLiteral
+                | HlTag::Operator(_)
+                | HlTag::Punctuation(_)
+                | HlTag::StringLiteral
+                | HlTag::None
+                    if highlight_range.highlight.mods.is_empty() =>
+                {
+                    continue
+                }
+                _ => (),
+            }
+        }
+
+        let (mut ty, mut mods) = semantic_token_type_and_modifiers(highlight_range.highlight);
+
+        if !non_standard_tokens {
+            ty = match standard_fallback_type(ty) {
+                Some(ty) => ty,
+                None => continue,
+            };
+            mods.standard_fallback();
+        }
         let token_index = semantic_tokens::type_index(ty);
         let modifier_bitset = mods.0;
 
@@ -710,6 +680,7 @@ fn semantic_token_type_and_modifiers(
             HlMod::Injected => semantic_tokens::INJECTED,
             HlMod::IntraDocLink => semantic_tokens::INTRA_DOC_LINK,
             HlMod::Library => semantic_tokens::LIBRARY,
+            HlMod::Macro => semantic_tokens::MACRO_MODIFIER,
             HlMod::Mutable => semantic_tokens::MUTABLE,
             HlMod::Public => semantic_tokens::PUBLIC,
             HlMod::Reference => semantic_tokens::REFERENCE,
@@ -1215,6 +1186,14 @@ pub(crate) fn code_lens(
                     data: None,
                 })
             }
+            if lens_config.interpret {
+                let command = command::interpret_single(&r);
+                acc.push(lsp_types::CodeLens {
+                    range: annotation_range,
+                    command: Some(command),
+                    data: None,
+                })
+            }
         }
         AnnotationKind::HasImpls { pos: file_range, data } => {
             if !client_commands_config.show_reference {
@@ -1359,6 +1338,15 @@ pub(crate) mod command {
         }
     }
 
+    pub(crate) fn interpret_single(_runnable: &lsp_ext::Runnable) -> lsp_types::Command {
+        lsp_types::Command {
+            title: "Interpret".into(),
+            command: "rust-analyzer.interpretFunction".into(),
+            // FIXME: use the `_runnable` here.
+            arguments: Some(vec![]),
+        }
+    }
+
     pub(crate) fn goto_location(
         snap: &GlobalStateSnapshot,
         nav: &NavigationTarget,
@@ -1424,9 +1412,8 @@ pub(crate) fn rename_error(err: RenameError) -> crate::LspError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use ide::Analysis;
+    use triomphe::Arc;
 
     use super::*;
 

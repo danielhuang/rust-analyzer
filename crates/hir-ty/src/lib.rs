@@ -35,7 +35,7 @@ mod tests;
 #[cfg(test)]
 mod test_db;
 
-use std::{collections::HashMap, hash::Hash, sync::Arc};
+use std::{collections::HashMap, hash::Hash};
 
 use chalk_ir::{
     fold::{Shift, TypeFoldable},
@@ -44,12 +44,13 @@ use chalk_ir::{
     NoSolution, TyData,
 };
 use either::Either;
-use hir_def::{hir::ExprId, type_ref::Rawness, TypeOrConstParamId};
+use hir_def::{hir::ExprId, type_ref::Rawness, ConstId, TypeOrConstParamId};
 use hir_expand::name;
 use la_arena::{Arena, Idx};
-use mir::MirEvalError;
+use mir::{MirEvalError, VTableMap};
 use rustc_hash::FxHashSet;
 use traits::FnTrait;
+use triomphe::Arc;
 use utils::Generics;
 
 use crate::{
@@ -60,6 +61,7 @@ pub use autoderef::autoderef;
 pub use builder::{ParamKind, TyBuilder};
 pub use chalk_ext::*;
 pub use infer::{
+    closure::{CaptureKind, CapturedItem},
     could_coerce, could_unify, Adjust, Adjustment, AutoBorrow, BindingMode, InferenceDiagnostic,
     InferenceResult, OverloadedDeref, PointerCast,
 };
@@ -151,11 +153,14 @@ pub type WhereClause = chalk_ir::WhereClause<Interner>;
 /// the necessary bits of memory of the const eval session to keep the constant
 /// meaningful.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct MemoryMap(pub HashMap<usize, Vec<u8>>);
+pub struct MemoryMap {
+    pub memory: HashMap<usize, Vec<u8>>,
+    pub vtable: VTableMap,
+}
 
 impl MemoryMap {
     fn insert(&mut self, addr: usize, x: Vec<u8>) {
-        self.0.insert(addr, x);
+        self.memory.insert(addr, x);
     }
 
     /// This functions convert each address by a function `f` which gets the byte intervals and assign an address
@@ -165,7 +170,7 @@ impl MemoryMap {
         &self,
         mut f: impl FnMut(&[u8]) -> Result<usize, MirEvalError>,
     ) -> Result<HashMap<usize, usize>, MirEvalError> {
-        self.0.iter().map(|x| Ok((*x.0, f(x.1)?))).collect()
+        self.memory.iter().map(|x| Ok((*x.0, f(x.1)?))).collect()
     }
 }
 
@@ -173,6 +178,9 @@ impl MemoryMap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstScalar {
     Bytes(Vec<u8>, MemoryMap),
+    // FIXME: this is a hack to get around chalk not being able to represent unevaluatable
+    // constants
+    UnevaluatedConst(ConstId, Substitution),
     /// Case of an unknown value that rustc might know but we don't
     // FIXME: this is a hack to get around chalk not being able to represent unevaluatable
     // constants
@@ -283,16 +291,19 @@ impl CallableSig {
     pub fn from_fn_ptr(fn_ptr: &FnPointer) -> CallableSig {
         CallableSig {
             // FIXME: what to do about lifetime params? -> return PolyFnSig
-            params_and_return: fn_ptr
-                .substitution
-                .clone()
-                .shifted_out_to(Interner, DebruijnIndex::ONE)
-                .expect("unexpected lifetime vars in fn ptr")
-                .0
-                .as_slice(Interner)
-                .iter()
-                .map(|arg| arg.assert_ty_ref(Interner).clone())
-                .collect(),
+            // FIXME: use `Arc::from_iter` when it becomes available
+            params_and_return: Arc::from(
+                fn_ptr
+                    .substitution
+                    .clone()
+                    .shifted_out_to(Interner, DebruijnIndex::ONE)
+                    .expect("unexpected lifetime vars in fn ptr")
+                    .0
+                    .as_slice(Interner)
+                    .iter()
+                    .map(|arg| arg.assert_ty_ref(Interner).clone())
+                    .collect::<Vec<_>>(),
+            ),
             is_varargs: fn_ptr.sig.variadic,
             safety: fn_ptr.sig.safety,
         }

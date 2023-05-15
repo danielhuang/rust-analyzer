@@ -121,6 +121,11 @@
                 "category": "rust-analyzer (debug command)"
             },
             {
+                "command": "rust-analyzer.interpretFunction",
+                "title": "Interpret Function",
+                "category": "rust-analyzer (debug command)"
+            },
+            {
                 "command": "rust-analyzer.viewFileText",
                 "title": "View File Text (as seen by the server)",
                 "category": "rust-analyzer (debug command)"
@@ -211,7 +216,7 @@
                 "category": "rust-analyzer"
             },
             {
-                "command": "rust-analyzer.reload",
+                "command": "rust-analyzer.restartServer",
                 "title": "Restart server",
                 "category": "rust-analyzer"
             },
@@ -278,6 +283,11 @@
             {
                 "command": "rust-analyzer.clearFlycheck",
                 "title": "Clear flycheck diagnostics",
+                "category": "rust-analyzer"
+            },
+            {
+                "command": "rust-analyzer.revealDependency",
+                "title": "Reveal File",
                 "category": "rust-analyzer"
             }
         ],
@@ -881,6 +891,11 @@
                     "default": true,
                     "type": "boolean"
                 },
+                "rust-analyzer.highlightRelated.closureCaptures.enable": {
+                    "markdownDescription": "Enables highlighting of all captures of a closure while the cursor is on the `|` or move keyword of a closure.",
+                    "default": true,
+                    "type": "boolean"
+                },
                 "rust-analyzer.highlightRelated.exitPoints.enable": {
                     "markdownDescription": "Enables highlighting of all exit points while the cursor is on any `return`, `?`, `fn`, or return type arrow (`->`).",
                     "default": true,
@@ -937,7 +952,12 @@
                     "type": "boolean"
                 },
                 "rust-analyzer.hover.links.enable": {
-                    "markdownDescription": "Use markdown syntax for links in hover.",
+                    "markdownDescription": "Use markdown syntax for links on hover.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.hover.memoryLayout.enable": {
+                    "markdownDescription": "Whether to show memory layout data on hover.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -1013,6 +1033,11 @@
                     "default": 25,
                     "type": "integer",
                     "minimum": 0
+                },
+                "rust-analyzer.inlayHints.closureCaptureHints.enable": {
+                    "markdownDescription": "Whether to show inlay hints for closure captures.",
+                    "default": false,
+                    "type": "boolean"
                 },
                 "rust-analyzer.inlayHints.closureReturnTypeHints.enable": {
                     "markdownDescription": "Whether to show inlay type hints for return types of closures.",
@@ -1305,7 +1330,7 @@
                     "type": "object"
                 },
                 "rust-analyzer.procMacro.server": {
-                    "markdownDescription": "Internal config, path to proc-macro server executable (typically,\nthis is rust-analyzer itself, but we override this in tests).",
+                    "markdownDescription": "Internal config, path to proc-macro server executable.",
                     "default": null,
                     "type": [
                         "null",
@@ -1367,6 +1392,11 @@
                 },
                 "rust-analyzer.semanticHighlighting.doc.comment.inject.enable": {
                     "markdownDescription": "Inject additional highlighting into doc comments.\n\nWhen enabled, rust-analyzer will highlight rust source in doc comments as well as intra\ndoc links.",
+                    "default": true,
+                    "type": "boolean"
+                },
+                "rust-analyzer.semanticHighlighting.nonStandardTokens": {
+                    "markdownDescription": "Whether the server is allowed to emit non-standard tokens and modifiers.",
                     "default": true,
                     "type": "boolean"
                 },
@@ -1494,6 +1524,18 @@
                         "endColumn": 6
                     }
                 ]
+            },
+            {
+                "name": "rust-panic",
+                "patterns": [
+                    {
+                        "regexp": "^thread '.*' panicked at '(.*)', (.*):(\\d*):(\\d*)$",
+                        "message": 1,
+                        "file": 2,
+                        "line": 3,
+                        "column": 4
+                    }
+                ]
             }
         ],
         "languages": [
@@ -1542,6 +1584,16 @@
                     "${workspaceRoot}"
                 ],
                 "pattern": "$rustc-json"
+            },
+            {
+                "name": "rust-panic",
+                "owner": "rust-panic",
+                "source": "panic",
+                "fileLocation": [
+                    "autoDetect",
+                    "${workspaceRoot}"
+                ],
+                "pattern": "$rust-panic"
             },
             {
                 "name": "rustc-watch",
@@ -1909,7 +1961,7 @@
                     "when": "inRustProject"
                 },
                 {
-                    "command": "rust-analyzer.reload",
+                    "command": "rust-analyzer.restartServer",
                     "when": "inRustProject"
                 },
                 {
@@ -1943,6 +1995,15 @@
                     "command": "rust-analyzer.openDocs",
                     "when": "inRustProject && editorTextFocus && editorLangId == rust",
                     "group": "navigation@1001"
+                }
+            ]
+        },
+        "views": {
+            "explorer": [
+                {
+                    "id": "rustDependencies",
+                    "name": "Rust Dependencies",
+                    "when": "inRustProject"
                 }
             ]
         },

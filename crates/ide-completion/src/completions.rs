@@ -78,14 +78,6 @@ impl Completions {
         }
     }
 
-    pub(crate) fn add_all<I>(&mut self, items: I)
-    where
-        I: IntoIterator,
-        I::Item: Into<CompletionItem>,
-    {
-        items.into_iter().for_each(|item| self.add(item.into()))
-    }
-
     pub(crate) fn add_keyword(&mut self, ctx: &CompletionContext<'_>, keyword: &'static str) {
         let item = CompletionItem::new(CompletionItemKind::Keyword, ctx.source_range(), keyword);
         item.add_to(self);
@@ -303,9 +295,12 @@ impl Completions {
             Visible::Editable => true,
             Visible::No => return,
         };
+        let doc_aliases = ctx.doc_aliases(&func);
         self.add(
             render_fn(
-                RenderContext::new(ctx).private_editable(is_private_editable),
+                RenderContext::new(ctx)
+                    .private_editable(is_private_editable)
+                    .doc_aliases(doc_aliases),
                 path_ctx,
                 local_name,
                 func,
@@ -330,9 +325,12 @@ impl Completions {
             Visible::Editable => true,
             Visible::No => return,
         };
+        let doc_aliases = ctx.doc_aliases(&func);
         self.add(
             render_method(
-                RenderContext::new(ctx).private_editable(is_private_editable),
+                RenderContext::new(ctx)
+                    .private_editable(is_private_editable)
+                    .doc_aliases(doc_aliases),
                 dot_access,
                 receiver,
                 local_name,
@@ -357,10 +355,12 @@ impl Completions {
             Visible::Editable => true,
             Visible::No => return,
         };
+        let doc_aliases = ctx.doc_aliases(&func);
         self.add(
             render_method(
                 RenderContext::new(ctx)
                     .private_editable(is_private_editable)
+                    .doc_aliases(doc_aliases)
                     .import_to_add(Some(import)),
                 dot_access,
                 None,
@@ -472,8 +472,9 @@ impl Completions {
             Visible::Editable => true,
             Visible::No => return,
         };
+        let doc_aliases = ctx.doc_aliases(&field);
         let item = render_field(
-            RenderContext::new(ctx).private_editable(is_private_editable),
+            RenderContext::new(ctx).private_editable(is_private_editable).doc_aliases(doc_aliases),
             dot_access,
             receiver,
             field,

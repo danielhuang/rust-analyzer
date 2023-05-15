@@ -2034,6 +2034,56 @@ fn test() {
 }
 
 #[test]
+fn tuple_pattern_nested_match_ergonomics() {
+    check_no_mismatches(
+        r#"
+fn f(x: (&i32, &i32)) -> i32 {
+    match x {
+        (3, 4) => 5,
+        _ => 12,
+    }
+}
+        "#,
+    );
+    check_types(
+        r#"
+fn f(x: (&&&&i32, &&&i32)) {
+    let f = match x {
+        t @ (3, 4) => t,
+        _ => loop {},
+    };
+    f;
+  //^ (&&&&i32, &&&i32)
+}
+        "#,
+    );
+    check_types(
+        r#"
+fn f() {
+    let x = &&&(&&&2, &&&&&3);
+    let (y, z) = x;
+       //^ &&&&i32
+    let t @ (y, z) = x;
+    t;
+  //^ &&&(&&&i32, &&&&&i32)
+}
+        "#,
+    );
+    check_types(
+        r#"
+fn f() {
+    let x = &&&(&&&2, &&&&&3);
+    let (y, z) = x;
+       //^ &&&&i32
+    let t @ (y, z) = x;
+    t;
+  //^ &&&(&&&i32, &&&&&i32)
+}
+        "#,
+    );
+}
+
+#[test]
 fn fn_pointer_return() {
     check_infer(
         r#"
@@ -3479,14 +3529,30 @@ fn main() {
 
 #[test]
 fn issue_14275() {
-    // FIXME: evaluate const generic
     check_types(
         r#"
 struct Foo<const T: bool>;
 fn main() {
     const B: bool = false;
     let foo = Foo::<B>;
-      //^^^ Foo<_>
+      //^^^ Foo<false>
+}
+"#,
+    );
+    check_types(
+        r#"
+struct Foo<const T: bool>;
+impl Foo<true> {
+    fn foo(self) -> u8 { 2 }
+}
+impl Foo<false> {
+    fn foo(self) -> u16 { 5 }
+}
+fn main() {
+    const B: bool = false;
+    let foo: Foo<B> = Foo;
+    let x = foo.foo();
+      //^ u16
 }
 "#,
     );

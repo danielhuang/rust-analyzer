@@ -281,6 +281,8 @@ config_data! {
 
         /// Enables highlighting of related references while the cursor is on `break`, `loop`, `while`, or `for` keywords.
         highlightRelated_breakPoints_enable: bool = "true",
+        /// Enables highlighting of all captures of a closure while the cursor is on the `|` or move keyword of a closure.
+        highlightRelated_closureCaptures_enable: bool = "true",
         /// Enables highlighting of all exit points while the cursor is on any `return`, `?`, `fn`, or return type arrow (`->`).
         highlightRelated_exitPoints_enable: bool = "true",
         /// Enables highlighting of related references while the cursor is on any identifier.
@@ -311,8 +313,10 @@ config_data! {
         /// Whether to show keyword hover popups. Only applies when
         /// `#rust-analyzer.hover.documentation.enable#` is set.
         hover_documentation_keywords_enable: bool  = "true",
-        /// Use markdown syntax for links in hover.
+        /// Use markdown syntax for links on hover.
         hover_links_enable: bool = "true",
+        /// Whether to show memory layout data on hover.
+        hover_memoryLayout_enable: bool = "true",
 
         /// Whether to enforce the import granularity setting for all files. If set to false rust-analyzer will try to keep import styles consistent per file.
         imports_granularity_enforce: bool              = "false",
@@ -336,6 +340,8 @@ config_data! {
         /// Minimum number of lines required before the `}` until the hint is shown (set to 0 or 1
         /// to always show them).
         inlayHints_closingBraceHints_minLines: usize               = "25",
+        /// Whether to show inlay hints for closure captures.
+        inlayHints_closureCaptureHints_enable: bool                          = "false",
         /// Whether to show inlay type hints for return types of closures.
         inlayHints_closureReturnTypeHints_enable: ClosureReturnTypeHintsDef  = "\"never\"",
         /// Closure notation in type and chaining inlay hints.
@@ -437,8 +443,7 @@ config_data! {
         ///
         /// This config takes a map of crate names with the exported proc-macro names to ignore as values.
         procMacro_ignored: FxHashMap<Box<str>, Box<[Box<str>]>>          = "{}",
-        /// Internal config, path to proc-macro server executable (typically,
-        /// this is rust-analyzer itself, but we override this in tests).
+        /// Internal config, path to proc-macro server executable.
         procMacro_server: Option<PathBuf>          = "null",
 
         /// Exclude imports from find-all-references.
@@ -478,6 +483,8 @@ config_data! {
         /// When enabled, rust-analyzer will highlight rust source in doc comments as well as intra
         /// doc links.
         semanticHighlighting_doc_comment_inject_enable: bool = "true",
+        /// Whether the server is allowed to emit non-standard tokens and modifiers.
+        semanticHighlighting_nonStandardTokens: bool = "true",
         /// Use semantic tokens for operators.
         ///
         /// When disabled, rust-analyzer will emit semantic tokens only for operator tokens when
@@ -575,6 +582,7 @@ pub struct LensConfig {
     // runnables
     pub run: bool,
     pub debug: bool,
+    pub interpret: bool,
 
     // implementations
     pub implementations: bool,
@@ -1022,6 +1030,11 @@ impl Config {
         .is_some()
     }
 
+    pub fn semantics_tokens_augments_syntax_tokens(&self) -> bool {
+        try_!(self.caps.text_document.as_ref()?.semantic_tokens.as_ref()?.augments_syntax_tokens?)
+            .unwrap_or(false)
+    }
+
     pub fn position_encoding(&self) -> PositionEncoding {
         negotiated_encoding(&self.caps)
     }
@@ -1032,6 +1045,10 @@ impl Config {
 
     pub fn code_action_group(&self) -> bool {
         self.experimental("codeActionGroup")
+    }
+
+    pub fn local_docs(&self) -> bool {
+        self.experimental("localDocs")
     }
 
     pub fn open_server_logs(&self) -> bool {
@@ -1102,17 +1119,9 @@ impl Config {
         self.data.lru_query_capacities.is_empty().not().then(|| &self.data.lru_query_capacities)
     }
 
-    pub fn proc_macro_srv(&self) -> Option<(AbsPathBuf, /* is path explicitly set */ bool)> {
-        if !self.data.procMacro_enable {
-            return None;
-        }
-        Some(match &self.data.procMacro_server {
-            Some(it) => (
-                AbsPathBuf::try_from(it.clone()).unwrap_or_else(|path| self.root_path.join(path)),
-                true,
-            ),
-            None => (AbsPathBuf::assert(std::env::current_exe().ok()?), false),
-        })
+    pub fn proc_macro_srv(&self) -> Option<AbsPathBuf> {
+        let path = self.data.procMacro_server.clone()?;
+        Some(AbsPathBuf::try_from(path).unwrap_or_else(|path| self.root_path.join(&path)))
     }
 
     pub fn dummy_replacements(&self) -> &FxHashMap<Box<str>, Box<[Box<str>]>> {
@@ -1314,6 +1323,7 @@ impl Config {
                 ClosureStyle::WithId => hir::ClosureStyle::ClosureWithId,
                 ClosureStyle::Hide => hir::ClosureStyle::Hide,
             },
+            closure_capture_hints: self.data.inlayHints_closureCaptureHints_enable,
             adjustment_hints: match self.data.inlayHints_expressionAdjustmentHints_enable {
                 AdjustmentHintsDef::Always => ide::AdjustmentHints::Always,
                 AdjustmentHintsDef::Never => match self.data.inlayHints_reborrowHints_enable {
@@ -1432,6 +1442,9 @@ impl Config {
         LensConfig {
             run: self.data.lens_enable && self.data.lens_run_enable,
             debug: self.data.lens_enable && self.data.lens_debug_enable,
+            interpret: self.data.lens_enable
+                && self.data.lens_run_enable
+                && self.data.interpret_tests,
             implementations: self.data.lens_enable && self.data.lens_implementations_enable,
             method_refs: self.data.lens_enable && self.data.lens_references_method_enable,
             refs_adt: self.data.lens_enable && self.data.lens_references_adt_enable,
@@ -1453,6 +1466,10 @@ impl Config {
         }
     }
 
+    pub fn highlighting_non_standard_tokens(&self) -> bool {
+        self.data.semanticHighlighting_nonStandardTokens
+    }
+
     pub fn highlighting_config(&self) -> HighlightConfig {
         HighlightConfig {
             strings: self.data.semanticHighlighting_strings_enable,
@@ -1471,6 +1488,7 @@ impl Config {
     pub fn hover(&self) -> HoverConfig {
         HoverConfig {
             links_in_hover: self.data.hover_links_enable,
+            memory_layout: self.data.hover_memoryLayout_enable,
             documentation: self.data.hover_documentation_enable,
             format: {
                 let is_markdown = try_or_def!(self
@@ -1490,7 +1508,6 @@ impl Config {
                 }
             },
             keywords: self.data.hover_documentation_keywords_enable,
-            interpret_tests: self.data.interpret_tests,
         }
     }
 
@@ -1560,6 +1577,7 @@ impl Config {
             break_points: self.data.highlightRelated_breakPoints_enable,
             exit_points: self.data.highlightRelated_exitPoints_enable,
             yield_points: self.data.highlightRelated_yieldPoints_enable,
+            closure_captures: self.data.highlightRelated_closureCaptures_enable,
         }
     }
 
@@ -2428,5 +2446,44 @@ mod tests {
 
     fn remove_ws(text: &str) -> String {
         text.replace(char::is_whitespace, "")
+    }
+
+    #[test]
+    fn proc_macro_srv_null() {
+        let mut config =
+            Config::new(AbsPathBuf::try_from(project_root()).unwrap(), Default::default(), vec![]);
+        config
+            .update(serde_json::json!({
+                "procMacro_server": null,
+            }))
+            .unwrap();
+        assert_eq!(config.proc_macro_srv(), None);
+    }
+
+    #[test]
+    fn proc_macro_srv_abs() {
+        let mut config =
+            Config::new(AbsPathBuf::try_from(project_root()).unwrap(), Default::default(), vec![]);
+        config
+            .update(serde_json::json!({
+                "procMacro": {"server": project_root().display().to_string()}
+            }))
+            .unwrap();
+        assert_eq!(config.proc_macro_srv(), Some(AbsPathBuf::try_from(project_root()).unwrap()));
+    }
+
+    #[test]
+    fn proc_macro_srv_rel() {
+        let mut config =
+            Config::new(AbsPathBuf::try_from(project_root()).unwrap(), Default::default(), vec![]);
+        config
+            .update(serde_json::json!({
+                "procMacro": {"server": "./server"}
+            }))
+            .unwrap();
+        assert_eq!(
+            config.proc_macro_srv(),
+            Some(AbsPathBuf::try_from(project_root().join("./server")).unwrap())
+        );
     }
 }

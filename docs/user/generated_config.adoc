@@ -352,6 +352,11 @@ Controls file watching implementation.
 --
 Enables highlighting of related references while the cursor is on `break`, `loop`, `while`, or `for` keywords.
 --
+[[rust-analyzer.highlightRelated.closureCaptures.enable]]rust-analyzer.highlightRelated.closureCaptures.enable (default: `true`)::
++
+--
+Enables highlighting of all captures of a closure while the cursor is on the `|` or move keyword of a closure.
+--
 [[rust-analyzer.highlightRelated.exitPoints.enable]]rust-analyzer.highlightRelated.exitPoints.enable (default: `true`)::
 +
 --
@@ -416,7 +421,12 @@ Whether to show keyword hover popups. Only applies when
 [[rust-analyzer.hover.links.enable]]rust-analyzer.hover.links.enable (default: `true`)::
 +
 --
-Use markdown syntax for links in hover.
+Use markdown syntax for links on hover.
+--
+[[rust-analyzer.hover.memoryLayout.enable]]rust-analyzer.hover.memoryLayout.enable (default: `true`)::
++
+--
+Whether to show memory layout data on hover.
 --
 [[rust-analyzer.imports.granularity.enforce]]rust-analyzer.imports.granularity.enforce (default: `false`)::
 +
@@ -468,6 +478,11 @@ Whether to show inlay hints after a closing `}` to indicate what item it belongs
 --
 Minimum number of lines required before the `}` until the hint is shown (set to 0 or 1
 to always show them).
+--
+[[rust-analyzer.inlayHints.closureCaptureHints.enable]]rust-analyzer.inlayHints.closureCaptureHints.enable (default: `false`)::
++
+--
+Whether to show inlay hints for closure captures.
 --
 [[rust-analyzer.inlayHints.closureReturnTypeHints.enable]]rust-analyzer.inlayHints.closureReturnTypeHints.enable (default: `"never"`)::
 +
@@ -679,8 +694,7 @@ This config takes a map of crate names with the exported proc-macro names to ign
 [[rust-analyzer.procMacro.server]]rust-analyzer.procMacro.server (default: `null`)::
 +
 --
-Internal config, path to proc-macro server executable (typically,
-this is rust-analyzer itself, but we override this in tests).
+Internal config, path to proc-macro server executable.
 --
 [[rust-analyzer.references.excludeImports]]rust-analyzer.references.excludeImports (default: `false`)::
 +
@@ -738,6 +752,11 @@ Inject additional highlighting into doc comments.
 
 When enabled, rust-analyzer will highlight rust source in doc comments as well as intra
 doc links.
+--
+[[rust-analyzer.semanticHighlighting.nonStandardTokens]]rust-analyzer.semanticHighlighting.nonStandardTokens (default: `true`)::
++
+--
+Whether the server is allowed to emit non-standard tokens and modifiers.
 --
 [[rust-analyzer.semanticHighlighting.operator.enable]]rust-analyzer.semanticHighlighting.operator.enable (default: `true`)::
 +

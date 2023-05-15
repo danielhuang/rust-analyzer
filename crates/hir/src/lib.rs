@@ -6,7 +6,7 @@
 //! applied. So, the relation between syntax and HIR is many-to-one.
 //!
 //! HIR is the public API of the all of the compiler logic above syntax trees.
-//! It is written in "OO" style. Each type is self contained (as in, it knows it's
+//! It is written in "OO" style. Each type is self contained (as in, it knows its
 //! parents and full context). It should be "clean code".
 //!
 //! `hir_*` crates are the implementation of the compiler logic.
@@ -33,7 +33,7 @@ pub mod symbols;
 
 mod display;
 
-use std::{iter, ops::ControlFlow, sync::Arc};
+use std::{iter, ops::ControlFlow};
 
 use arrayvec::ArrayVec;
 use base_db::{CrateDisplayName, CrateId, CrateOrigin, Edition, FileId, ProcMacroKind};
@@ -44,14 +44,14 @@ use hir_def::{
     generics::{LifetimeParamData, TypeOrConstParamData, TypeParamProvenance},
     hir::{BindingAnnotation, BindingId, ExprOrPatId, LabelId, Pat},
     item_tree::ItemTreeNode,
-    lang_item::{LangItem, LangItemTarget},
+    lang_item::LangItemTarget,
     layout::ReprOptions,
     macro_id_to_def_id,
     nameres::{self, diagnostics::DefDiagnostic, ModuleOrigin},
     per_ns::PerNs,
     resolver::{HasResolver, Resolver},
     src::HasSource as _,
-    AdtId, AssocItemId, AssocItemLoc, AttrDefId, ConstId, ConstParamId, DefWithBodyId, EnumId,
+    AssocItemId, AssocItemLoc, AttrDefId, ConstId, ConstParamId, DefWithBodyId, EnumId,
     EnumVariantId, FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, LifetimeParamId,
     LocalEnumVariantId, LocalFieldId, Lookup, MacroExpander, MacroId, ModuleId, StaticId, StructId,
     TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
@@ -80,6 +80,7 @@ use syntax::{
     ast::{self, HasAttrs as _, HasDocComments, HasName},
     AstNode, AstPtr, SmolStr, SyntaxNode, SyntaxNodePtr, TextRange, T,
 };
+use triomphe::Arc;
 
 use crate::db::{DefDatabase, HirDatabase};
 
@@ -114,15 +115,14 @@ pub use {
         data::adt::StructKind,
         find_path::PrefixKind,
         import_map,
+        lang_item::LangItem,
         nameres::ModuleSource,
         path::{ModPath, PathKind},
         type_ref::{Mutability, TypeRef},
         visibility::Visibility,
-        // FIXME: This is here since it is input of a method in `HirWrite`
-        // and things outside of hir need to implement that trait. We probably
-        // should move whole `hir_ty::display` to this crate so we will become
-        // able to use `ModuleDef` or `Definition` instead of `ModuleDefId`.
-        ModuleDefId,
+        // FIXME: This is here since some queries take it as input that are used
+        // outside of hir.
+        {AdtId, ModuleDefId},
     },
     hir_expand::{
         attrs::Attr,
@@ -1535,9 +1535,6 @@ impl DefWithBody {
         for (pat_or_expr, mismatch) in infer.type_mismatches() {
             let expr_or_pat = match pat_or_expr {
                 ExprOrPatId::ExprId(expr) => source_map.expr_syntax(expr).map(Either::Left),
-                // FIXME: Re-enable these once we have less false positives
-                ExprOrPatId::PatId(_pat) => continue,
-                #[allow(unreachable_patterns)]
                 ExprOrPatId::PatId(pat) => source_map.pat_syntax(pat).map(Either::Right),
             };
             let expr_or_pat = match expr_or_pat {
@@ -1856,11 +1853,21 @@ impl Function {
         def_map.fn_as_proc_macro(self.id).map(|id| Macro { id: id.into() })
     }
 
-    pub fn eval(self, db: &dyn HirDatabase) -> Result<(), MirEvalError> {
+    pub fn eval(
+        self,
+        db: &dyn HirDatabase,
+        span_formatter: impl Fn(FileId, TextRange) -> String,
+    ) -> Result<(), String> {
+        let converter = |e: MirEvalError| {
+            let mut r = String::new();
+            _ = e.pretty_print(&mut r, db, &span_formatter);
+            r
+        };
         let body = db
             .mir_body(self.id.into())
-            .map_err(|e| MirEvalError::MirLowerError(self.id.into(), e))?;
-        interpret_mir(db, &body, Substitution::empty(Interner), false)?;
+            .map_err(|e| MirEvalError::MirLowerError(self.id.into(), e))
+            .map_err(converter)?;
+        interpret_mir(db, &body, Substitution::empty(Interner), false).map_err(converter)?;
         Ok(())
     }
 }
@@ -2006,7 +2013,7 @@ impl Const {
     }
 
     pub fn render_eval(self, db: &dyn HirDatabase) -> Result<String, ConstEvalError> {
-        let c = db.const_eval(self.id, Substitution::empty(Interner))?;
+        let c = db.const_eval(self.id.into(), Substitution::empty(Interner))?;
         let r = format!("{}", HexifiedConst(c).display(db));
         // We want to see things like `<utf8-error>` and `<layout-error>` as they are probably bug in our
         // implementation, but there is no need to show things like `<enum-not-supported>` or `<ref-not-supported>` to
@@ -2604,6 +2611,10 @@ impl LocalSource {
         self.source.file_id.original_file(db.upcast())
     }
 
+    pub fn file(&self) -> HirFileId {
+        self.source.file_id
+    }
+
     pub fn name(&self) -> Option<ast::Name> {
         self.source.value.name()
     }
@@ -3174,6 +3185,89 @@ impl TraitRef {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Closure {
+    id: ClosureId,
+    subst: Substitution,
+}
+
+impl From<Closure> for ClosureId {
+    fn from(value: Closure) -> Self {
+        value.id
+    }
+}
+
+impl Closure {
+    fn as_ty(self) -> Ty {
+        TyKind::Closure(self.id, self.subst).intern(Interner)
+    }
+
+    pub fn display_with_id(&self, db: &dyn HirDatabase) -> String {
+        self.clone().as_ty().display(db).with_closure_style(ClosureStyle::ClosureWithId).to_string()
+    }
+
+    pub fn display_with_impl(&self, db: &dyn HirDatabase) -> String {
+        self.clone().as_ty().display(db).with_closure_style(ClosureStyle::ImplFn).to_string()
+    }
+
+    pub fn captured_items(&self, db: &dyn HirDatabase) -> Vec<ClosureCapture> {
+        let owner = db.lookup_intern_closure((self.id).into()).0;
+        let infer = &db.infer(owner);
+        let info = infer.closure_info(&self.id);
+        info.0
+            .iter()
+            .cloned()
+            .map(|capture| ClosureCapture { owner, closure: self.id, capture })
+            .collect()
+    }
+
+    pub fn fn_trait(&self, db: &dyn HirDatabase) -> FnTrait {
+        let owner = db.lookup_intern_closure((self.id).into()).0;
+        let infer = &db.infer(owner);
+        let info = infer.closure_info(&self.id);
+        info.1
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosureCapture {
+    owner: DefWithBodyId,
+    closure: ClosureId,
+    capture: hir_ty::CapturedItem,
+}
+
+impl ClosureCapture {
+    pub fn local(&self) -> Local {
+        Local { parent: self.owner, binding_id: self.capture.local() }
+    }
+
+    pub fn kind(&self) -> CaptureKind {
+        match self.capture.kind() {
+            hir_ty::CaptureKind::ByRef(
+                hir_ty::mir::BorrowKind::Shallow | hir_ty::mir::BorrowKind::Shared,
+            ) => CaptureKind::SharedRef,
+            hir_ty::CaptureKind::ByRef(hir_ty::mir::BorrowKind::Unique) => {
+                CaptureKind::UniqueSharedRef
+            }
+            hir_ty::CaptureKind::ByRef(hir_ty::mir::BorrowKind::Mut { .. }) => {
+                CaptureKind::MutableRef
+            }
+            hir_ty::CaptureKind::ByValue => CaptureKind::Move,
+        }
+    }
+
+    pub fn display_place(&self, db: &dyn HirDatabase) -> String {
+        self.capture.display_place(self.owner, db)
+    }
+}
+
+pub enum CaptureKind {
+    SharedRef,
+    UniqueSharedRef,
+    MutableRef,
+    Move,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Type {
     env: Arc<TraitEnvironment>,
@@ -3461,6 +3555,13 @@ impl Type {
 
     pub fn is_closure(&self) -> bool {
         matches!(self.ty.kind(Interner), TyKind::Closure { .. })
+    }
+
+    pub fn as_closure(&self) -> Option<Closure> {
+        match self.ty.kind(Interner) {
+            TyKind::Closure(id, subst) => Some(Closure { id: *id, subst: subst.clone() }),
+            _ => None,
+        }
     }
 
     pub fn is_fn(&self) -> bool {
@@ -4016,6 +4117,10 @@ impl Type {
             .map(|id| TypeOrConstParam { id }.split(db).either_into())
             .collect()
     }
+
+    pub fn layout(&self, db: &dyn HirDatabase) -> Result<Layout, LayoutError> {
+        layout_of_ty(db, &self.ty, self.env.krate)
+    }
 }
 
 // FIXME: Document this
@@ -4346,4 +4451,91 @@ impl HasCrate for Module {
     fn krate(&self, _: &dyn HirDatabase) -> Crate {
         Module::krate(*self)
     }
+}
+
+pub trait HasContainer {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer;
+}
+
+impl HasContainer for Module {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        // FIXME: handle block expressions as modules (their parent is in a different DefMap)
+        let def_map = self.id.def_map(db.upcast());
+        match def_map[self.id.local_id].parent {
+            Some(parent_id) => ItemContainer::Module(Module { id: def_map.module_id(parent_id) }),
+            None => ItemContainer::Crate(def_map.krate()),
+        }
+    }
+}
+
+impl HasContainer for Function {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        container_id_to_hir(self.id.lookup(db.upcast()).container)
+    }
+}
+
+impl HasContainer for Struct {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        ItemContainer::Module(Module { id: self.id.lookup(db.upcast()).container })
+    }
+}
+
+impl HasContainer for Union {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        ItemContainer::Module(Module { id: self.id.lookup(db.upcast()).container })
+    }
+}
+
+impl HasContainer for Enum {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        ItemContainer::Module(Module { id: self.id.lookup(db.upcast()).container })
+    }
+}
+
+impl HasContainer for TypeAlias {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        container_id_to_hir(self.id.lookup(db.upcast()).container)
+    }
+}
+
+impl HasContainer for Const {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        container_id_to_hir(self.id.lookup(db.upcast()).container)
+    }
+}
+
+impl HasContainer for Static {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        container_id_to_hir(self.id.lookup(db.upcast()).container)
+    }
+}
+
+impl HasContainer for Trait {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        ItemContainer::Module(Module { id: self.id.lookup(db.upcast()).container })
+    }
+}
+
+impl HasContainer for TraitAlias {
+    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+        ItemContainer::Module(Module { id: self.id.lookup(db.upcast()).container })
+    }
+}
+
+fn container_id_to_hir(c: ItemContainerId) -> ItemContainer {
+    match c {
+        ItemContainerId::ExternBlockId(_id) => ItemContainer::ExternBlock(),
+        ItemContainerId::ModuleId(id) => ItemContainer::Module(Module { id }),
+        ItemContainerId::ImplId(id) => ItemContainer::Impl(Impl { id }),
+        ItemContainerId::TraitId(id) => ItemContainer::Trait(Trait { id }),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ItemContainer {
+    Trait(Trait),
+    Impl(Impl),
+    Module(Module),
+    ExternBlock(),
+    Crate(CrateId),
 }

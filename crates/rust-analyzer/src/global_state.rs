@@ -3,18 +3,19 @@
 //!
 //! Each tick provides an immutable snapshot of the state as `WorldSnapshot`.
 
-use std::{sync::Arc, time::Instant};
+use std::time::Instant;
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use flycheck::FlycheckHandle;
 use ide::{Analysis, AnalysisHost, Cancellable, Change, FileId};
 use ide_db::base_db::{CrateId, FileLoader, ProcMacroPaths, SourceDatabase};
 use lsp_types::{SemanticTokens, Url};
+use nohash_hasher::IntMap;
 use parking_lot::{Mutex, RwLock};
 use proc_macro_api::ProcMacroServer;
 use project_model::{CargoWorkspace, ProjectWorkspace, Target, WorkspaceBuildScripts};
 use rustc_hash::FxHashMap;
-use stdx::hash::NoHashHashMap;
+use triomphe::Arc;
 use vfs::AnchoredPathBuf;
 
 use crate::{
@@ -63,13 +64,13 @@ pub(crate) struct GlobalState {
     pub(crate) source_root_config: SourceRootConfig,
 
     pub(crate) proc_macro_changed: bool,
-    pub(crate) proc_macro_clients: Arc<[Result<ProcMacroServer, String>]>,
+    pub(crate) proc_macro_clients: Arc<[anyhow::Result<ProcMacroServer>]>,
 
     pub(crate) flycheck: Arc<[FlycheckHandle]>,
     pub(crate) flycheck_sender: Sender<flycheck::Message>,
     pub(crate) flycheck_receiver: Receiver<flycheck::Message>,
 
-    pub(crate) vfs: Arc<RwLock<(vfs::Vfs, NoHashHashMap<FileId, LineEndings>)>>,
+    pub(crate) vfs: Arc<RwLock<(vfs::Vfs, IntMap<FileId, LineEndings>)>>,
     pub(crate) vfs_config_version: u32,
     pub(crate) vfs_progress_config_version: u32,
     pub(crate) vfs_progress_n_total: usize,
@@ -116,7 +117,7 @@ pub(crate) struct GlobalStateSnapshot {
     pub(crate) check_fixes: CheckFixes,
     mem_docs: MemDocs,
     pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Url, SemanticTokens>>>,
-    vfs: Arc<RwLock<(vfs::Vfs, NoHashHashMap<FileId, LineEndings>)>>,
+    vfs: Arc<RwLock<(vfs::Vfs, IntMap<FileId, LineEndings>)>>,
     pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
     // used to signal semantic highlighting to fall back to syntax based highlighting until proc-macros have been loaded
     pub(crate) proc_macros_loaded: bool,
@@ -161,13 +162,15 @@ impl GlobalState {
             source_root_config: SourceRootConfig::default(),
 
             proc_macro_changed: false,
-            proc_macro_clients: Arc::new([]),
+            // FIXME: use `Arc::from_iter` when it becomes available
+            proc_macro_clients: Arc::from(Vec::new()),
 
-            flycheck: Arc::new([]),
+            // FIXME: use `Arc::from_iter` when it becomes available
+            flycheck: Arc::from(Vec::new()),
             flycheck_sender,
             flycheck_receiver,
 
-            vfs: Arc::new(RwLock::new((vfs::Vfs::default(), NoHashHashMap::default()))),
+            vfs: Arc::new(RwLock::new((vfs::Vfs::default(), IntMap::default()))),
             vfs_config_version: 0,
             vfs_progress_config_version: 0,
             vfs_progress_n_total: 0,
@@ -193,7 +196,7 @@ impl GlobalState {
         let (change, changed_files) = {
             let mut change = Change::new();
             let (vfs, line_endings_map) = &mut *self.vfs.write();
-            let mut changed_files = vfs.take_changes();
+            let changed_files = vfs.take_changes();
             if changed_files.is_empty() {
                 return false;
             }
@@ -201,7 +204,7 @@ impl GlobalState {
             // We need to fix up the changed events a bit. If we have a create or modify for a file
             // id that is followed by a delete we actually skip observing the file text from the
             // earlier event, to avoid problems later on.
-            for changed_file in &changed_files {
+            for changed_file in changed_files {
                 use vfs::ChangeKind::*;
 
                 file_changes
@@ -237,14 +240,13 @@ impl GlobalState {
                     ));
             }
 
-            changed_files.extend(
-                file_changes
-                    .into_iter()
-                    .filter(|(_, (change_kind, just_created))| {
-                        !matches!((change_kind, just_created), (vfs::ChangeKind::Delete, true))
-                    })
-                    .map(|(file_id, (change_kind, _))| vfs::ChangedFile { file_id, change_kind }),
-            );
+            let changed_files: Vec<_> = file_changes
+                .into_iter()
+                .filter(|(_, (change_kind, just_created))| {
+                    !matches!((change_kind, just_created), (vfs::ChangeKind::Delete, true))
+                })
+                .map(|(file_id, (change_kind, _))| vfs::ChangedFile { file_id, change_kind })
+                .collect();
 
             // A file was added or deleted
             let mut has_structure_changes = false;

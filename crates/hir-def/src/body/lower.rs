@@ -1,7 +1,7 @@
 //! Transforms `ast::Expr` into an equivalent `hir_def::expr::Expr`
 //! representation.
 
-use std::{mem, sync::Arc};
+use std::mem;
 
 use base_db::CrateId;
 use either::Either;
@@ -17,11 +17,12 @@ use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use syntax::{
     ast::{
-        self, ArrayExprKind, AstChildren, BlockExpr, HasArgList, HasLoopBody, HasName,
+        self, ArrayExprKind, AstChildren, BlockExpr, HasArgList, HasAttrs, HasLoopBody, HasName,
         SlicePatComponents,
     },
     AstNode, AstPtr, SyntaxNodePtr,
 };
+use triomphe::Arc;
 
 use crate::{
     body::{Body, BodyDiagnostic, BodySourceMap, ExprPtr, LabelPtr, PatPtr},
@@ -36,7 +37,7 @@ use crate::{
     item_scope::BuiltinShadowMode,
     lang_item::LangItem,
     lower::LowerCtx,
-    nameres::DefMap,
+    nameres::{DefMap, MacroSubNs},
     path::{GenericArgs, Path},
     type_ref::{Mutability, Rawness, TypeRef},
     AdtId, BlockId, BlockLoc, ModuleDefId, UnresolvedMacro,
@@ -53,7 +54,7 @@ pub(super) fn lower(
     ExprCollector {
         db,
         krate,
-        def_map: db.crate_def_map(krate),
+        def_map: expander.module.def_map(db),
         source_map: BodySourceMap::default(),
         ast_id_map: db.ast_id_map(expander.current_file_id),
         body: Body {
@@ -302,16 +303,29 @@ impl ExprCollector<'_> {
                 self.alloc_expr(Expr::For { iterable, pat, body, label }, syntax_ptr)
             }
             ast::Expr::CallExpr(e) => {
-                let callee = self.collect_expr_opt(e.expr());
-                let args = if let Some(arg_list) = e.arg_list() {
-                    arg_list.args().filter_map(|e| self.maybe_collect_expr(e)).collect()
-                } else {
-                    Box::default()
+                let is_rustc_box = {
+                    let attrs = e.attrs();
+                    attrs.filter_map(|x| x.as_simple_atom()).any(|x| x == "rustc_box")
                 };
-                self.alloc_expr(
-                    Expr::Call { callee, args, is_assignee_expr: self.is_lowering_assignee_expr },
-                    syntax_ptr,
-                )
+                if is_rustc_box {
+                    let expr = self.collect_expr_opt(e.arg_list().and_then(|x| x.args().next()));
+                    self.alloc_expr(Expr::Box { expr }, syntax_ptr)
+                } else {
+                    let callee = self.collect_expr_opt(e.expr());
+                    let args = if let Some(arg_list) = e.arg_list() {
+                        arg_list.args().filter_map(|e| self.maybe_collect_expr(e)).collect()
+                    } else {
+                        Box::default()
+                    };
+                    self.alloc_expr(
+                        Expr::Call {
+                            callee,
+                            args,
+                            is_assignee_expr: self.is_lowering_assignee_expr,
+                        },
+                        syntax_ptr,
+                    )
+                }
             }
             ast::Expr::MethodCallExpr(e) => {
                 let receiver = self.collect_expr_opt(e.receiver());
@@ -492,6 +506,7 @@ impl ExprCollector<'_> {
                     .map(|it| Interned::new(TypeRef::from_ast(&this.ctx(), it)));
 
                 let prev_is_lowering_generator = mem::take(&mut this.is_lowering_generator);
+                let prev_try_block_label = this.current_try_block_label.take();
 
                 let body = this.collect_expr_opt(e.body());
 
@@ -507,11 +522,11 @@ impl ExprCollector<'_> {
                 } else {
                     ClosureKind::Closure
                 };
-                this.is_lowering_generator = prev_is_lowering_generator;
                 let capture_by =
                     if e.move_token().is_some() { CaptureBy::Value } else { CaptureBy::Ref };
                 this.is_lowering_generator = prev_is_lowering_generator;
                 this.current_binding_owner = prev_binding_owner;
+                this.current_try_block_label = prev_try_block_label;
                 this.body.exprs[result_expr_id] = Expr::Closure {
                     args: args.into(),
                     arg_types: arg_types.into(),
@@ -785,7 +800,13 @@ impl ExprCollector<'_> {
         let module = self.expander.module.local_id;
         let res = self.expander.enter_expand(self.db, mcall, |path| {
             self.def_map
-                .resolve_path(self.db, module, &path, crate::item_scope::BuiltinShadowMode::Other)
+                .resolve_path(
+                    self.db,
+                    module,
+                    &path,
+                    crate::item_scope::BuiltinShadowMode::Other,
+                    Some(MacroSubNs::Bang),
+                )
                 .0
                 .take_macros()
         });
@@ -1041,6 +1062,7 @@ impl ExprCollector<'_> {
                         self.expander.module.local_id,
                         &name.clone().into(),
                         BuiltinShadowMode::Other,
+                        None,
                     );
                     match resolved.take_values() {
                         Some(ModuleDefId::ConstId(_)) => (None, Pat::Path(name.into())),

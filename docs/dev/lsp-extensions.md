@@ -1,5 +1,5 @@
 <!---
-lsp_ext.rs hash: be2f663a78beb7bd
+lsp_ext.rs hash: 2d60bbffe70ae198
 
 If you need to change the above hash to make the test pass, please check if you
 need to adjust this doc as well and ping this issue:
@@ -386,14 +386,26 @@ rust-analyzer supports only one `kind`, `"cargo"`. The `args` for `"cargo"` look
 
 ## Open External Documentation
 
-This request is sent from client to server to get a URL to documentation for the symbol under the cursor, if available.
+This request is sent from the client to the server to obtain web and local URL(s) for documentation related to the symbol under the cursor, if available.
 
-**Method** `experimental/externalDocs`
+**Method:** `experimental/externalDocs`
 
-**Request:**: `TextDocumentPositionParams`
+**Request:** `TextDocumentPositionParams`
 
-**Response** `string | null`
+**Response:** `string | null`
 
+## Local Documentation
+
+**Experimental Client Capability:** `{ "localDocs": boolean }`
+
+If this capability is set, the `Open External Documentation` request returned from the server will have the following structure:
+
+```typescript
+interface ExternalDocsResponse {
+    web?: string;
+    local?: string;
+}
+```
 
 ## Analyzer Status
 
@@ -547,6 +559,18 @@ For debugging or when working on rust-analyzer itself.
 
 Returns a textual representation of the MIR of the function containing the cursor.
 For debugging or when working on rust-analyzer itself.
+
+## Interpret Function
+
+**Method:** `rust-analyzer/interpretFunction`
+
+**Request:** `TextDocumentPositionParams`
+
+**Response:** `string`
+
+Tries to evaluate the function using internal rust analyzer knowledge, without compiling
+the code. Currently evaluates the function under cursor, but will give a runnable in
+future. Highly experimental.
 
 ## View File Text
 
@@ -839,3 +863,26 @@ export interface Diagnostic {
         rendered?: string;
     };
 }
+```
+
+## Dependency Tree
+
+**Method:** `rust-analyzer/fetchDependencyList`
+
+**Request:**
+
+```typescript
+export interface FetchDependencyListParams {}
+```
+
+**Response:**
+```typescript
+export interface FetchDependencyListResult {
+    crates: {
+        name: string;
+        version: string;
+        path: string;
+    }[];
+}
+```
+Returns all crates from this workspace, so it can be used create a viewTree to help navigate the dependency tree.

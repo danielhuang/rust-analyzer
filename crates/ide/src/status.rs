@@ -1,4 +1,4 @@
-use std::{fmt, marker::PhantomData, sync::Arc};
+use std::{fmt, marker::PhantomData};
 
 use hir::{
     db::{AstIdMapQuery, AttrsQuery, ParseMacroExpansionQuery},
@@ -23,6 +23,7 @@ use profile::{memory_usage, Bytes};
 use std::env;
 use stdx::format_to;
 use syntax::{ast, Parse, SyntaxNode};
+use triomphe::Arc;
 
 // Feature: Status
 //
@@ -227,9 +228,10 @@ impl fmt::Display for SymbolsStats<SourceRootId> {
 }
 impl<Key> StatCollect<Key, Arc<SymbolIndex>> for SymbolsStats<Key> {
     fn collect_entry(&mut self, _: Key, value: Option<Arc<SymbolIndex>>) {
-        let symbols = value.unwrap();
-        self.total += symbols.len();
-        self.size += symbols.memory_size();
+        if let Some(symbols) = value {
+            self.total += symbols.len();
+            self.size += symbols.memory_size();
+        }
     }
 }
 
@@ -254,8 +256,7 @@ impl fmt::Display for AttrsStats {
 
 impl<Key> StatCollect<Key, Attrs> for AttrsStats {
     fn collect_entry(&mut self, _: Key, value: Option<Attrs>) {
-        let attrs = value.unwrap();
         self.entries += 1;
-        self.total += attrs.len();
+        self.total += value.map_or(0, |it| it.len());
     }
 }

@@ -2,7 +2,7 @@
 //! For details about how this works in rustc, see the method lookup page in the
 //! [rustc guide](https://rust-lang.github.io/rustc-guide/method-lookup.html)
 //! and the corresponding code mostly in rustc_hir_analysis/check/method/probe.rs.
-use std::{ops::ControlFlow, sync::Arc};
+use std::ops::ControlFlow;
 
 use base_db::{CrateId, Edition};
 use chalk_ir::{cast::Cast, Mutability, TyKind, UniverseIndex, WhereClause};
@@ -17,6 +17,7 @@ use hir_expand::name::Name;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{smallvec, SmallVec};
 use stdx::never;
+use triomphe::Arc;
 
 use crate::{
     autoderef::{self, AutoderefKind},
@@ -160,17 +161,19 @@ impl TraitImpls {
         Arc::new(impls)
     }
 
-    pub(crate) fn trait_impls_in_deps_query(db: &dyn HirDatabase, krate: CrateId) -> Arc<Self> {
+    pub(crate) fn trait_impls_in_deps_query(
+        db: &dyn HirDatabase,
+        krate: CrateId,
+    ) -> Arc<[Arc<Self>]> {
         let _p = profile::span("trait_impls_in_deps_query").detail(|| format!("{krate:?}"));
         let crate_graph = db.crate_graph();
-        let mut res = Self { map: FxHashMap::default() };
-
-        for krate in crate_graph.transitive_deps(krate) {
-            res.merge(&db.trait_impls_in_crate(krate));
-        }
-        res.shrink_to_fit();
-
-        Arc::new(res)
+        // FIXME: use `Arc::from_iter` when it becomes available
+        Arc::from(
+            crate_graph
+                .transitive_deps(krate)
+                .map(|krate| db.trait_impls_in_crate(krate))
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn shrink_to_fit(&mut self) {
@@ -184,6 +187,15 @@ impl TraitImpls {
     fn collect_def_map(&mut self, db: &dyn HirDatabase, def_map: &DefMap) {
         for (_module_id, module_data) in def_map.modules() {
             for impl_id in module_data.scope.impls() {
+                // Reservation impls should be ignored during trait resolution, so we never need
+                // them during type analysis. See rust-lang/rust#64631 for details.
+                //
+                // FIXME: Reservation impls should be considered during coherence checks. If we are
+                // (ever) to implement coherence checks, this filtering should be done by the trait
+                // solver.
+                if db.attrs(impl_id.into()).by_key("rustc_reservation_impl").exists() {
+                    continue;
+                }
                 let target_trait = match db.impl_trait(impl_id) {
                     Some(tr) => tr.skip_binders().hir_trait_id(),
                     None => continue,
@@ -205,15 +217,6 @@ impl TraitImpls {
                 for (_, block_def_map) in body.blocks(db.upcast()) {
                     self.collect_def_map(db, &block_def_map);
                 }
-            }
-        }
-    }
-
-    fn merge(&mut self, other: &Self) {
-        for (trait_, other_map) in &other.map {
-            let map = self.map.entry(*trait_).or_default();
-            for (fp, impls) in other_map {
-                map.entry(*fp).or_default().extend(impls);
             }
         }
     }
@@ -713,10 +716,12 @@ fn lookup_impl_assoc_item_for_trait_ref(
     env: Arc<TraitEnvironment>,
     name: &Name,
 ) -> Option<(AssocItemId, Substitution)> {
+    let hir_trait_id = trait_ref.hir_trait_id();
     let self_ty = trait_ref.self_type_parameter(Interner);
     let self_ty_fp = TyFingerprint::for_trait_impl(&self_ty)?;
     let impls = db.trait_impls_in_deps(env.krate);
-    let impls = impls.for_trait_and_self_ty(trait_ref.hir_trait_id(), self_ty_fp);
+    let impls =
+        impls.iter().flat_map(|impls| impls.for_trait_and_self_ty(hir_trait_id, self_ty_fp));
 
     let table = InferenceTable::new(db, env);
 
@@ -742,9 +747,8 @@ fn find_matching_impl(
     actual_trait_ref: TraitRef,
 ) -> Option<(Arc<ImplData>, Substitution)> {
     let db = table.db;
-    loop {
-        let impl_ = impls.next()?;
-        let r = table.run_in_snapshot(|table| {
+    impls.find_map(|impl_| {
+        table.run_in_snapshot(|table| {
             let impl_data = db.impl_data(impl_);
             let impl_substs =
                 TyBuilder::subst_for_def(db, impl_, None).fill_with_inference_vars(table).build();
@@ -762,11 +766,8 @@ fn find_matching_impl(
                 .map(|b| b.cast(Interner));
             let goal = crate::Goal::all(Interner, wcs);
             table.try_obligation(goal).map(|_| (impl_data, table.resolve_completely(impl_substs)))
-        });
-        if r.is_some() {
-            break r;
-        }
-    }
+        })
+    })
 }
 
 fn is_inherent_impl_coherent(

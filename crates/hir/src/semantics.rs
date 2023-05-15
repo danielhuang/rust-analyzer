@@ -10,6 +10,7 @@ use hir_def::{
     hir::Expr,
     lower::LowerCtx,
     macro_id_to_def_id,
+    nameres::MacroSubNs,
     resolver::{self, HasResolver, Resolver, TypeNs},
     type_ref::Mutability,
     AsMacroCall, DefWithBodyId, FieldId, FunctionId, MacroId, TraitId, VariantId,
@@ -350,6 +351,13 @@ impl<'db, DB: HirDatabase> Semantics<'db, DB> {
         self.imp.type_of_pat(pat)
     }
 
+    /// It also includes the changes that binding mode makes in the type. For example in
+    /// `let ref x @ Some(_) = None` the result of `type_of_pat` is `Option<T>` but the result
+    /// of this function is `&mut Option<T>`
+    pub fn type_of_binding_in_pat(&self, pat: &ast::IdentPat) -> Option<Type> {
+        self.imp.type_of_binding_in_pat(pat)
+    }
+
     pub fn type_of_self(&self, param: &ast::SelfParam) -> Option<Type> {
         self.imp.type_of_self(param)
     }
@@ -609,7 +617,7 @@ impl<'db> SemanticsImpl<'db> {
         let krate = resolver.krate();
         let macro_call_id = macro_call.as_call_id(self.db.upcast(), krate, |path| {
             resolver
-                .resolve_path_as_macro(self.db.upcast(), &path)
+                .resolve_path_as_macro(self.db.upcast(), &path, Some(MacroSubNs::Bang))
                 .map(|it| macro_id_to_def_id(self.db.upcast(), it))
         })?;
         hir_expand::db::expand_speculative(
@@ -1136,6 +1144,10 @@ impl<'db> SemanticsImpl<'db> {
         self.analyze(pat.syntax())?
             .type_of_pat(self.db, pat)
             .map(|(ty, coerced)| TypeInfo { original: ty, adjusted: coerced })
+    }
+
+    fn type_of_binding_in_pat(&self, pat: &ast::IdentPat) -> Option<Type> {
+        self.analyze(pat.syntax())?.type_of_binding_in_pat(self.db, pat)
     }
 
     fn type_of_self(&self, param: &ast::SelfParam) -> Option<Type> {

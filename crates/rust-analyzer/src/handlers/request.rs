@@ -1,37 +1,37 @@
 //! This module is responsible for implementing handlers for Language Server
-//! Protocol. The majority of requests are fulfilled by calling into the
-//! `ide` crate.
+//! Protocol. This module specifically handles requests.
 
 use std::{
     env,
+    fs,
     io::Write as _,
     process::{self, Stdio},
-    sync::Arc,
 };
 
 use anyhow::Context;
 use ide::{
-    AnnotationConfig, AssistKind, AssistResolveStrategy, Cancellable, FileId, FilePosition,
-    FileRange, HoverAction, HoverGotoTypeData, Query, RangeInfo, ReferenceCategory, Runnable,
-    RunnableKind, SingleResolve, SourceChange, TextEdit,
+    AnnotationConfig, AssistKind, AssistResolveStrategy, Cancellable, FilePosition, FileRange,
+    HoverAction, HoverGotoTypeData, Query, RangeInfo, ReferenceCategory, Runnable, RunnableKind,
+    SingleResolve, SourceChange, TextEdit,
 };
 use ide_db::SymbolKind;
 use lsp_server::ErrorCode;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    CodeLens, CompletionItem, Diagnostic, DiagnosticTag, DocumentFormattingParams, FoldingRange,
-    FoldingRangeParams, HoverContents, InlayHint, InlayHintParams, Location, LocationLink,
-    NumberOrString, Position, PrepareRenameResponse, Range, RenameParams,
-    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
-    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation,
-    SymbolTag, TextDocumentIdentifier, Url, WorkspaceEdit,
+    CodeLens, CompletionItem, DocumentFormattingParams, FoldingRange, FoldingRangeParams,
+    HoverContents, InlayHint, InlayHintParams, Location, LocationLink, Position,
+    PrepareRenameResponse, Range, RenameParams, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
+    SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation, SymbolTag,
+    TextDocumentIdentifier, Url, WorkspaceEdit,
 };
 use project_model::{ManifestPath, ProjectWorkspace, TargetKind};
 use serde_json::json;
 use stdx::{format_to, never};
 use syntax::{algo, ast, AstNode, TextRange, TextSize};
-use vfs::{AbsPath, AbsPathBuf};
+use triomphe::Arc;
+use vfs::{AbsPath, AbsPathBuf, VfsPath};
 
 use crate::{
     cargo_target_spec::CargoTargetSpec,
@@ -40,13 +40,17 @@ use crate::{
     from_proto,
     global_state::{GlobalState, GlobalStateSnapshot},
     line_index::LineEndings,
-    lsp_ext::{self, PositionOrRange, ViewCrateGraphParams, WorkspaceSymbolParams},
+    lsp_ext::{
+        self, CrateInfoResult, ExternalDocsPair, ExternalDocsResponse, FetchDependencyListParams,
+        FetchDependencyListResult, PositionOrRange, ViewCrateGraphParams, WorkspaceSymbolParams,
+    },
     lsp_utils::{all_edits_are_disjoint, invalid_params_error},
     to_proto, LspError, Result,
 };
 
 pub(crate) fn handle_workspace_reload(state: &mut GlobalState, _: ()) -> Result<()> {
-    state.proc_macro_clients = Arc::new([]);
+    // FIXME: use `Arc::from_iter` when it becomes available
+    state.proc_macro_clients = Arc::from(Vec::new());
     state.proc_macro_changed = false;
 
     state.fetch_workspaces_queue.request_op("reload workspace request".to_string(), ());
@@ -54,16 +58,11 @@ pub(crate) fn handle_workspace_reload(state: &mut GlobalState, _: ()) -> Result<
 }
 
 pub(crate) fn handle_proc_macros_rebuild(state: &mut GlobalState, _: ()) -> Result<()> {
-    state.proc_macro_clients = Arc::new([]);
+    // FIXME: use `Arc::from_iter` when it becomes available
+    state.proc_macro_clients = Arc::from(Vec::new());
     state.proc_macro_changed = false;
 
     state.fetch_build_data_queue.request_op("rebuild proc macros request".to_string(), ());
-    Ok(())
-}
-
-pub(crate) fn handle_cancel_flycheck(state: &mut GlobalState, _: ()) -> Result<()> {
-    let _p = profile::span("handle_stop_flycheck");
-    state.flycheck.iter().for_each(|flycheck| flycheck.cancel());
     Ok(())
 }
 
@@ -161,6 +160,16 @@ pub(crate) fn handle_view_mir(
     let _p = profile::span("handle_view_mir");
     let position = from_proto::file_position(&snap, params)?;
     let res = snap.analysis.view_mir(position)?;
+    Ok(res)
+}
+
+pub(crate) fn handle_interpret_function(
+    snap: GlobalStateSnapshot,
+    params: lsp_types::TextDocumentPositionParams,
+) -> Result<String> {
+    let _p = profile::span("handle_interpret_function");
+    let position = from_proto::file_position(&snap, params)?;
+    let res = snap.analysis.interpret_function(position)?;
     Ok(res)
 }
 
@@ -1327,38 +1336,6 @@ pub(crate) fn handle_ssr(
     to_proto::workspace_edit(&snap, source_change).map_err(Into::into)
 }
 
-pub(crate) fn publish_diagnostics(
-    snap: &GlobalStateSnapshot,
-    file_id: FileId,
-) -> Result<Vec<Diagnostic>> {
-    let _p = profile::span("publish_diagnostics");
-    let line_index = snap.file_line_index(file_id)?;
-
-    let diagnostics: Vec<Diagnostic> = snap
-        .analysis
-        .diagnostics(&snap.config.diagnostics(), AssistResolveStrategy::None, file_id)?
-        .into_iter()
-        .map(|d| Diagnostic {
-            range: to_proto::range(&line_index, d.range),
-            severity: Some(to_proto::diagnostic_severity(d.severity)),
-            code: Some(NumberOrString::String(d.code.as_str().to_string())),
-            code_description: Some(lsp_types::CodeDescription {
-                href: lsp_types::Url::parse(&format!(
-                    "https://rust-analyzer.github.io/manual.html#{}",
-                    d.code.as_str()
-                ))
-                .unwrap(),
-            }),
-            source: Some("rust-analyzer".to_string()),
-            message: d.message,
-            related_information: None,
-            tags: if d.unused { Some(vec![DiagnosticTag::UNNECESSARY]) } else { None },
-            data: None,
-        })
-        .collect();
-    Ok(diagnostics)
-}
-
 pub(crate) fn handle_inlay_hints(
     snap: GlobalStateSnapshot,
     params: InlayHintParams,
@@ -1376,9 +1353,7 @@ pub(crate) fn handle_inlay_hints(
         snap.analysis
             .inlay_hints(&inlay_hints_config, file_id, Some(range))?
             .into_iter()
-            .map(|it| {
-                to_proto::inlay_hint(&snap, &line_index, inlay_hints_config.render_colons, it)
-            })
+            .map(|it| to_proto::inlay_hint(&snap, &line_index, it))
             .collect::<Cancellable<Vec<_>>>()?,
     ))
 }
@@ -1499,7 +1474,13 @@ pub(crate) fn handle_semantic_tokens_full(
         snap.workspaces.is_empty() || !snap.proc_macros_loaded;
 
     let highlights = snap.analysis.highlight(highlight_config, file_id)?;
-    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
+    let semantic_tokens = to_proto::semantic_tokens(
+        &text,
+        &line_index,
+        highlights,
+        snap.config.semantics_tokens_augments_syntax_tokens(),
+        snap.config.highlighting_non_standard_tokens(),
+    );
 
     // Unconditionally cache the tokens
     snap.semantic_tokens_cache.lock().insert(params.text_document.uri, semantic_tokens.clone());
@@ -1523,7 +1504,13 @@ pub(crate) fn handle_semantic_tokens_full_delta(
         snap.workspaces.is_empty() || !snap.proc_macros_loaded;
 
     let highlights = snap.analysis.highlight(highlight_config, file_id)?;
-    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
+    let semantic_tokens = to_proto::semantic_tokens(
+        &text,
+        &line_index,
+        highlights,
+        snap.config.semantics_tokens_augments_syntax_tokens(),
+        snap.config.highlighting_non_standard_tokens(),
+    );
 
     let mut cache = snap.semantic_tokens_cache.lock();
     let cached_tokens = cache.entry(params.text_document.uri).or_default();
@@ -1557,20 +1544,53 @@ pub(crate) fn handle_semantic_tokens_range(
         snap.workspaces.is_empty() || !snap.proc_macros_loaded;
 
     let highlights = snap.analysis.highlight_range(highlight_config, frange)?;
-    let semantic_tokens = to_proto::semantic_tokens(&text, &line_index, highlights);
+    let semantic_tokens = to_proto::semantic_tokens(
+        &text,
+        &line_index,
+        highlights,
+        snap.config.semantics_tokens_augments_syntax_tokens(),
+        snap.config.highlighting_non_standard_tokens(),
+    );
     Ok(Some(semantic_tokens.into()))
 }
 
 pub(crate) fn handle_open_docs(
     snap: GlobalStateSnapshot,
     params: lsp_types::TextDocumentPositionParams,
-) -> Result<Option<lsp_types::Url>> {
+) -> Result<ExternalDocsResponse> {
     let _p = profile::span("handle_open_docs");
     let position = from_proto::file_position(&snap, params)?;
 
-    let remote = snap.analysis.external_docs(position)?;
+    let ws_and_sysroot = snap.workspaces.iter().find_map(|ws| match ws {
+        ProjectWorkspace::Cargo { cargo, sysroot, .. } => Some((cargo, sysroot.as_ref().ok())),
+        ProjectWorkspace::Json { .. } => None,
+        ProjectWorkspace::DetachedFiles { .. } => None,
+    });
 
-    Ok(remote.and_then(|remote| Url::parse(&remote).ok()))
+    let (cargo, sysroot) = match ws_and_sysroot {
+        Some((ws, sysroot)) => (Some(ws), sysroot),
+        _ => (None, None),
+    };
+
+    let sysroot = sysroot.map(|p| p.root().as_os_str());
+    let target_dir = cargo.map(|cargo| cargo.target_directory()).map(|p| p.as_os_str());
+
+    let Ok(remote_urls) = snap.analysis.external_docs(position, target_dir, sysroot) else {
+        return if snap.config.local_docs() {
+            Ok(ExternalDocsResponse::WithLocal(Default::default()))
+            } else {
+            Ok(ExternalDocsResponse::Simple(None))
+            }
+    };
+
+    let web = remote_urls.web_url.and_then(|it| Url::parse(&it).ok());
+    let local = remote_urls.local_url.and_then(|it| Url::parse(&it).ok());
+
+    if snap.config.local_docs() {
+        Ok(ExternalDocsResponse::WithLocal(ExternalDocsPair { web, local }))
+    } else {
+        Ok(ExternalDocsResponse::Simple(web))
+    }
 }
 
 pub(crate) fn handle_open_cargo_toml(
@@ -1913,4 +1933,53 @@ fn run_rustfmt(
     } else {
         Ok(Some(to_proto::text_edit_vec(&line_index, diff(&file, &new_text))))
     }
+}
+
+pub(crate) fn fetch_dependency_list(
+    state: GlobalStateSnapshot,
+    _params: FetchDependencyListParams,
+) -> Result<FetchDependencyListResult> {
+    let crates = state.analysis.fetch_crates()?;
+    let crate_infos = crates
+        .into_iter()
+        .filter_map(|it| {
+            let root_file_path = state.file_id_to_file_path(it.root_file_id);
+            crate_path(root_file_path).and_then(to_url).map(|path| CrateInfoResult {
+                name: it.name,
+                version: it.version,
+                path,
+            })
+        })
+        .collect();
+    Ok(FetchDependencyListResult { crates: crate_infos })
+}
+
+/// Searches for the directory of a Rust crate given this crate's root file path.
+///
+/// # Arguments
+///
+/// * `root_file_path`: The path to the root file of the crate.
+///
+/// # Returns
+///
+/// An `Option` value representing the path to the directory of the crate with the given
+/// name, if such a crate is found. If no crate with the given name is found, this function
+/// returns `None`.
+fn crate_path(root_file_path: VfsPath) -> Option<VfsPath> {
+    let mut current_dir = root_file_path.parent();
+    while let Some(path) = current_dir {
+        let cargo_toml_path = path.join("../Cargo.toml")?;
+        if fs::metadata(cargo_toml_path.as_path()?).is_ok() {
+            let crate_path = cargo_toml_path.parent()?;
+            return Some(crate_path);
+        }
+        current_dir = path.parent();
+    }
+    None
+}
+
+fn to_url(path: VfsPath) -> Option<Url> {
+    let path = path.as_path()?;
+    let str_path = path.as_os_str().to_str()?;
+    Url::from_file_path(str_path).ok()
 }

@@ -1,6 +1,6 @@
 //! Unification and canonicalization logic.
 
-use std::{fmt, iter, mem, sync::Arc};
+use std::{fmt, iter, mem};
 
 use chalk_ir::{
     cast::Cast, fold::TypeFoldable, interner::HasInterner, zip::Zip, CanonicalVarKind, FloatTy,
@@ -11,14 +11,15 @@ use either::Either;
 use ena::unify::UnifyKey;
 use hir_expand::name;
 use stdx::never;
+use triomphe::Arc;
 
 use super::{InferOk, InferResult, InferenceContext, TypeError};
 use crate::{
-    db::HirDatabase, fold_tys, fold_tys_and_consts, static_lifetime, to_chalk_trait_id,
-    traits::FnTrait, AliasEq, AliasTy, BoundVar, Canonical, Const, ConstValue, DebruijnIndex,
-    GenericArg, GenericArgData, Goal, Guidance, InEnvironment, InferenceVar, Interner, Lifetime,
-    ParamKind, ProjectionTy, ProjectionTyExt, Scalar, Solution, Substitution, TraitEnvironment, Ty,
-    TyBuilder, TyExt, TyKind, VariableKind,
+    db::HirDatabase, fold_tys_and_consts, static_lifetime, to_chalk_trait_id, traits::FnTrait,
+    AliasEq, AliasTy, BoundVar, Canonical, Const, ConstValue, DebruijnIndex, GenericArg,
+    GenericArgData, Goal, Guidance, InEnvironment, InferenceVar, Interner, Lifetime, ParamKind,
+    ProjectionTy, ProjectionTyExt, Scalar, Solution, Substitution, TraitEnvironment, Ty, TyBuilder,
+    TyExt, TyKind, VariableKind,
 };
 
 impl<'a> InferenceContext<'a> {
@@ -231,14 +232,40 @@ impl<'a> InferenceTable<'a> {
     /// type annotation (e.g. from a let type annotation, field type or function
     /// call). `make_ty` handles this already, but e.g. for field types we need
     /// to do it as well.
-    pub(crate) fn normalize_associated_types_in(&mut self, ty: Ty) -> Ty {
-        fold_tys(
+    pub(crate) fn normalize_associated_types_in<T>(&mut self, ty: T) -> T
+    where
+        T: HasInterner<Interner = Interner> + TypeFoldable<Interner>,
+    {
+        fold_tys_and_consts(
             ty,
-            |ty, _| match ty.kind(Interner) {
-                TyKind::Alias(AliasTy::Projection(proj_ty)) => {
-                    self.normalize_projection_ty(proj_ty.clone())
-                }
-                _ => ty,
+            |e, _| match e {
+                Either::Left(ty) => Either::Left(match ty.kind(Interner) {
+                    TyKind::Alias(AliasTy::Projection(proj_ty)) => {
+                        self.normalize_projection_ty(proj_ty.clone())
+                    }
+                    _ => ty,
+                }),
+                Either::Right(c) => Either::Right(match &c.data(Interner).value {
+                    chalk_ir::ConstValue::Concrete(cc) => match &cc.interned {
+                        crate::ConstScalar::UnevaluatedConst(c_id, subst) => {
+                            // FIXME: Ideally here we should do everything that we do with type alias, i.e. adding a variable
+                            // and registering an obligation. But it needs chalk support, so we handle the most basic
+                            // case (a non associated const without generic parameters) manually.
+                            if subst.len(Interner) == 0 {
+                                if let Ok(eval) = self.db.const_eval((*c_id).into(), subst.clone())
+                                {
+                                    eval
+                                } else {
+                                    c
+                                }
+                            } else {
+                                c
+                            }
+                        }
+                        _ => c,
+                    },
+                    _ => c,
+                }),
             },
             DebruijnIndex::INNERMOST,
         )
@@ -720,7 +747,10 @@ impl<'a> InferenceTable<'a> {
         }
     }
 
-    pub(super) fn insert_type_vars(&mut self, ty: Ty) -> Ty {
+    pub(super) fn insert_type_vars<T>(&mut self, ty: T) -> T
+    where
+        T: HasInterner<Interner = Interner> + TypeFoldable<Interner>,
+    {
         fold_tys_and_consts(
             ty,
             |x, _| match x {

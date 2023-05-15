@@ -7,18 +7,13 @@ use std::env;
 use either::Either;
 use hir::{
     import_map::{self, ImportKind},
-    symbols::FileSymbol,
     AsAssocItem, Crate, ItemInNs, Semantics,
 };
 use limit::Limit;
 use once_cell::sync::Lazy;
 use syntax::{ast, AstNode, SyntaxKind::NAME};
 
-use crate::{
-    defs::{Definition, NameClass},
-    imports::import_assets::NameToImport,
-    symbol_index, RootDatabase,
-};
+use crate::{imports::import_assets::NameToImport, symbol_index, RootDatabase};
 
 /// A value to use, when uncertain which limit to pick.
 pub static DEFAULT_QUERY_SEARCH_LIMIT: Lazy<Limit> = {
@@ -57,8 +52,6 @@ pub fn items_with_name<'a>(
             limit,
         )
     });
-
-    let (mut local_query, mut external_query) = match name {
         NameToImport::Exact(exact_name, case_sensitive) => {
             let mut local_query = symbol_index::Query::new(exact_name.clone());
             local_query.exact();
@@ -127,10 +120,9 @@ fn find_items<'a>(
     let local_results = local_query
         .search(&symbol_index::crate_symbols(db, krate))
         .into_iter()
-        .filter_map(move |local_candidate| get_name_definition(sema, &local_candidate))
-        .filter_map(|name_definition_to_import| match name_definition_to_import {
-            Definition::Macro(macro_def) => Some(ItemInNs::from(macro_def)),
-            def => <Option<_>>::from(def),
+        .filter_map(|local_candidate| match local_candidate.def {
+            hir::ModuleDef::Macro(macro_def) => Some(ItemInNs::Macros(macro_def)),
+            def => Some(ItemInNs::from(def)),
         });
 
     external_importables.chain(local_results).filter(move |&item| match assoc_item_search {
@@ -138,22 +130,6 @@ fn find_items<'a>(
         AssocItemSearch::Exclude => !is_assoc_item(item, sema.db),
         AssocItemSearch::AssocItemsOnly => is_assoc_item(item, sema.db),
     })
-}
-
-fn get_name_definition(
-    sema: &Semantics<'_, RootDatabase>,
-    import_candidate: &FileSymbol,
-) -> Option<Definition> {
-    let _p = profile::span("get_name_definition");
-
-    let candidate_node = import_candidate.loc.syntax(sema);
-    let candidate_name_node = if candidate_node.kind() != NAME {
-        candidate_node.children().find(|it| it.kind() == NAME)?
-    } else {
-        candidate_node
-    };
-    let name = ast::Name::cast(candidate_name_node)?;
-    NameClass::classify(sema, &name)?.defined()
 }
 
 fn is_assoc_item(item: ItemInNs, db: &RootDatabase) -> bool {

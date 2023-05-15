@@ -2,14 +2,13 @@
 
 pub mod adt;
 
-use std::sync::Arc;
-
 use hir_expand::{
     name::Name, AstId, ExpandResult, HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefKind,
 };
 use intern::Interned;
 use smallvec::SmallVec;
 use syntax::{ast, Parse};
+use triomphe::Arc;
 
 use crate::{
     attr::Attrs,
@@ -23,7 +22,7 @@ use crate::{
         attr_resolution::ResolvedAttr,
         diagnostics::DefDiagnostic,
         proc_macro::{parse_macro_name_and_helper_attrs, ProcMacroKind},
-        DefMap,
+        DefMap, MacroSubNs,
     },
     type_ref::{TraitRef, TypeBound, TypeRef},
     visibility::RawVisibility,
@@ -623,7 +622,6 @@ impl<'a> AssocItemCollector<'a> {
                                 ast_id,
                                 attr_args: Arc::new((tt::Subtree::empty(), Default::default())),
                                 invoc_attr_index: attr.id,
-                                is_derive: false,
                             },
                             attr.path().clone(),
                         ));
@@ -675,6 +673,7 @@ impl<'a> AssocItemCollector<'a> {
                             module,
                             &path,
                             crate::item_scope::BuiltinShadowMode::Other,
+                            Some(MacroSubNs::Bang),
                         )
                         .0
                         .take_macros()
