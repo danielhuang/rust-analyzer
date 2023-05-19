@@ -340,7 +340,7 @@ impl<'a> InferenceContext<'a> {
         } else {
             BindingMode::convert(mode)
         };
-        self.result.pat_binding_modes.insert(pat, mode);
+        self.result.binding_modes.insert(binding, mode);
 
         let inner_ty = match subpat {
             Some(subpat) => self.infer_pat(subpat, &expected, default_bm),
@@ -379,7 +379,7 @@ impl<'a> InferenceContext<'a> {
         if let &Some(slice_pat_id) = slice {
             let rest_pat_ty = match expected.kind(Interner) {
                 TyKind::Array(_, length) => {
-                    let len = try_const_usize(length);
+                    let len = try_const_usize(self.db, length);
                     let len =
                         len.and_then(|len| len.checked_sub((prefix.len() + suffix.len()) as u128));
                     TyKind::Array(elem_ty.clone(), usize_const(self.db, len, self.resolver.krate()))
@@ -428,9 +428,10 @@ fn is_non_ref_pat(body: &hir_def::body::Body, pat: PatId) -> bool {
         // FIXME: ConstBlock/Path/Lit might actually evaluate to ref, but inference is unimplemented.
         Pat::Path(..) => true,
         Pat::ConstBlock(..) => true,
-        Pat::Lit(expr) => {
-            !matches!(body[*expr], Expr::Literal(Literal::String(..) | Literal::ByteString(..)))
-        }
+        Pat::Lit(expr) => !matches!(
+            body[*expr],
+            Expr::Literal(Literal::String(..) | Literal::CString(..) | Literal::ByteString(..))
+        ),
         Pat::Wild | Pat::Bind { .. } | Pat::Ref { .. } | Pat::Box { .. } | Pat::Missing => false,
     }
 }
@@ -438,7 +439,7 @@ fn is_non_ref_pat(body: &hir_def::body::Body, pat: PatId) -> bool {
 pub(super) fn contains_explicit_ref_binding(body: &Body, pat_id: PatId) -> bool {
     let mut res = false;
     body.walk_pats(pat_id, &mut |pat| {
-        res |= matches!(pat, Pat::Bind { id, .. } if body.bindings[*id].mode == BindingAnnotation::Ref);
+        res |= matches!(body[pat], Pat::Bind { id, .. } if body.bindings[id].mode == BindingAnnotation::Ref);
     });
     res
 }

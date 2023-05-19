@@ -420,13 +420,8 @@ impl HirDisplay for Const {
             ConstValue::Concrete(c) => match &c.interned {
                 ConstScalar::Bytes(b, m) => render_const_scalar(f, &b, m, &data.ty),
                 ConstScalar::UnevaluatedConst(c, parameters) => {
-                    let const_data = f.db.const_data(*c);
-                    write!(
-                        f,
-                        "{}",
-                        const_data.name.as_ref().and_then(|x| x.as_str()).unwrap_or("_")
-                    )?;
-                    hir_fmt_generics(f, parameters, Some((*c).into()))?;
+                    write!(f, "{}", c.name(f.db.upcast()))?;
+                    hir_fmt_generics(f, parameters, c.generic_def(f.db.upcast()))?;
                     Ok(())
                 }
                 ConstScalar::Unknown => f.write_char('_'),
@@ -463,6 +458,9 @@ fn render_const_scalar(
     memory_map: &MemoryMap,
     ty: &Ty,
 ) -> Result<(), HirDisplayError> {
+    // FIXME: We need to get krate from the final callers of the hir display
+    // infrastructure and have it here as a field on `f`.
+    let krate = *f.db.crate_graph().crates_in_topological_order().last().unwrap();
     match ty.kind(Interner) {
         chalk_ir::TyKind::Scalar(s) => match s {
             Scalar::Bool => write!(f, "{}", if b[0] == 0 { false } else { true }),
@@ -502,11 +500,6 @@ fn render_const_scalar(
             _ => f.write_str("<ref-not-supported>"),
         },
         chalk_ir::TyKind::Tuple(_, subst) => {
-            // FIXME: Remove this line. If the target data layout is independent
-            // of the krate, the `db.target_data_layout` and its callers like `layout_of_ty` don't need
-            // to get krate. Otherwise, we need to get krate from the final callers of the hir display
-            // infrastructure and have it here as a field on `f`.
-            let krate = *f.db.crate_graph().crates_in_topological_order().last().unwrap();
             let Ok(layout) = layout_of_ty(f.db, ty, krate) else {
                 return f.write_str("<layout-error>");
             };
@@ -532,7 +525,7 @@ fn render_const_scalar(
         chalk_ir::TyKind::Adt(adt, subst) => match adt.0 {
             hir_def::AdtId::StructId(s) => {
                 let data = f.db.struct_data(s);
-                let Ok(layout) = f.db.layout_of_adt(adt.0, subst.clone()) else {
+                let Ok(layout) = f.db.layout_of_adt(adt.0, subst.clone(), krate) else {
                     return f.write_str("<layout-error>");
                 };
                 match data.variant_data.as_ref() {

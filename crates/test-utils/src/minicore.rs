@@ -23,7 +23,7 @@
 //!     drop:
 //!     eq: sized
 //!     error: fmt
-//!     fmt: result
+//!     fmt: result, transmute, coerce_unsized
 //!     fn:
 //!     from: sized
 //!     future: pin
@@ -37,7 +37,7 @@
 //!     non_zero:
 //!     option: panic
 //!     ord: eq, option
-//!     panic:
+//!     panic: fmt
 //!     pin:
 //!     range:
 //!     result:
@@ -45,6 +45,7 @@
 //!     sized:
 //!     slice:
 //!     sync: sized
+//!     transmute:
 //!     try: infallible
 //!     unsize: sized
 
@@ -110,6 +111,7 @@ pub mod marker {
         impl<T: ?Sized> Copy for *const T {}
         impl<T: ?Sized> Copy for *mut T {}
         impl<T: ?Sized> Copy for &T {}
+        impl Copy for ! {}
     }
     // endregion:copy
 
@@ -245,6 +247,12 @@ pub mod clone {
         f32 f64
         bool char
     }
+
+    impl Clone for ! {
+        fn clone(&self) {
+            *self
+        }
+    }
     // endregion:builtin_impls
 
     // region:derive
@@ -289,8 +297,8 @@ pub mod convert {
     // endregion:infallible
 }
 
-// region:drop
 pub mod mem {
+    // region:drop
     // region:manually_drop
     #[lang = "manually_drop"]
     #[repr(transparent)]
@@ -318,13 +326,34 @@ pub mod mem {
     pub fn drop<T>(_x: T) {}
     pub const fn replace<T>(dest: &mut T, src: T) -> T {
         unsafe {
-            let result = *dest;
-            *dest = src;
+            let result = crate::ptr::read(dest);
+            crate::ptr::write(dest, src);
             result
         }
     }
+    // endregion:drop
+
+    // region:transmute
+    extern "rust-intrinsic" {
+        pub fn transmute<Src, Dst>(src: Src) -> Dst;
+    }
+    // endregion:transmute
 }
-// endregion:drop
+
+pub mod ptr {
+    // region:drop
+    #[lang = "drop_in_place"]
+    pub unsafe fn drop_in_place<T: ?Sized>(to_drop: *mut T) {
+        unsafe { drop_in_place(to_drop) }
+    }
+    pub const unsafe fn read<T>(src: *const T) -> T {
+        *src
+    }
+    pub const unsafe fn write<T>(dst: *mut T, src: T) {
+        *dst = src;
+    }
+    // endregion:drop
+}
 
 pub mod ops {
     // region:coerce_unsized
@@ -805,6 +834,38 @@ pub mod fmt {
         fn fmt(&self, f: &mut Formatter<'_>) -> Result;
     }
 
+    extern "C" {
+        type Opaque;
+    }
+
+    #[lang = "format_argument"]
+    pub struct ArgumentV1<'a> {
+        value: &'a Opaque,
+        formatter: fn(&Opaque, &mut Formatter<'_>) -> Result,
+    }
+
+    impl<'a> ArgumentV1<'a> {
+        pub fn new<'b, T>(x: &'b T, f: fn(&T, &mut Formatter<'_>) -> Result) -> ArgumentV1<'b> {
+            use crate::mem::transmute;
+            unsafe { ArgumentV1 { formatter: transmute(f), value: transmute(x) } }
+        }
+    }
+
+    #[lang = "format_arguments"]
+    pub struct Arguments<'a> {
+        pieces: &'a [&'static str],
+        args: &'a [ArgumentV1<'a>],
+    }
+
+    impl<'a> Arguments<'a> {
+        pub const fn new_v1(
+            pieces: &'a [&'static str],
+            args: &'a [ArgumentV1<'a>],
+        ) -> Arguments<'a> {
+            Arguments { pieces, args }
+        }
+    }
+
     // region:derive
     #[rustc_builtin_macro]
     pub macro Debug($item:item) {}
@@ -1140,8 +1201,17 @@ pub mod iter {
 
 // region:panic
 mod panic {
-    pub macro panic_2021($($t:tt)+) {
-        /* Nothing yet */
+    pub macro panic_2021 {
+        ($($t:tt)+) => (
+            $crate::panicking::panic_fmt($crate::const_format_args!($($t)+))
+        ),
+    }
+}
+
+mod panicking {
+    #[lang = "panic_fmt"]
+    pub const fn panic_fmt(fmt: crate::fmt::Arguments<'_>) -> ! {
+        loop {}
     }
 }
 // endregion:panic
@@ -1158,6 +1228,17 @@ mod macros {
 
     pub(crate) use panic;
     // endregion:panic
+
+    // region:fmt
+    #[macro_export]
+    #[rustc_builtin_macro]
+    macro_rules! const_format_args {
+        ($fmt:expr) => {{ /* compiler built-in */ }};
+        ($fmt:expr, $($args:tt)*) => {{ /* compiler built-in */ }};
+    }
+
+    pub(crate) use const_format_args;
+    // endregion:fmt
 
     // region:derive
     pub(crate) mod builtin {

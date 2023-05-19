@@ -26,9 +26,11 @@ fn simplify(e: ConstEvalError) -> ConstEvalError {
 #[track_caller]
 fn check_fail(ra_fixture: &str, error: impl FnOnce(ConstEvalError) -> bool) {
     let (db, file_id) = TestDB::with_single_file(ra_fixture);
-    match eval_goal(&db, file_id).map_err(simplify) {
+    match eval_goal(&db, file_id) {
         Ok(_) => panic!("Expected fail, but it succeeded"),
-        Err(e) => assert!(error(e)),
+        Err(e) => {
+            assert!(error(simplify(e.clone())), "Actual error was: {}", pretty_print_err(e, db))
+        }
     }
 }
 
@@ -38,13 +40,7 @@ fn check_number(ra_fixture: &str, answer: i128) {
     let r = match eval_goal(&db, file_id) {
         Ok(t) => t,
         Err(e) => {
-            let mut err = String::new();
-            let span_formatter = |file, range| format!("{:?} {:?}", file, range);
-            match e {
-                ConstEvalError::MirLowerError(e) => e.pretty_print(&mut err, &db, span_formatter),
-                ConstEvalError::MirEvalError(e) => e.pretty_print(&mut err, &db, span_formatter),
-            }
-            .unwrap();
+            let err = pretty_print_err(e, db);
             panic!("Error in evaluating goal: {}", err);
         }
     };
@@ -62,6 +58,17 @@ fn check_number(ra_fixture: &str, answer: i128) {
         },
         _ => panic!("result of const eval wasn't a concrete const"),
     }
+}
+
+fn pretty_print_err(e: ConstEvalError, db: TestDB) -> String {
+    let mut err = String::new();
+    let span_formatter = |file, range| format!("{:?} {:?}", file, range);
+    match e {
+        ConstEvalError::MirLowerError(e) => e.pretty_print(&mut err, &db, span_formatter),
+        ConstEvalError::MirEvalError(e) => e.pretty_print(&mut err, &db, span_formatter),
+    }
+    .unwrap();
+    err
 }
 
 fn eval_goal(db: &TestDB, file_id: FileId) -> Result<Const, ConstEvalError> {
@@ -113,6 +120,10 @@ fn floating_point() {
         r#"const GOAL: f32 = 2.0 + 3.0 * 5.5 - 8.;"#,
         i128::from_le_bytes(pad16(&f32::to_le_bytes(10.5), true)),
     );
+    check_number(
+        r#"const GOAL: f32 = -90.0 + 36.0;"#,
+        i128::from_le_bytes(pad16(&f32::to_le_bytes(-54.0), true)),
+    );
 }
 
 #[test]
@@ -155,6 +166,22 @@ fn casts() {
     };
         "#,
         4,
+    );
+}
+
+#[test]
+fn raw_pointer_equality() {
+    check_number(
+        r#"
+        //- minicore: copy, eq
+        const GOAL: bool = {
+            let a = 2;
+            let p1 = a as *const i32;
+            let p2 = a as *const i32;
+            p1 == p2
+        };
+        "#,
+        1,
     );
 }
 
@@ -972,6 +999,22 @@ fn pattern_matching_literal() {
     const GOAL: u8 = f("foo") + f("bar");
         "#,
         11,
+    );
+}
+
+#[test]
+fn pattern_matching_slice() {
+    check_number(
+        r#"
+    //- minicore: slice, index, coerce_unsized, copy
+    const fn f(x: &[usize]) -> usize {
+        match x {
+            [a, b @ .., c, d] => *a + b.len() + *c + *d,
+        }
+    }
+    const GOAL: usize = f(&[10, 20, 3, 15, 1000, 60, 16]);
+        "#,
+        10 + 4 + 60 + 16,
     );
 }
 
@@ -1808,6 +1851,28 @@ fn array_and_index() {
     const GOAL: usize = [1, 2, 3, 4, 5].len();"#,
         5,
     );
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, index, slice
+    const GOAL: [u16; 5] = [1, 2, 3, 4, 5];"#,
+        1 + (2 << 16) + (3 << 32) + (4 << 48) + (5 << 64),
+    );
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, index, slice
+    const GOAL: [u16; 5] = [12; 5];"#,
+        12 + (12 << 16) + (12 << 32) + (12 << 48) + (12 << 64),
+    );
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, index, slice
+    const LEN: usize = 4;
+    const GOAL: u16 = {
+        let x = [7; LEN];
+        x[2]
+    }"#,
+        7,
+    );
 }
 
 #[test]
@@ -1822,6 +1887,38 @@ fn byte_string() {
     };
         "#,
         104,
+    );
+}
+
+#[test]
+fn c_string() {
+    check_number(
+        r#"
+//- minicore: index, slice
+#[lang = "CStr"]
+pub struct CStr {
+    inner: [u8]
+}
+const GOAL: u8 = {
+    let a = c"hello";
+    a.inner[0]
+};
+    "#,
+        104,
+    );
+    check_number(
+        r#"
+//- minicore: index, slice
+#[lang = "CStr"]
+pub struct CStr {
+    inner: [u8]
+}
+const GOAL: u8 = {
+    let a = c"hello";
+    a.inner[6]
+};
+    "#,
+        0,
     );
 }
 
@@ -1903,7 +2000,7 @@ fn enums() {
         "#,
     );
     let r = eval_goal(&db, file_id).unwrap();
-    assert_eq!(try_const_usize(&r), Some(1));
+    assert_eq!(try_const_usize(&db, &r), Some(1));
 }
 
 #[test]
@@ -1932,6 +2029,29 @@ fn const_transfer_memory() {
 }
 
 #[test]
+fn anonymous_const_block() {
+    check_number(
+        r#"
+    extern "rust-intrinsic" {
+        pub fn size_of<T>() -> usize;
+    }
+
+    const fn f<T>() -> usize {
+        let r = const { size_of::<T>() };
+        r
+    }
+
+    const GOAL: usize = {
+        let x = const { 2 + const { 3 } };
+        let y = f::<i32>();
+        x + y
+    };
+    "#,
+        9,
+    );
+}
+
+#[test]
 fn const_impl_assoc() {
     check_number(
         r#"
@@ -1939,9 +2059,9 @@ fn const_impl_assoc() {
     impl U5 {
         const VAL: usize = 5;
     }
-    const GOAL: usize = U5::VAL;
+    const GOAL: usize = U5::VAL + <U5>::VAL;
     "#,
-        5,
+        10,
     );
 }
 
@@ -1959,6 +2079,36 @@ fn const_generic_subst_fn() {
 }
 
 #[test]
+fn layout_of_type_with_associated_type_field_defined_inside_body() {
+    check_number(
+        r#"
+trait Tr {
+    type Ty;
+}
+
+struct St<T: Tr>(T::Ty);
+
+const GOAL: i64 = {
+    // if we move `St2` out of body, the test will fail, as we don't see the impl anymore. That
+    // case will probably be rejected by rustc in some later edition, but we should support this
+    // case.
+    struct St2;
+
+    impl Tr for St2 {
+        type Ty = i64;
+    }
+
+    struct Goal(St<St2>);
+
+    let x = Goal(St(5));
+    x.0.0
+};
+"#,
+        5,
+    );
+}
+
+#[test]
 fn const_generic_subst_assoc_const_impl() {
     check_number(
         r#"
@@ -1967,6 +2117,35 @@ fn const_generic_subst_assoc_const_impl() {
         const VAL: usize = N + M;
     }
     const GOAL: usize = Adder::<2, 3>::VAL;
+    "#,
+        5,
+    );
+}
+
+#[test]
+fn associated_types() {
+    check_number(
+        r#"
+    trait Tr {
+        type Item;
+        fn get_item(&self) -> Self::Item;
+    }
+
+    struct X(i32);
+    struct Y(i32);
+
+    impl Tr for X {
+        type Item = Y;
+        fn get_item(&self) -> Self::Item {
+            Y(self.0 + 2)
+        }
+    }
+
+    fn my_get_item<T: Tr>(x: T) -> <T as Tr>::Item {
+        x.get_item()
+    }
+
+    const GOAL: i32 = my_get_item(X(3)).0;
     "#,
         5,
     );
@@ -2012,6 +2191,20 @@ fn const_trait_assoc() {
     const GOAL: usize = f::<i32>() + f::<i64>() * 2;
     "#,
         12,
+    );
+}
+
+#[test]
+fn panic_messages() {
+    check_fail(
+        r#"
+    //- minicore: panic
+    const GOAL: u8 = {
+        let x: u16 = 2;
+        panic!("hello");
+    };
+    "#,
+        |e| e == ConstEvalError::MirEvalError(MirEvalError::Panic("hello".to_string())),
     );
 }
 

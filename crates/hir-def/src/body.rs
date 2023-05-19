@@ -165,7 +165,7 @@ impl Body {
         };
         let expander = Expander::new(db, file_id, module);
         let (mut body, source_map) =
-            Body::new(db, expander, params, body, module.krate, is_async_fn);
+            Body::new(db, def, expander, params, body, module.krate, is_async_fn);
         body.shrink_to_fit();
 
         (Arc::new(body), Arc::new(source_map))
@@ -187,15 +187,25 @@ impl Body {
         pretty::print_body_hir(db, self, owner)
     }
 
+    pub fn pretty_print_expr(
+        &self,
+        db: &dyn DefDatabase,
+        owner: DefWithBodyId,
+        expr: ExprId,
+    ) -> String {
+        pretty::print_expr_hir(db, self, owner, expr)
+    }
+
     fn new(
         db: &dyn DefDatabase,
+        owner: DefWithBodyId,
         expander: Expander,
         params: Option<(ast::ParamList, impl Iterator<Item = bool>)>,
         body: Option<ast::Expr>,
         krate: CrateId,
         is_async_fn: bool,
     ) -> (Body, BodySourceMap) {
-        lower::lower(db, expander, params, body, krate, is_async_fn)
+        lower::lower(db, owner, expander, params, body, krate, is_async_fn)
     }
 
     fn shrink_to_fit(&mut self) {
@@ -211,15 +221,15 @@ impl Body {
 
     pub fn walk_bindings_in_pat(&self, pat_id: PatId, mut f: impl FnMut(BindingId)) {
         self.walk_pats(pat_id, &mut |pat| {
-            if let Pat::Bind { id, .. } = pat {
+            if let Pat::Bind { id, .. } = &self[pat] {
                 f(*id);
             }
         });
     }
 
-    pub fn walk_pats(&self, pat_id: PatId, f: &mut impl FnMut(&Pat)) {
+    pub fn walk_pats(&self, pat_id: PatId, f: &mut impl FnMut(PatId)) {
         let pat = &self[pat_id];
-        f(pat);
+        f(pat_id);
         match pat {
             Pat::Range { .. }
             | Pat::Lit(..)

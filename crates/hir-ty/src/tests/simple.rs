@@ -1812,6 +1812,20 @@ fn main() {
       //^ [(); 7]
 }"#,
     );
+    check_types(
+        r#"
+trait Foo {
+    fn x(self);
+}
+
+impl Foo for u8 {
+    fn x(self) {
+        let t = [0; 4 + 2];
+          //^ [i32; 6]
+    }
+}
+    "#,
+    );
 }
 
 #[test]
@@ -2136,6 +2150,7 @@ async fn main() {
             130..140 'try { () }': ControlFlow<(), ()>
             136..138 '()': ()
             150..151 'w': i32
+            154..166 'const { 92 }': i32
             154..166 'const { 92 }': i32
             162..164 '92': i32
             176..177 't': i32
@@ -3553,6 +3568,21 @@ fn main() {
     let foo: Foo<B> = Foo;
     let x = foo.foo();
       //^ u16
+}
+"#,
+    );
+}
+
+#[test]
+fn cstring_literals() {
+    check_types(
+        r#"
+#[lang = "CStr"]
+pub struct CStr;
+
+fn main() {
+    c"ello";
+  //^^^^^^^ &CStr
 }
 "#,
     );

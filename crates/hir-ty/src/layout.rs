@@ -84,7 +84,7 @@ pub fn layout_of_ty(db: &dyn HirDatabase, ty: &Ty, krate: CrateId) -> Result<Lay
     let trait_env = Arc::new(TraitEnvironment::empty(krate));
     let ty = normalize(db, trait_env, ty.clone());
     Ok(match ty.kind(Interner) {
-        TyKind::Adt(AdtId(def), subst) => db.layout_of_adt(*def, subst.clone())?,
+        TyKind::Adt(AdtId(def), subst) => db.layout_of_adt(*def, subst.clone(), krate)?,
         TyKind::Scalar(s) => match s {
             chalk_ir::Scalar::Bool => Layout::scalar(
                 dl,
@@ -148,7 +148,7 @@ pub fn layout_of_ty(db: &dyn HirDatabase, ty: &Ty, krate: CrateId) -> Result<Lay
             cx.univariant(dl, &fields, &ReprOptions::default(), kind).ok_or(LayoutError::Unknown)?
         }
         TyKind::Array(element, count) => {
-            let count = try_const_usize(&count).ok_or(LayoutError::UserError(
+            let count = try_const_usize(db, &count).ok_or(LayoutError::UserError(
                 "unevaluated or mistyped const generic parameter".to_string(),
             ))? as u64;
             let element = layout_of_ty(db, element, krate)?;

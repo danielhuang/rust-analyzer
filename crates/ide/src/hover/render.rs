@@ -35,11 +35,11 @@ pub(super) fn type_info_of(
     _config: &HoverConfig,
     expr_or_pat: &Either<ast::Expr, ast::Pat>,
 ) -> Option<HoverResult> {
-    let TypeInfo { original, adjusted } = match expr_or_pat {
+    let ty_info = match expr_or_pat {
         Either::Left(expr) => sema.type_of_expr(expr)?,
         Either::Right(pat) => sema.type_of_pat(pat)?,
     };
-    type_info(sema, _config, original, adjusted)
+    type_info(sema, _config, ty_info)
 }
 
 pub(super) fn closure_expr(
@@ -47,41 +47,8 @@ pub(super) fn closure_expr(
     config: &HoverConfig,
     c: ast::ClosureExpr,
 ) -> Option<HoverResult> {
-    let ty = &sema.type_of_expr(&c.into())?.original;
-    let layout = if config.memory_layout {
-        ty.layout(sema.db)
-            .map(|x| format!(" // size = {}, align = {}", x.size.bytes(), x.align.abi.bytes()))
-            .unwrap_or_default()
-    } else {
-        String::default()
-    };
-    let c = ty.as_closure()?;
-    let mut captures = c
-        .captured_items(sema.db)
-        .into_iter()
-        .map(|it| {
-            let borrow_kind=   match it.kind() {
-                CaptureKind::SharedRef => "immutable borrow",
-                CaptureKind::UniqueSharedRef => "unique immutable borrow ([read more](https://doc.rust-lang.org/stable/reference/types/closure.html#unique-immutable-borrows-in-captures))",
-                CaptureKind::MutableRef => "mutable borrow",
-                CaptureKind::Move => "move",
-            };
-            format!("* `{}` by {}", it.display_place(sema.db), borrow_kind)
-        })
-        .join("\n");
-    if captures.trim().is_empty() {
-        captures = "This closure captures nothing".to_string();
-    }
-    let mut res = HoverResult::default();
-    res.markup = format!(
-        "```rust\n{}{}\n{}\n```\n\n## Captures\n{}",
-        c.display_with_id(sema.db),
-        layout,
-        c.display_with_impl(sema.db),
-        captures,
-    )
-    .into();
-    Some(res)
+    let TypeInfo { original, .. } = sema.type_of_expr(&c.into())?;
+    closure_ty(sema, config, &TypeInfo { original, adjusted: None })
 }
 
 pub(super) fn try_expr(
@@ -450,15 +417,25 @@ pub(super) fn definition(
             let layout = it.layout(db).ok()?;
             Some(format!("size = {}, align = {}", layout.size.bytes(), layout.align.abi.bytes()))
         }),
-        Definition::Variant(it) => label_value_and_docs(db, it, |&it| {
-            if !it.parent_enum(db).is_data_carrying(db) {
+        Definition::Variant(it) => label_value_and_layout_info_and_docs(db, it, config, |&it| {
+            let layout = (|| {
+                let (layout, tag_size) = it.layout(db).ok()?;
+                let size = layout.size.bytes_usize() - tag_size;
+                if size == 0 {
+                    // There is no value in showing layout info for fieldless variants
+                    return None;
+                }
+                Some(format!("size = {}", layout.size.bytes()))
+            })();
+            let value = if !it.parent_enum(db).is_data_carrying(db) {
                 match it.eval(db) {
                     Ok(x) => Some(if x >= 10 { format!("{x} ({x:#X})") } else { format!("{x}") }),
                     Err(_) => it.value(db).map(|x| format!("{x:?}")),
                 }
             } else {
                 None
-            }
+            };
+            (value, layout)
         }),
         Definition::Const(it) => label_value_and_docs(db, it, |it| {
             let body = it.render_eval(db);
@@ -493,7 +470,7 @@ pub(super) fn definition(
                 .and_then(|fd| builtin(fd, it))
                 .or_else(|| Some(Markup::fenced_block(&it.name())))
         }
-        Definition::Local(it) => return local(db, it),
+        Definition::Local(it) => return local(db, it, config),
         Definition::SelfType(impl_def) => {
             impl_def.self_ty(db).as_adt().map(|adt| label_and_docs(db, adt))?
         }
@@ -522,10 +499,13 @@ pub(super) fn definition(
 
 fn type_info(
     sema: &Semantics<'_, RootDatabase>,
-    _config: &HoverConfig,
-    original: hir::Type,
-    adjusted: Option<hir::Type>,
+    config: &HoverConfig,
+    ty: TypeInfo,
 ) -> Option<HoverResult> {
+    if let Some(res) = closure_ty(sema, config, &ty) {
+        return Some(res);
+    };
+    let TypeInfo { original, adjusted } = ty;
     let mut res = HoverResult::default();
     let mut targets: Vec<hir::ModuleDef> = Vec::new();
     let mut push_new_def = |item: hir::ModuleDef| {
@@ -552,6 +532,69 @@ fn type_info(
         Markup::fenced_block(&original.display(sema.db))
     };
     res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    Some(res)
+}
+
+fn closure_ty(
+    sema: &Semantics<'_, RootDatabase>,
+    config: &HoverConfig,
+    TypeInfo { original, adjusted }: &TypeInfo,
+) -> Option<HoverResult> {
+    let c = original.as_closure()?;
+    let layout = if config.memory_layout {
+        original
+            .layout(sema.db)
+            .map(|x| format!(" // size = {}, align = {}", x.size.bytes(), x.align.abi.bytes()))
+            .unwrap_or_default()
+    } else {
+        String::default()
+    };
+    let mut captures_rendered = c.captured_items(sema.db)
+        .into_iter()
+        .map(|it| {
+            let borrow_kind = match it.kind() {
+                CaptureKind::SharedRef => "immutable borrow",
+                CaptureKind::UniqueSharedRef => "unique immutable borrow ([read more](https://doc.rust-lang.org/stable/reference/types/closure.html#unique-immutable-borrows-in-captures))",
+                CaptureKind::MutableRef => "mutable borrow",
+                CaptureKind::Move => "move",
+            };
+            format!("* `{}` by {}", it.display_place(sema.db), borrow_kind)
+        })
+        .join("\n");
+    if captures_rendered.trim().is_empty() {
+        captures_rendered = "This closure captures nothing".to_string();
+    }
+    let mut targets: Vec<hir::ModuleDef> = Vec::new();
+    let mut push_new_def = |item: hir::ModuleDef| {
+        if !targets.contains(&item) {
+            targets.push(item);
+        }
+    };
+    walk_and_push_ty(sema.db, original, &mut push_new_def);
+    c.capture_types(sema.db).into_iter().for_each(|ty| {
+        walk_and_push_ty(sema.db, &ty, &mut push_new_def);
+    });
+
+    let adjusted = if let Some(adjusted_ty) = adjusted {
+        walk_and_push_ty(sema.db, &adjusted_ty, &mut push_new_def);
+        format!(
+            "\nCoerced to: {}",
+            adjusted_ty.display(sema.db).with_closure_style(hir::ClosureStyle::ImplFn)
+        )
+    } else {
+        String::new()
+    };
+
+    let mut res = HoverResult::default();
+    res.actions.push(HoverAction::goto_type_from_targets(sema.db, targets));
+    res.markup = format!(
+        "```rust\n{}{}\n{}\n```{adjusted}\n\n## Captures\n{}",
+        c.display_with_id(sema.db),
+        layout,
+        c.display_with_impl(sema.db),
+        captures_rendered,
+    )
+    .into();
     Some(res)
 }
 
@@ -599,6 +642,32 @@ where
     let label = match value_extractor(&def) {
         Some(value) if config.memory_layout => format!("{} // {value}", def.display(db)),
         _ => def.display(db).to_string(),
+    };
+    let docs = def.attrs(db).docs();
+    (label, docs)
+}
+
+fn label_value_and_layout_info_and_docs<D, E, V, L>(
+    db: &RootDatabase,
+    def: D,
+    config: &HoverConfig,
+    value_extractor: E,
+) -> (String, Option<hir::Documentation>)
+where
+    D: HasAttrs + HirDisplay,
+    E: Fn(&D) -> (Option<V>, Option<L>),
+    V: Display,
+    L: Display,
+{
+    let (value, layout) = value_extractor(&def);
+    let label = if let Some(value) = value {
+        format!("{} = {value}", def.display(db))
+    } else {
+        def.display(db).to_string()
+    };
+    let label = match layout {
+        Some(layout) if config.memory_layout => format!("{} // {layout}", label),
+        _ => label,
     };
     let docs = def.attrs(db).docs();
     (label, docs)
@@ -663,11 +732,11 @@ fn find_std_module(famous_defs: &FamousDefs<'_, '_>, name: &str) -> Option<hir::
         .find(|module| module.name(db).map_or(false, |module| module.to_string() == name))
 }
 
-fn local(db: &RootDatabase, it: hir::Local) -> Option<Markup> {
+fn local(db: &RootDatabase, it: hir::Local, config: &HoverConfig) -> Option<Markup> {
     let ty = it.ty(db);
     let ty = ty.display_truncated(db, None);
     let is_mut = if it.is_mut(db) { "mut " } else { "" };
-    let desc = match it.primary_source(db).into_ident_pat() {
+    let mut desc = match it.primary_source(db).into_ident_pat() {
         Some(ident) => {
             let name = it.name(db);
             let let_kw = if ident
@@ -683,6 +752,16 @@ fn local(db: &RootDatabase, it: hir::Local) -> Option<Markup> {
         }
         None => format!("{is_mut}self: {ty}"),
     };
+    if config.memory_layout {
+        if let Ok(layout) = it.ty(db).layout(db) {
+            format_to!(
+                desc,
+                " // size = {}, align = {}",
+                layout.size.bytes(),
+                layout.align.abi.bytes()
+            );
+        }
+    }
     markup(None, desc, None)
 }
 

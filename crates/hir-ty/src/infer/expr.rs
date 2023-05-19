@@ -6,14 +6,14 @@ use std::{
 };
 
 use chalk_ir::{
-    cast::Cast, fold::Shift, DebruijnIndex, GenericArgData, Mutability, TyKind, TyVariableKind,
+    cast::Cast, fold::Shift, DebruijnIndex, GenericArgData, Mutability, TyVariableKind,
 };
 use hir_def::{
     generics::TypeOrConstParamData,
     hir::{
         ArithOp, Array, BinaryOp, ClosureKind, Expr, ExprId, LabelId, Literal, Statement, UnaryOp,
     },
-    lang_item::LangItem,
+    lang_item::{LangItem, LangItemTarget},
     path::{GenericArg, GenericArgs},
     BlockId, ConstParamId, FieldId, ItemContainerId, Lookup,
 };
@@ -26,7 +26,10 @@ use crate::{
     autoderef::{builtin_deref, deref_by_trait, Autoderef},
     consteval,
     infer::{
-        coerce::CoerceMany, find_continuable, pat::contains_explicit_ref_binding, BreakableKind,
+        coerce::{CoerceMany, CoercionCause},
+        find_continuable,
+        pat::contains_explicit_ref_binding,
+        BreakableKind,
     },
     lang_items::lang_items_for_bin_op,
     lower::{
@@ -39,7 +42,7 @@ use crate::{
     traits::FnTrait,
     utils::{generics, Generics},
     Adjust, Adjustment, AdtId, AutoBorrow, Binders, CallableDefId, FnPointer, FnSig, FnSubst,
-    Interner, Rawness, Scalar, Substitution, TraitRef, Ty, TyBuilder, TyExt,
+    Interner, Rawness, Scalar, Substitution, TraitRef, Ty, TyBuilder, TyExt, TyKind,
 };
 
 use super::{
@@ -132,24 +135,28 @@ impl<'a> InferenceContext<'a> {
                 );
 
                 let condition_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
-                let mut both_arms_diverge = Diverges::Always;
 
                 let then_ty = self.infer_expr_inner(then_branch, expected);
-                both_arms_diverge &= mem::replace(&mut self.diverges, Diverges::Maybe);
+                let then_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
                 let mut coerce = CoerceMany::new(expected.coercion_target_type(&mut self.table));
-                coerce.coerce(self, Some(then_branch), &then_ty);
+                coerce.coerce(self, Some(then_branch), &then_ty, CoercionCause::Expr(then_branch));
                 match else_branch {
                     Some(else_branch) => {
                         let else_ty = self.infer_expr_inner(else_branch, expected);
-                        coerce.coerce(self, Some(else_branch), &else_ty);
+                        let else_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
+                        coerce.coerce(
+                            self,
+                            Some(else_branch),
+                            &else_ty,
+                            CoercionCause::Expr(else_branch),
+                        );
+                        self.diverges = condition_diverges | then_diverges & else_diverges;
                     }
                     None => {
-                        coerce.coerce_forced_unit(self);
+                        coerce.coerce_forced_unit(self, CoercionCause::Expr(tgt_expr));
+                        self.diverges = condition_diverges;
                     }
                 }
-                both_arms_diverge &= self.diverges;
-
-                self.diverges = condition_diverges | both_arms_diverge;
 
                 coerce.complete(self)
             }
@@ -164,9 +171,10 @@ impl<'a> InferenceContext<'a> {
             Expr::Unsafe { id, statements, tail } => {
                 self.infer_block(tgt_expr, *id, statements, *tail, None, expected)
             }
-            Expr::Const { id, statements, tail } => {
+            Expr::Const(id) => {
                 self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
-                    this.infer_block(tgt_expr, *id, statements, *tail, None, expected)
+                    let (_, expr) = this.db.lookup_intern_anonymous_const(*id);
+                    this.infer_expr(expr, expected)
                 })
                 .1
             }
@@ -444,7 +452,7 @@ impl<'a> InferenceContext<'a> {
 
                         let arm_ty = self.infer_expr_inner(arm.expr, &expected);
                         all_arms_diverge &= self.diverges;
-                        coerce.coerce(self, Some(arm.expr), &arm_ty);
+                        coerce.coerce(self, Some(arm.expr), &arm_ty, CoercionCause::Expr(arm.expr));
                     }
 
                     self.diverges = matchee_diverges | all_arms_diverge;
@@ -492,7 +500,11 @@ impl<'a> InferenceContext<'a> {
                 match find_breakable(&mut self.breakables, label) {
                     Some(ctxt) => match ctxt.coerce.take() {
                         Some(mut coerce) => {
-                            coerce.coerce(self, expr, &val_ty);
+                            let cause = match expr {
+                                Some(expr) => CoercionCause::Expr(expr),
+                                None => CoercionCause::Expr(tgt_expr),
+                            };
+                            coerce.coerce(self, expr, &val_ty, cause);
 
                             // Avoiding borrowck
                             let ctxt = find_breakable(&mut self.breakables, label)
@@ -512,7 +524,7 @@ impl<'a> InferenceContext<'a> {
                 }
                 self.result.standard_types.never.clone()
             }
-            &Expr::Return { expr } => self.infer_expr_return(expr),
+            &Expr::Return { expr } => self.infer_expr_return(tgt_expr, expr),
             Expr::Yield { expr } => {
                 if let Some((resume_ty, yield_ty)) = self.resume_yield_tys.clone() {
                     if let Some(expr) = expr {
@@ -820,6 +832,20 @@ impl<'a> InferenceContext<'a> {
                     let array_type = TyKind::Array(byte_type, len).intern(Interner);
                     TyKind::Ref(Mutability::Not, static_lifetime(), array_type).intern(Interner)
                 }
+                Literal::CString(..) => TyKind::Ref(
+                    Mutability::Not,
+                    static_lifetime(),
+                    self.resolve_lang_item(LangItem::CStr)
+                        .and_then(LangItemTarget::as_struct)
+                        .map_or_else(
+                            || self.err_ty(),
+                            |strukt| {
+                                TyKind::Adt(AdtId(strukt.into()), Substitution::empty(Interner))
+                                    .intern(Interner)
+                            },
+                        ),
+                )
+                .intern(Interner),
                 Literal::Char(..) => TyKind::Scalar(Scalar::Char).intern(Interner),
                 Literal::Int(_v, ty) => match ty {
                     Some(int_ty) => {
@@ -908,7 +934,18 @@ impl<'a> InferenceContext<'a> {
         match fn_x {
             FnTrait::FnOnce => (),
             FnTrait::FnMut => {
-                if !matches!(derefed_callee.kind(Interner), TyKind::Ref(Mutability::Mut, _, _)) {
+                if let TyKind::Ref(Mutability::Mut, _, inner) = derefed_callee.kind(Interner) {
+                    if adjustments
+                        .last()
+                        .map(|x| matches!(x.kind, Adjust::Borrow(_)))
+                        .unwrap_or(true)
+                    {
+                        // prefer reborrow to move
+                        adjustments
+                            .push(Adjustment { kind: Adjust::Deref(None), target: inner.clone() });
+                        adjustments.push(Adjustment::borrow(Mutability::Mut, inner.clone()))
+                    }
+                } else {
                     adjustments.push(Adjustment::borrow(Mutability::Mut, derefed_callee.clone()));
                 }
             }
@@ -952,7 +989,7 @@ impl<'a> InferenceContext<'a> {
                 let mut coerce = CoerceMany::new(elem_ty);
                 for &expr in elements.iter() {
                     let cur_elem_ty = self.infer_expr_inner(expr, &expected);
-                    coerce.coerce(self, Some(expr), &cur_elem_ty);
+                    coerce.coerce(self, Some(expr), &cur_elem_ty, CoercionCause::Expr(expr));
                 }
                 (
                     coerce.complete(self),
@@ -997,18 +1034,18 @@ impl<'a> InferenceContext<'a> {
             .expected_ty();
         let return_expr_ty = self.infer_expr_inner(expr, &Expectation::HasType(ret_ty));
         let mut coerce_many = self.return_coercion.take().unwrap();
-        coerce_many.coerce(self, Some(expr), &return_expr_ty);
+        coerce_many.coerce(self, Some(expr), &return_expr_ty, CoercionCause::Expr(expr));
         self.return_coercion = Some(coerce_many);
     }
 
-    fn infer_expr_return(&mut self, expr: Option<ExprId>) -> Ty {
+    fn infer_expr_return(&mut self, ret: ExprId, expr: Option<ExprId>) -> Ty {
         match self.return_coercion {
             Some(_) => {
                 if let Some(expr) = expr {
                     self.infer_return(expr);
                 } else {
                     let mut coerce = self.return_coercion.take().unwrap();
-                    coerce.coerce_forced_unit(self);
+                    coerce.coerce_forced_unit(self, CoercionCause::Expr(ret));
                     self.return_coercion = Some(coerce);
                 }
             }

@@ -4,7 +4,9 @@ use ide_db::{
     defs::{Definition, IdentClass},
     helpers::pick_best_token,
     search::{FileReference, ReferenceCategory, SearchScope},
-    syntax_helpers::node_ext::{for_each_break_and_continue_expr, for_each_tail_expr, walk_expr},
+    syntax_helpers::node_ext::{
+        for_each_break_and_continue_expr, for_each_tail_expr, full_path_of_name_ref, walk_expr,
+    },
     FxHashSet, RootDatabase,
 };
 use syntax::{
@@ -39,11 +41,13 @@ pub struct HighlightRelatedConfig {
 // Highlights constructs related to the thing under the cursor:
 //
 // . if on an identifier, highlights all references to that identifier in the current file
+// .. additionally, if the identifier is a trait in a where clause, type parameter trait bound or use item, highlights all references to that trait's assoc items in the corresponding scope
 // . if on an `async` or `await token, highlights all yield points for that async context
 // . if on a `return` or `fn` keyword, `?` character or `->` return type arrow, highlights all exit points for that context
 // . if on a `break`, `loop`, `while` or `for` token, highlights all break points for that loop or block context
+// . if on a `move` or `|` token that belongs to a closure, highlights all captures of the closure.
 //
-// Note: `?` and `->` do not currently trigger this behavior in the VSCode editor.
+// Note: `?`, `|` and `->` do not currently trigger this behavior in the VSCode editor.
 pub(crate) fn highlight_related(
     sema: &Semantics<'_, RootDatabase>,
     config: HighlightRelatedConfig,
@@ -54,9 +58,10 @@ pub(crate) fn highlight_related(
 
     let token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
         T![?] => 4, // prefer `?` when the cursor is sandwiched like in `await$0?`
-        T![->] | T![|] => 3,
-        kind if kind.is_keyword() => 2,
-        IDENT | INT_NUMBER => 1,
+        T![->] => 4,
+        kind if kind.is_keyword() => 3,
+        IDENT | INT_NUMBER => 2,
+        T![|] => 1,
         _ => 0,
     })?;
     // most if not all of these should be re-implemented with information seeded from hir
@@ -129,7 +134,7 @@ fn highlight_references(
     token: SyntaxToken,
     file_id: FileId,
 ) -> Option<Vec<HighlightedRange>> {
-    let defs = find_defs(sema, token);
+    let defs = find_defs(sema, token.clone());
     let usages = defs
         .iter()
         .filter_map(|&d| {
@@ -144,6 +149,59 @@ fn highlight_references(
         .map(|FileReference { category, range, .. }| HighlightedRange { range, category });
     let mut res = FxHashSet::default();
     for &def in &defs {
+        // highlight trait usages
+        if let Definition::Trait(t) = def {
+            let trait_item_use_scope = (|| {
+                let name_ref = token.parent().and_then(ast::NameRef::cast)?;
+                let path = full_path_of_name_ref(&name_ref)?;
+                let parent = path.syntax().parent()?;
+                match_ast! {
+                    match parent {
+                        ast::UseTree(it) => it.syntax().ancestors().find(|it| {
+                            ast::SourceFile::can_cast(it.kind()) || ast::Module::can_cast(it.kind())
+                        }),
+                        ast::PathType(it) => it
+                            .syntax()
+                            .ancestors()
+                            .nth(2)
+                            .and_then(ast::TypeBoundList::cast)?
+                            .syntax()
+                            .parent()
+                            .filter(|it| ast::WhereClause::can_cast(it.kind()) || ast::TypeParam::can_cast(it.kind()))?
+                            .ancestors()
+                            .find(|it| {
+                                ast::Item::can_cast(it.kind())
+                            }),
+                        _ => None,
+                    }
+                }
+            })();
+            if let Some(trait_item_use_scope) = trait_item_use_scope {
+                res.extend(
+                    t.items_with_supertraits(sema.db)
+                        .into_iter()
+                        .filter_map(|item| {
+                            Definition::from(item)
+                                .usages(sema)
+                                .set_scope(Some(SearchScope::file_range(FileRange {
+                                    file_id,
+                                    range: trait_item_use_scope.text_range(),
+                                })))
+                                .include_self_refs()
+                                .all()
+                                .references
+                                .remove(&file_id)
+                        })
+                        .flatten()
+                        .map(|FileReference { category, range, .. }| HighlightedRange {
+                            range,
+                            category,
+                        }),
+                );
+            }
+        }
+
+        // highlight the defs themselves
         match def {
             Definition::Local(local) => {
                 let category = local.is_mut(sema.db).then_some(ReferenceCategory::Write);
@@ -635,6 +693,29 @@ pub async$0 fn foo() {
     }
 
     #[test]
+    fn test_hl_let_else_yield_points() {
+        check(
+            r#"
+pub async fn foo() {
+ // ^^^^^
+    let x = foo()
+        .await$0
+      // ^^^^^
+        .await;
+      // ^^^^^
+    || { 0.await };
+    let Some(_) = None else {
+        foo().await
+           // ^^^^^
+    };
+    (async { 0.await }).await
+                     // ^^^^^
+}
+"#,
+        );
+    }
+
+    #[test]
     fn test_hl_yield_nested_fn() {
         check(
             r#"
@@ -720,6 +801,26 @@ async fn foo() {
         return 0;
      // ^^^^^^
     }
+
+    0?;
+  // ^
+    0xDEAD_BEEF
+ // ^^^^^^^^^^^
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_hl_let_else_exit_points() {
+        check(
+            r#"
+  fn$0 foo() -> u32 {
+//^^
+    let Some(bar) = None else {
+        return 0;
+     // ^^^^^^
+    };
 
     0?;
   // ^
@@ -1475,6 +1576,47 @@ fn f() {
     //  ^
     let c = move$0 |y| x + y;
     //               ^ read
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_trait_highlights_assoc_item_uses() {
+        check(
+            r#"
+trait Foo {
+    //^^^
+    type T;
+    const C: usize;
+    fn f() {}
+    fn m(&self) {}
+}
+impl Foo for i32 {
+   //^^^
+    type T = i32;
+    const C: usize = 0;
+    fn f() {}
+    fn m(&self) {}
+}
+fn f<T: Foo$0>(t: T) {
+      //^^^
+    let _: T::T;
+            //^
+    t.m();
+    //^
+    T::C;
+     //^
+    T::f();
+     //^
+}
+
+fn f2<T: Foo>(t: T) {
+       //^^^
+    let _: T::T;
+    t.m();
+    T::C;
+    T::f();
 }
 "#,
         );

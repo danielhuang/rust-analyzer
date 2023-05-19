@@ -362,6 +362,8 @@ pub mod known {
         gt,
         le,
         lt,
+        // known fields of lang items
+        pieces,
         // lang items
         add_assign,
         add,
@@ -376,6 +378,7 @@ pub mod known {
         deref,
         div_assign,
         div,
+        drop,
         fn_mut,
         fn_once,
         future_trait,

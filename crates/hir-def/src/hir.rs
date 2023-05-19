@@ -26,7 +26,7 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     path::{GenericArgs, Path},
     type_ref::{Mutability, Rawness, TypeRef},
-    BlockId,
+    AnonymousConstId, BlockId,
 };
 
 pub use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp};
@@ -85,6 +85,7 @@ impl fmt::Display for FloatTypeWrapper {
 pub enum Literal {
     String(Box<str>),
     ByteString(Box<[u8]>),
+    CString(Box<str>),
     Char(char),
     Bool(bool),
     Int(i128, Option<BuiltinInt>),
@@ -135,6 +136,10 @@ impl From<ast::LiteralKind> for Literal {
                 let text = s.value().map(Box::from).unwrap_or_else(Default::default);
                 Literal::String(text)
             }
+            LiteralKind::CString(s) => {
+                let text = s.value().map(Box::from).unwrap_or_else(Default::default);
+                Literal::CString(text)
+            }
             LiteralKind::Byte(b) => {
                 Literal::Uint(b.value().unwrap_or_default() as u128, Some(BuiltinUint::U8))
             }
@@ -169,11 +174,7 @@ pub enum Expr {
         statements: Box<[Statement]>,
         tail: Option<ExprId>,
     },
-    Const {
-        id: Option<BlockId>,
-        statements: Box<[Statement]>,
-        tail: Option<ExprId>,
-    },
+    Const(AnonymousConstId),
     Unsafe {
         id: Option<BlockId>,
         statements: Box<[Statement]>,
@@ -355,10 +356,10 @@ impl Expr {
             Expr::Let { expr, .. } => {
                 f(*expr);
             }
+            Expr::Const(_) => (),
             Expr::Block { statements, tail, .. }
             | Expr::Unsafe { statements, tail, .. }
-            | Expr::Async { statements, tail, .. }
-            | Expr::Const { statements, tail, .. } => {
+            | Expr::Async { statements, tail, .. } => {
                 for stmt in statements.iter() {
                     match stmt {
                         Statement::Let { initializer, else_branch, .. } => {

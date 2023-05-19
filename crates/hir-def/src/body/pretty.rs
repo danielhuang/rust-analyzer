@@ -61,6 +61,17 @@ pub(super) fn print_body_hir(db: &dyn DefDatabase, body: &Body, owner: DefWithBo
     p.buf
 }
 
+pub(super) fn print_expr_hir(
+    _db: &dyn DefDatabase,
+    body: &Body,
+    _owner: DefWithBodyId,
+    expr: ExprId,
+) -> String {
+    let mut p = Printer { body, buf: String::new(), indent_level: 0, needs_indent: false };
+    p.print_expr(expr);
+    p.buf
+}
+
 macro_rules! w {
     ($dst:expr, $($arg:tt)*) => {
         { let _ = write!($dst, $($arg)*); }
@@ -436,8 +447,8 @@ impl<'a> Printer<'a> {
             Expr::Async { id: _, statements, tail } => {
                 self.print_block(Some("async "), statements, tail);
             }
-            Expr::Const { id: _, statements, tail } => {
-                self.print_block(Some("const "), statements, tail);
+            Expr::Const(id) => {
+                w!(self, "const {{ /* {id:?} */ }}");
             }
         }
     }
@@ -611,6 +622,7 @@ impl<'a> Printer<'a> {
         match literal {
             Literal::String(it) => w!(self, "{:?}", it),
             Literal::ByteString(it) => w!(self, "\"{}\"", it.escape_ascii()),
+            Literal::CString(it) => w!(self, "\"{}\\0\"", it),
             Literal::Char(it) => w!(self, "'{}'", it.escape_debug()),
             Literal::Bool(it) => w!(self, "{}", it),
             Literal::Int(i, suffix) => {
