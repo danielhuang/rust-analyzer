@@ -24,33 +24,21 @@ use crate::{
     rustc_cfg,
     sysroot::SysrootCrate,
     target_data_layout, utf8_stdout, CargoConfig, CargoWorkspace, InvocationStrategy, ManifestPath,
-    Package, ProjectJson, ProjectManifest, Sysroot, TargetKind, WorkspaceBuildScripts,
+    Package, ProjectJson, ProjectManifest, Sysroot, TargetData, TargetKind, WorkspaceBuildScripts,
 };
 
 /// A set of cfg-overrides per crate.
-///
-/// `Wildcard(..)` is useful e.g. disabling `#[cfg(test)]` on all crates,
-/// without having to first obtain a list of all crates.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum CfgOverrides {
-    /// A single global set of overrides matching all crates.
-    Wildcard(CfgDiff),
+#[derive(Default, Debug, Clone, Eq, PartialEq)]
+pub struct CfgOverrides {
+    /// A global set of overrides matching all crates.
+    pub global: CfgDiff,
     /// A set of overrides matching specific crates.
-    Selective(FxHashMap<String, CfgDiff>),
-}
-
-impl Default for CfgOverrides {
-    fn default() -> Self {
-        Self::Selective(FxHashMap::default())
-    }
+    pub selective: FxHashMap<String, CfgDiff>,
 }
 
 impl CfgOverrides {
     pub fn len(&self) -> usize {
-        match self {
-            CfgOverrides::Wildcard(_) => 1,
-            CfgOverrides::Selective(hash_map) => hash_map.len(),
-        }
+        self.global.len() + self.selective.iter().map(|(_, it)| it.len()).sum::<usize>()
     }
 }
 
@@ -292,7 +280,7 @@ impl ProjectWorkspace {
                 let rustc_cfg =
                     rustc_cfg::get(Some(&cargo_toml), config.target.as_deref(), &config.extra_env);
 
-                let cfg_overrides = config.cfg_overrides();
+                let cfg_overrides = config.cfg_overrides.clone();
                 let data_layout = target_data_layout::get(
                     Some(&cargo_toml),
                     config.target.as_deref(),
@@ -886,12 +874,10 @@ fn cargo_to_crate_graph(
                 cfg_options.insert_atom("test".into());
             }
 
-            let overrides = match override_cfg {
-                CfgOverrides::Wildcard(cfg_diff) => Some(cfg_diff),
-                CfgOverrides::Selective(cfg_overrides) => cfg_overrides.get(&cargo[pkg].name),
+            if !override_cfg.global.is_empty() {
+                cfg_options.apply_diff(override_cfg.global.clone());
             };
-
-            if let Some(overrides) = overrides {
+            if let Some(diff) = override_cfg.selective.get(&cargo[pkg].name) {
                 // FIXME: this is sort of a hack to deal with #![cfg(not(test))] vanishing such as seen
                 // in ed25519_dalek (#7243), and libcore (#9203) (although you only hit that one while
                 // working on rust-lang/rust as that's the only time it appears outside sysroot).
@@ -899,7 +885,7 @@ fn cargo_to_crate_graph(
                 // A more ideal solution might be to reanalyze crates based on where the cursor is and
                 // figure out the set of cfgs that would have to apply to make it active.
 
-                cfg_options.apply_diff(overrides.clone());
+                cfg_options.apply_diff(diff.clone());
             };
             cfg_options
         });
@@ -914,7 +900,24 @@ fn cargo_to_crate_graph(
                 // https://github.com/rust-lang/rust-analyzer/issues/11300
                 continue;
             }
-            let Some(file_id) =  load(&cargo[tgt].root) else { continue };
+            let &TargetData { ref name, kind, is_proc_macro, ref root, .. } = &cargo[tgt];
+
+            if kind == TargetKind::Lib
+                && sysroot.map_or(false, |sysroot| root.starts_with(sysroot.src_root()))
+            {
+                if let Some(&(_, crate_id, _)) =
+                    public_deps.deps.iter().find(|(dep_name, ..)| dep_name.as_smol_str() == name)
+                {
+                    pkg_crates.entry(pkg).or_insert_with(Vec::new).push((crate_id, kind));
+
+                    lib_tgt = Some((crate_id, name.clone()));
+                    pkg_to_lib_crate.insert(pkg, crate_id);
+                    // sysroot is inside the workspace, prevent the sysroot crates from being duplicated here
+                    continue;
+                }
+            }
+
+            let Some(file_id) = load(root) else { continue };
 
             let crate_id = add_target_crate_root(
                 crate_graph,
@@ -923,23 +926,23 @@ fn cargo_to_crate_graph(
                 build_scripts.get_output(pkg),
                 cfg_options.clone(),
                 file_id,
-                &cargo[tgt].name,
-                cargo[tgt].is_proc_macro,
+                name,
+                is_proc_macro,
                 target_layout.clone(),
                 false,
                 channel,
             );
-            if cargo[tgt].kind == TargetKind::Lib {
-                lib_tgt = Some((crate_id, cargo[tgt].name.clone()));
+            if kind == TargetKind::Lib {
+                lib_tgt = Some((crate_id, name.clone()));
                 pkg_to_lib_crate.insert(pkg, crate_id);
             }
             // Even crates that don't set proc-macro = true are allowed to depend on proc_macro
             // (just none of the APIs work when called outside of a proc macro).
             if let Some(proc_macro) = libproc_macro {
-                add_proc_macro_dep(crate_graph, crate_id, proc_macro, cargo[tgt].is_proc_macro);
+                add_proc_macro_dep(crate_graph, crate_id, proc_macro, is_proc_macro);
             }
 
-            pkg_crates.entry(pkg).or_insert_with(Vec::new).push((crate_id, cargo[tgt].kind));
+            pkg_crates.entry(pkg).or_insert_with(Vec::new).push((crate_id, kind));
         }
 
         // Set deps to the core, std and to the lib target of the current package
@@ -1109,14 +1112,10 @@ fn handle_rustc_crates(
 
             let mut cfg_options = cfg_options.clone();
 
-            let overrides = match override_cfg {
-                CfgOverrides::Wildcard(cfg_diff) => Some(cfg_diff),
-                CfgOverrides::Selective(cfg_overrides) => {
-                    cfg_overrides.get(&rustc_workspace[pkg].name)
-                }
+            if !override_cfg.global.is_empty() {
+                cfg_options.apply_diff(override_cfg.global.clone());
             };
-
-            if let Some(overrides) = overrides {
+            if let Some(diff) = override_cfg.selective.get(&rustc_workspace[pkg].name) {
                 // FIXME: this is sort of a hack to deal with #![cfg(not(test))] vanishing such as seen
                 // in ed25519_dalek (#7243), and libcore (#9203) (although you only hit that one while
                 // working on rust-lang/rust as that's the only time it appears outside sysroot).
@@ -1124,7 +1123,7 @@ fn handle_rustc_crates(
                 // A more ideal solution might be to reanalyze crates based on where the cursor is and
                 // figure out the set of cfgs that would have to apply to make it active.
 
-                cfg_options.apply_diff(overrides.clone());
+                cfg_options.apply_diff(diff.clone());
             };
 
             for &tgt in rustc_workspace[pkg].targets.iter() {
@@ -1403,6 +1402,12 @@ fn handle_hack_cargo_workspace(
             })
             .unwrap();
         crate_graph.remove_and_replace(fake, original).unwrap();
+    }
+    for (_, c) in crate_graph.iter_mut() {
+        if c.origin.is_local() {
+            // LangCrateOrigin::Other is good enough for a hack.
+            c.origin = CrateOrigin::Lang(LangCrateOrigin::Other);
+        }
     }
     sysroot
         .crates()

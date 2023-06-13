@@ -41,10 +41,15 @@ use stdx::{always, never};
 use triomphe::Arc;
 
 use crate::{
-    db::HirDatabase, fold_tys, infer::coerce::CoerceMany, lower::ImplTraitLoweringMode,
-    static_lifetime, to_assoc_type_id, traits::FnTrait, AliasEq, AliasTy, ClosureId, DomainGoal,
-    GenericArg, Goal, ImplTraitId, InEnvironment, Interner, ProjectionTy, RpitId, Substitution,
-    TraitEnvironment, TraitRef, Ty, TyBuilder, TyExt,
+    db::HirDatabase,
+    fold_tys,
+    infer::coerce::CoerceMany,
+    lower::ImplTraitLoweringMode,
+    static_lifetime, to_assoc_type_id,
+    traits::FnTrait,
+    utils::{InTypeConstIdMetadata, UnevaluatedConstEvaluatorFolder},
+    AliasEq, AliasTy, ClosureId, DomainGoal, GenericArg, Goal, ImplTraitId, InEnvironment,
+    Interner, ProjectionTy, RpitId, Substitution, TraitEnvironment, TraitRef, Ty, TyBuilder, TyExt,
 };
 
 // This lint has a false positive here. See the link below for details.
@@ -101,6 +106,16 @@ pub(crate) fn infer_query(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<Infer
                     }),
                 },
             });
+        }
+        DefWithBodyId::InTypeConstId(c) => {
+            // FIXME(const-generic-body): We should not get the return type in this way.
+            ctx.return_ty = c
+                .lookup(db.upcast())
+                .thing
+                .box_any()
+                .downcast::<InTypeConstIdMetadata>()
+                .unwrap()
+                .0;
         }
     }
 
@@ -214,6 +229,10 @@ pub enum InferenceDiagnostic {
     ExpectedFunction {
         call_expr: ExprId,
         found: Ty,
+    },
+    TypedHole {
+        expr: ExprId,
+        expected: Ty,
     },
 }
 
@@ -363,6 +382,10 @@ pub enum PointerCast {
 }
 
 /// The result of type inference: A mapping from expressions and patterns to types.
+///
+/// When you add a field that stores types (including `Substitution` and the like), don't forget
+/// `resolve_completely()`'ing  them in `InferenceContext::resolve_all()`. Inference variables must
+/// not appear in the final inference result.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct InferenceResult {
     /// For each method call expr, records the function it resolves to.
@@ -572,6 +595,30 @@ impl<'a> InferenceContext<'a> {
     // there is no problem in it being `pub(crate)`, remove this comment.
     pub(crate) fn resolve_all(self) -> InferenceResult {
         let InferenceContext { mut table, mut result, .. } = self;
+        // Destructure every single field so whenever new fields are added to `InferenceResult` we
+        // don't forget to handle them here.
+        let InferenceResult {
+            method_resolutions,
+            field_resolutions: _,
+            variant_resolutions: _,
+            assoc_resolutions,
+            diagnostics,
+            type_of_expr,
+            type_of_pat,
+            type_of_binding,
+            type_of_rpit,
+            type_of_for_iterator,
+            type_mismatches,
+            standard_types: _,
+            pat_adjustments,
+            binding_modes: _,
+            expr_adjustments,
+            // Types in `closure_info` have already been `resolve_completely()`'d during
+            // `InferenceContext::infer_closures()` (in `HirPlace::ty()` specifically), so no need
+            // to resolve them here.
+            closure_info: _,
+            mutated_bindings_in_closure: _,
+        } = &mut result;
 
         table.fallback_if_possible();
 
@@ -580,62 +627,63 @@ impl<'a> InferenceContext<'a> {
 
         // make sure diverging type variables are marked as such
         table.propagate_diverging_flag();
-        for ty in result.type_of_expr.values_mut() {
+        for ty in type_of_expr.values_mut() {
             *ty = table.resolve_completely(ty.clone());
         }
-        for ty in result.type_of_pat.values_mut() {
+        for ty in type_of_pat.values_mut() {
             *ty = table.resolve_completely(ty.clone());
         }
-        for ty in result.type_of_binding.values_mut() {
+        for ty in type_of_binding.values_mut() {
             *ty = table.resolve_completely(ty.clone());
         }
-        for ty in result.type_of_rpit.values_mut() {
+        for ty in type_of_rpit.values_mut() {
             *ty = table.resolve_completely(ty.clone());
         }
-        for ty in result.type_of_for_iterator.values_mut() {
+        for ty in type_of_for_iterator.values_mut() {
             *ty = table.resolve_completely(ty.clone());
         }
-        for mismatch in result.type_mismatches.values_mut() {
+        for mismatch in type_mismatches.values_mut() {
             mismatch.expected = table.resolve_completely(mismatch.expected.clone());
             mismatch.actual = table.resolve_completely(mismatch.actual.clone());
         }
-        result.diagnostics.retain_mut(|diagnostic| {
-            if let InferenceDiagnostic::ExpectedFunction { found: ty, .. }
-            | InferenceDiagnostic::UnresolvedField { receiver: ty, .. }
-            | InferenceDiagnostic::UnresolvedMethodCall { receiver: ty, .. } = diagnostic
-            {
-                *ty = table.resolve_completely(ty.clone());
-                // FIXME: Remove this when we are on par with rustc in terms of inference
-                if ty.contains_unknown() {
-                    return false;
-                }
+        diagnostics.retain_mut(|diagnostic| {
+            use InferenceDiagnostic::*;
+            match diagnostic {
+                ExpectedFunction { found: ty, .. }
+                | UnresolvedField { receiver: ty, .. }
+                | UnresolvedMethodCall { receiver: ty, .. } => {
+                    *ty = table.resolve_completely(ty.clone());
+                    // FIXME: Remove this when we are on par with rustc in terms of inference
+                    if ty.contains_unknown() {
+                        return false;
+                    }
 
-                if let InferenceDiagnostic::UnresolvedMethodCall { field_with_same_name, .. } =
-                    diagnostic
-                {
-                    let clear = if let Some(ty) = field_with_same_name {
-                        *ty = table.resolve_completely(ty.clone());
-                        ty.contains_unknown()
-                    } else {
-                        false
-                    };
-                    if clear {
-                        *field_with_same_name = None;
+                    if let UnresolvedMethodCall { field_with_same_name, .. } = diagnostic {
+                        if let Some(ty) = field_with_same_name {
+                            *ty = table.resolve_completely(ty.clone());
+                            if ty.contains_unknown() {
+                                *field_with_same_name = None;
+                            }
+                        }
                     }
                 }
+                TypedHole { expected: ty, .. } => {
+                    *ty = table.resolve_completely(ty.clone());
+                }
+                _ => (),
             }
             true
         });
-        for (_, subst) in result.method_resolutions.values_mut() {
+        for (_, subst) in method_resolutions.values_mut() {
             *subst = table.resolve_completely(subst.clone());
         }
-        for (_, subst) in result.assoc_resolutions.values_mut() {
+        for (_, subst) in assoc_resolutions.values_mut() {
             *subst = table.resolve_completely(subst.clone());
         }
-        for adjustment in result.expr_adjustments.values_mut().flatten() {
+        for adjustment in expr_adjustments.values_mut().flatten() {
             adjustment.target = table.resolve_completely(adjustment.target.clone());
         }
-        for adjustment in result.pat_adjustments.values_mut().flatten() {
+        for adjustment in pat_adjustments.values_mut().flatten() {
             *adjustment = table.resolve_completely(adjustment.clone());
         }
         result
@@ -651,7 +699,7 @@ impl<'a> InferenceContext<'a> {
 
     fn collect_fn(&mut self, func: FunctionId) {
         let data = self.db.function_data(func);
-        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver)
+        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver, func.into())
             .with_impl_trait_mode(ImplTraitLoweringMode::Param);
         let mut param_tys =
             data.params.iter().map(|type_ref| ctx.lower_ty(type_ref)).collect::<Vec<_>>();
@@ -675,7 +723,7 @@ impl<'a> InferenceContext<'a> {
         }
         let return_ty = &*data.ret_type;
 
-        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver)
+        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver, self.owner.into())
             .with_impl_trait_mode(ImplTraitLoweringMode::Opaque);
         let return_ty = ctx.lower_ty(return_ty);
         let return_ty = self.insert_type_vars(return_ty);
@@ -790,7 +838,7 @@ impl<'a> InferenceContext<'a> {
     }
 
     fn make_ty(&mut self, type_ref: &TypeRef) -> Ty {
-        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver);
+        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver, self.owner.into());
         let ty = ctx.lower_ty(type_ref);
         let ty = self.insert_type_vars(ty);
         self.normalize_associated_types_in(ty)
@@ -817,7 +865,21 @@ impl<'a> InferenceContext<'a> {
     }
 
     fn unify(&mut self, ty1: &Ty, ty2: &Ty) -> bool {
-        self.table.unify(ty1, ty2)
+        let ty1 = ty1
+            .clone()
+            .try_fold_with(
+                &mut UnevaluatedConstEvaluatorFolder { db: self.db },
+                DebruijnIndex::INNERMOST,
+            )
+            .unwrap();
+        let ty2 = ty2
+            .clone()
+            .try_fold_with(
+                &mut UnevaluatedConstEvaluatorFolder { db: self.db },
+                DebruijnIndex::INNERMOST,
+            )
+            .unwrap();
+        self.table.unify(&ty1, &ty2)
     }
 
     /// Attempts to returns the deeply last field of nested structures, but
@@ -940,7 +1002,7 @@ impl<'a> InferenceContext<'a> {
             Some(path) => path,
             None => return (self.err_ty(), None),
         };
-        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver);
+        let ctx = crate::lower::TyLoweringContext::new(self.db, &self.resolver, self.owner.into());
         let (resolution, unresolved) = if value_ns {
             match self.resolver.resolve_path_in_value_ns(self.db.upcast(), path) {
                 Some(ResolveValueResult::ValueNs(value)) => match value {
@@ -1146,22 +1208,6 @@ impl<'a> InferenceContext<'a> {
     fn resolve_lang_item(&self, item: LangItem) -> Option<LangItemTarget> {
         let krate = self.resolver.krate();
         self.db.lang_item(krate, item)
-    }
-
-    fn resolve_into_iter_item(&self) -> Option<TypeAliasId> {
-        let ItemContainerId::TraitId(trait_) = self.resolve_lang_item(LangItem::IntoIterIntoIter)?
-            .as_function()?
-            .lookup(self.db.upcast()).container
-        else { return None };
-        self.db.trait_data(trait_).associated_type_by_name(&name![IntoIter])
-    }
-
-    fn resolve_iterator_item(&self) -> Option<TypeAliasId> {
-        let ItemContainerId::TraitId(trait_) = self.resolve_lang_item(LangItem::IteratorNext)?
-            .as_function()?
-            .lookup(self.db.upcast()).container
-        else { return None };
-        self.db.trait_data(trait_).associated_type_by_name(&name![Item])
     }
 
     fn resolve_output_on(&self, trait_: TraitId) -> Option<TypeAliasId> {

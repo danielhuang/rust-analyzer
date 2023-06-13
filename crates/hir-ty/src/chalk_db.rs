@@ -365,13 +365,19 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
 
     fn trait_name(&self, trait_id: chalk_ir::TraitId<Interner>) -> String {
         let id = from_chalk_trait_id(trait_id);
-        self.db.trait_data(id).name.to_string()
+        self.db.trait_data(id).name.display(self.db.upcast()).to_string()
     }
     fn adt_name(&self, chalk_ir::AdtId(adt_id): AdtId) -> String {
         match adt_id {
-            hir_def::AdtId::StructId(id) => self.db.struct_data(id).name.to_string(),
-            hir_def::AdtId::EnumId(id) => self.db.enum_data(id).name.to_string(),
-            hir_def::AdtId::UnionId(id) => self.db.union_data(id).name.to_string(),
+            hir_def::AdtId::StructId(id) => {
+                self.db.struct_data(id).name.display(self.db.upcast()).to_string()
+            }
+            hir_def::AdtId::EnumId(id) => {
+                self.db.enum_data(id).name.display(self.db.upcast()).to_string()
+            }
+            hir_def::AdtId::UnionId(id) => {
+                self.db.union_data(id).name.display(self.db.upcast()).to_string()
+            }
         }
     }
     fn adt_size_align(&self, _id: chalk_ir::AdtId<Interner>) -> Arc<rust_ir::AdtSizeAlign> {
@@ -380,7 +386,7 @@ impl<'a> chalk_solve::RustIrDatabase<Interner> for ChalkContext<'a> {
     }
     fn assoc_type_name(&self, assoc_ty_id: chalk_ir::AssocTypeId<Interner>) -> String {
         let id = self.db.associated_ty_data(assoc_ty_id).name;
-        self.db.type_alias_data(id).name.to_string()
+        self.db.type_alias_data(id).name.display(self.db.upcast()).to_string()
     }
     fn opaque_type_name(&self, opaque_ty_id: chalk_ir::OpaqueTyId<Interner>) -> String {
         format!("Opaque_{}", opaque_ty_id.0)
@@ -491,7 +497,7 @@ pub(crate) fn associated_ty_data_query(
     let generic_params = generics(db.upcast(), type_alias.into());
     // let bound_vars = generic_params.bound_vars_subst(DebruijnIndex::INNERMOST);
     let resolver = hir_def::resolver::HasResolver::resolver(type_alias, db.upcast());
-    let ctx = crate::TyLoweringContext::new(db, &resolver)
+    let ctx = crate::TyLoweringContext::new(db, &resolver, type_alias.into())
         .with_type_param_mode(crate::lower::ParamLoweringMode::Variable);
 
     let trait_subst = TyBuilder::subst_for_def(db, trait_, None)

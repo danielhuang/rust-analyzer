@@ -18,7 +18,8 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Diagno
         let use_range = d.span.value.text_range();
         for source in d.local.sources(ctx.sema.db) {
             let Some(ast) = source.name() else { continue };
-            edit_builder.insert(ast.syntax().text_range().start(), "mut ".to_string());
+            // FIXME: macros
+            edit_builder.insert(ast.value.syntax().text_range().start(), "mut ".to_string());
         }
         let edit = edit_builder.finish();
         Some(vec![fix(
@@ -30,7 +31,10 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Diagno
     })();
     Diagnostic::new(
         "need-mut",
-        format!("cannot mutate immutable variable `{}`", d.local.name(ctx.sema.db)),
+        format!(
+            "cannot mutate immutable variable `{}`",
+            d.local.name(ctx.sema.db).display(ctx.sema.db)
+        ),
         ctx.sema.diagnostics_display_range(d.span.clone()).range,
     )
     .with_fixes(fixes)
@@ -350,6 +354,32 @@ fn main() {
     }
 
     #[test]
+    fn match_closure_capture() {
+        check_diagnostics(
+            r#"
+//- minicore: option
+fn main() {
+    let mut v = &mut Some(2);
+      //^^^^^ 💡 weak: variable does not need to be mutable
+    let _ = || match v {
+        Some(k) => {
+            *k = 5;
+        }
+        None => {}
+    };
+    let v = &mut Some(2);
+    let _ = || match v {
+                   //^ 💡 error: cannot mutate immutable variable `v`
+        ref mut k => {
+            *k = &mut Some(5);
+        }
+    };
+}
+"#,
+        );
+    }
+
+    #[test]
     fn match_bindings() {
         check_diagnostics(
             r#"
@@ -486,6 +516,38 @@ fn main() {
         );
         check_diagnostics(
             r#"
+fn check(_: i32) -> bool {
+    false
+}
+fn main() {
+    loop {
+        let x = 1;
+        if check(x) {
+            break;
+        }
+        let y = (1, 2);
+        if check(y.1) {
+            return;
+        }
+        let z = (1, 2);
+        match z {
+            (k @ 5, ref mut t) if { continue; } => {
+                  //^^^^^^^^^ 💡 error: cannot mutate immutable variable `z`
+                *t = 5;
+            }
+            _ => {
+                let y = (1, 2);
+                if check(y.1) {
+                    return;
+                }
+            }
+        }
+    }
+}
+"#,
+        );
+        check_diagnostics(
+            r#"
 fn f(_: i32) {}
 fn main() {
     loop {
@@ -559,15 +621,50 @@ fn f((x, y): (i32, i32)) {
     }
 
     #[test]
+    fn no_diagnostics_in_case_of_multiple_bounds() {
+        check_diagnostics(
+            r#"
+fn f() {
+    let (b, a, b) = (2, 3, 5);
+    a = 8;
+  //^^^^^ 💡 error: cannot mutate immutable variable `a`
+}
+"#,
+        );
+    }
+
+    #[test]
     fn for_loop() {
         check_diagnostics(
             r#"
-//- minicore: iterators
+//- minicore: iterators, copy
 fn f(x: [(i32, u8); 10]) {
     for (a, mut b) in x {
           //^^^^^ 💡 weak: variable does not need to be mutable
         a = 2;
       //^^^^^ 💡 error: cannot mutate immutable variable `a`
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn while_let() {
+        check_diagnostics(
+            r#"
+//- minicore: iterators, copy
+fn f(x: [(i32, u8); 10]) {
+    let mut it = x.into_iter();
+    while let Some((a, mut b)) = it.next() {
+                     //^^^^^ 💡 weak: variable does not need to be mutable
+        while let Some((c, mut d)) = it.next() {
+                         //^^^^^ 💡 weak: variable does not need to be mutable
+            a = 2;
+          //^^^^^ 💡 error: cannot mutate immutable variable `a`
+            c = 2;
+          //^^^^^ 💡 error: cannot mutate immutable variable `c`
+        }
     }
 }
 "#,
@@ -893,6 +990,79 @@ fn f() {
                   //^^^^^^^^ 💡 error: cannot mutate immutable variable `closure1`
         }
                     "#,
+        );
+    }
+
+    #[test]
+    fn slice_pattern() {
+        check_diagnostics(
+            r#"
+//- minicore: coerce_unsized, deref_mut, slice, copy
+fn x(t: &[u8]) {
+    match t {
+        &[a, mut b] | &[a, _, mut b] => {
+           //^^^^^ 💡 weak: variable does not need to be mutable
+
+            a = 2;
+          //^^^^^ 💡 error: cannot mutate immutable variable `a`
+
+        }
+        _ => {}
+    }
+}
+            "#,
+        );
+    }
+
+    #[test]
+    fn boxes() {
+        check_diagnostics(
+            r#"
+//- minicore: coerce_unsized, deref_mut, slice
+use core::ops::{Deref, DerefMut};
+use core::{marker::Unsize, ops::CoerceUnsized};
+
+#[lang = "owned_box"]
+pub struct Box<T: ?Sized> {
+    inner: *mut T,
+}
+impl<T> Box<T> {
+    fn new(t: T) -> Self {
+        #[rustc_box]
+        Box::new(t)
+    }
+}
+
+impl<T: ?Sized> Deref for Box<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &**self
+    }
+}
+
+impl<T: ?Sized> DerefMut for Box<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut **self
+    }
+}
+
+fn f() {
+    let x = Box::new(5);
+    x = Box::new(7);
+  //^^^^^^^^^^^^^^^ 💡 error: cannot mutate immutable variable `x`
+    let x = Box::new(5);
+    *x = 7;
+  //^^^^^^ 💡 error: cannot mutate immutable variable `x`
+    let mut y = Box::new(5);
+      //^^^^^ 💡 weak: variable does not need to be mutable
+    *x = *y;
+  //^^^^^^^ 💡 error: cannot mutate immutable variable `x`
+    let x = Box::new(5);
+    let closure = || *x = 2;
+                    //^ 💡 error: cannot mutate immutable variable `x`
+}
+"#,
         );
     }
 

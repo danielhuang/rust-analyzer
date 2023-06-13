@@ -9,11 +9,12 @@
 
 use std::{fmt, iter, ops::Not, path::PathBuf};
 
+use cfg::{CfgAtom, CfgDiff};
 use flycheck::FlycheckConfig;
 use ide::{
     AssistConfig, CallableSnippets, CompletionConfig, DiagnosticsConfig, ExprFillDefaultMode,
     HighlightConfig, HighlightRelatedConfig, HoverConfig, HoverDocFormat, InlayHintsConfig,
-    JoinLinesConfig, Snippet, SnippetScope,
+    JoinLinesConfig, MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind, Snippet, SnippetScope,
 };
 use ide_db::{
     imports::insert_use::{ImportGranularity, InsertUseConfig, PrefixKind},
@@ -23,7 +24,6 @@ use itertools::Itertools;
 use lsp_types::{ClientCapabilities, MarkupKind};
 use project_model::{
     CargoConfig, CargoFeatures, ProjectJson, ProjectJsonData, ProjectManifest, RustLibSource,
-    UnsetTestCrates,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{de::DeserializeOwned, Deserialize};
@@ -101,6 +101,8 @@ config_data! {
         /// Use `RUSTC_WRAPPER=rust-analyzer` when running build scripts to
         /// avoid checking unnecessary things.
         cargo_buildScripts_useRustcWrapper: bool = "true",
+        /// List of cfg options to enable with the given values.
+        cargo_cfgs: FxHashMap<String, String> = "{}",
         /// Extra arguments that are passed to every cargo invocation.
         cargo_extraArgs: Vec<String> = "[]",
         /// Extra environment variables that will be set when running cargo, rustc
@@ -128,7 +130,7 @@ config_data! {
         // FIXME(@poliorcetics): move to multiple targets here too, but this will need more work
         // than `checkOnSave_target`
         cargo_target: Option<String>     = "null",
-        /// Unsets `#[cfg(test)]` for the specified crates.
+        /// Unsets the implicit `#[cfg(test)]` for the specified crates.
         cargo_unsetTest: Vec<String>     = "[\"core\"]",
 
         /// Run the check command for diagnostics on save.
@@ -315,8 +317,16 @@ config_data! {
         hover_documentation_keywords_enable: bool  = "true",
         /// Use markdown syntax for links on hover.
         hover_links_enable: bool = "true",
+        /// How to render the align information in a memory layout hover.
+        hover_memoryLayout_alignment: Option<MemoryLayoutHoverRenderKindDef> = "\"hexadecimal\"",
         /// Whether to show memory layout data on hover.
         hover_memoryLayout_enable: bool = "true",
+        /// How to render the niche information in a memory layout hover.
+        hover_memoryLayout_niches: Option<bool> = "false",
+        /// How to render the offset information in a memory layout hover.
+        hover_memoryLayout_offset: Option<MemoryLayoutHoverRenderKindDef> = "\"hexadecimal\"",
+        /// How to render the size information in a memory layout hover.
+        hover_memoryLayout_size: Option<MemoryLayoutHoverRenderKindDef> = "\"both\"",
 
         /// Whether to enforce the import granularity setting for all files. If set to false rust-analyzer will try to keep import styles consistent per file.
         imports_granularity_enforce: bool              = "false",
@@ -720,11 +730,11 @@ pub struct ClientCommandsConfig {
 }
 
 #[derive(Debug)]
-pub struct ConfigUpdateError {
+pub struct ConfigError {
     errors: Vec<(String, serde_json::Error)>,
 }
 
-impl fmt::Display for ConfigUpdateError {
+impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let errors = self.errors.iter().format_with("\n", |(key, e), f| {
             f(key)?;
@@ -733,8 +743,7 @@ impl fmt::Display for ConfigUpdateError {
         });
         write!(
             f,
-            "rust-analyzer found {} invalid config value{}:\n{}",
-            self.errors.len(),
+            "invalid config value{}:\n{}",
             if self.errors.len() == 1 { "" } else { "s" },
             errors
         )
@@ -777,7 +786,7 @@ impl Config {
         self.workspace_roots.extend(paths);
     }
 
-    pub fn update(&mut self, mut json: serde_json::Value) -> Result<(), ConfigUpdateError> {
+    pub fn update(&mut self, mut json: serde_json::Value) -> Result<(), ConfigError> {
         tracing::info!("updating config from JSON: {:#}", json);
         if json.is_null() || json.as_object().map_or(false, |it| it.is_empty()) {
             return Ok(());
@@ -824,7 +833,7 @@ impl Config {
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(ConfigUpdateError { errors })
+            Err(ConfigError { errors })
         }
     }
 
@@ -1190,7 +1199,34 @@ impl Config {
             sysroot,
             sysroot_src,
             rustc_source,
-            unset_test_crates: UnsetTestCrates::Only(self.data.cargo_unsetTest.clone()),
+            cfg_overrides: project_model::CfgOverrides {
+                global: CfgDiff::new(
+                    self.data
+                        .cargo_cfgs
+                        .iter()
+                        .map(|(key, val)| {
+                            if val.is_empty() {
+                                CfgAtom::Flag(key.into())
+                            } else {
+                                CfgAtom::KeyValue { key: key.into(), value: val.into() }
+                            }
+                        })
+                        .collect(),
+                    vec![],
+                )
+                .unwrap(),
+                selective: self
+                    .data
+                    .cargo_unsetTest
+                    .iter()
+                    .map(|it| {
+                        (
+                            it.clone(),
+                            CfgDiff::new(vec![], vec![CfgAtom::Flag("test".into())]).unwrap(),
+                        )
+                    })
+                    .collect(),
+            },
             wrap_rustc_in_build_scripts: self.data.cargo_buildScripts_useRustcWrapper,
             invocation_strategy: match self.data.cargo_buildScripts_invocationStrategy {
                 InvocationStrategy::Once => project_model::InvocationStrategy::Once,
@@ -1486,9 +1522,19 @@ impl Config {
     }
 
     pub fn hover(&self) -> HoverConfig {
+        let mem_kind = |kind| match kind {
+            MemoryLayoutHoverRenderKindDef::Both => MemoryLayoutHoverRenderKind::Both,
+            MemoryLayoutHoverRenderKindDef::Decimal => MemoryLayoutHoverRenderKind::Decimal,
+            MemoryLayoutHoverRenderKindDef::Hexadecimal => MemoryLayoutHoverRenderKind::Hexadecimal,
+        };
         HoverConfig {
             links_in_hover: self.data.hover_links_enable,
-            memory_layout: self.data.hover_memoryLayout_enable,
+            memory_layout: self.data.hover_memoryLayout_enable.then_some(MemoryLayoutHoverConfig {
+                size: self.data.hover_memoryLayout_size.map(mem_kind),
+                offset: self.data.hover_memoryLayout_offset.map(mem_kind),
+                alignment: self.data.hover_memoryLayout_alignment.map(mem_kind),
+                niches: self.data.hover_memoryLayout_niches.unwrap_or_default(),
+            }),
             documentation: self.data.hover_documentation_enable,
             format: {
                 let is_markdown = try_or_def!(self
@@ -1698,6 +1744,9 @@ mod de_unit_v {
     named_unit_variant!(reborrow);
     named_unit_variant!(fieldless);
     named_unit_variant!(with_block);
+    named_unit_variant!(decimal);
+    named_unit_variant!(hexadecimal);
+    named_unit_variant!(both);
 }
 
 #[derive(Deserialize, Debug, Clone, Copy)]
@@ -1928,6 +1977,18 @@ enum WorkspaceSymbolSearchKindDef {
     AllSymbols,
 }
 
+#[derive(Deserialize, Debug, Copy, Clone)]
+#[serde(rename_all = "snake_case")]
+#[serde(untagged)]
+pub enum MemoryLayoutHoverRenderKindDef {
+    #[serde(deserialize_with = "de_unit_v::decimal")]
+    Decimal,
+    #[serde(deserialize_with = "de_unit_v::hexadecimal")]
+    Hexadecimal,
+    #[serde(deserialize_with = "de_unit_v::both")]
+    Both,
+}
+
 macro_rules! _config_data {
     (struct $name:ident {
         $(
@@ -2010,7 +2071,9 @@ fn get_field<T: DeserializeOwned>(
                 None
             }
         })
-        .unwrap_or_else(|| serde_json::from_str(default).unwrap())
+        .unwrap_or_else(|| {
+            serde_json::from_str(default).unwrap_or_else(|e| panic!("{e} on: `{default}`"))
+        })
 }
 
 fn schema(fields: &[(&'static str, &'static str, &[&str], &str)]) -> serde_json::Value {
@@ -2336,6 +2399,22 @@ fn field_props(field: &str, ty: &str, doc: &[&str], default: &str) -> serde_json
                 "`rust_analyzer`: `|i32, u64| -> i8`",
                 "`with_id`: `{closure#14352}`, where that id is the unique number of the closure in r-a internals",
                 "`hide`: Shows `...` for every closure type",
+            ],
+        },
+        "Option<MemoryLayoutHoverRenderKindDef>" => set! {
+            "anyOf": [
+                {
+                    "type": "null"
+                },
+                {
+                    "type": "string",
+                    "enum": ["both", "decimal", "hexadecimal", ],
+                    "enumDescriptions": [
+                        "Render as 12 (0xC)",
+                        "Render as 12",
+                        "Render as 0xC"
+                    ],
+                },
             ],
         },
         _ => panic!("missing entry for {ty}: {default}"),

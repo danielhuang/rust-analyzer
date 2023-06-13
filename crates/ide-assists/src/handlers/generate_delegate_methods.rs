@@ -85,13 +85,16 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
 
     for method in methods {
         let adt = ast::Adt::Struct(strukt.clone());
-        let name = method.name(ctx.db()).to_string();
+        let name = method.name(ctx.db()).display(ctx.db()).to_string();
         // if `find_struct_impl` returns None, that means that a function named `name` already exists.
         let Some(impl_def) = find_struct_impl(ctx, &adt, &[name]) else { continue; };
         acc.add_group(
             &GroupLabel("Generate delegate methods…".to_owned()),
             AssistId("generate_delegate_methods", AssistKind::Generate),
-            format!("Generate delegate for `{field_name}.{}()`", method.name(ctx.db())),
+            format!(
+                "Generate delegate for `{field_name}.{}()`",
+                method.name(ctx.db()).display(ctx.db())
+            ),
             target,
             |builder| {
                 // Create the function
@@ -101,7 +104,7 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
                 };
                 let method_name = method.name(ctx.db());
                 let vis = method_source.visibility();
-                let name = make::name(&method.name(ctx.db()).to_string());
+                let name = make::name(&method.name(ctx.db()).display(ctx.db()).to_string());
                 let params =
                     method_source.param_list().unwrap_or_else(|| make::param_list(None, []));
                 let type_params = method_source.generic_param_list();
@@ -111,17 +114,30 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
                 };
                 let tail_expr = make::expr_method_call(
                     make::ext::field_from_idents(["self", &field_name]).unwrap(), // This unwrap is ok because we have at least 1 arg in the list
-                    make::name_ref(&method_name.to_string()),
+                    make::name_ref(&method_name.display(ctx.db()).to_string()),
                     arg_list,
                 );
                 let ret_type = method_source.ret_type();
                 let is_async = method_source.async_token().is_some();
+                let is_const = method_source.const_token().is_some();
+                let is_unsafe = method_source.unsafe_token().is_some();
                 let tail_expr_finished =
                     if is_async { make::expr_await(tail_expr) } else { tail_expr };
                 let body = make::block_expr([], Some(tail_expr_finished));
-                let f = make::fn_(vis, name, type_params, None, params, body, ret_type, is_async)
-                    .indent(ast::edit::IndentLevel(1))
-                    .clone_for_update();
+                let f = make::fn_(
+                    vis,
+                    name,
+                    type_params,
+                    None,
+                    params,
+                    body,
+                    ret_type,
+                    is_async,
+                    is_const,
+                    is_unsafe,
+                )
+                .indent(ast::edit::IndentLevel(1))
+                .clone_for_update();
 
                 let cursor = Cursor::Before(f.syntax());
 
@@ -153,8 +169,16 @@ pub(crate) fn generate_delegate_methods(acc: &mut Assists, ctx: &AssistContext<'
                         let name = &strukt_name.to_string();
                         let params = strukt.generic_param_list();
                         let ty_params = params.clone();
-                        let impl_def = make::impl_(make::ext::ident_path(name), params, ty_params)
-                            .clone_for_update();
+                        let where_clause = strukt.where_clause();
+
+                        let impl_def = make::impl_(
+                            ty_params,
+                            None,
+                            make::ty_path(make::ext::ident_path(name)),
+                            where_clause,
+                            None,
+                        )
+                        .clone_for_update();
                         let assoc_items = impl_def.get_or_create_assoc_item_list();
                         assoc_items.add_item(f.clone().into());
 

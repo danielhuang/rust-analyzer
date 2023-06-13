@@ -1,6 +1,5 @@
 //! See [`CargoWorkspace`].
 
-use std::iter;
 use std::path::PathBuf;
 use std::str::from_utf8;
 use std::{ops, process::Command};
@@ -10,7 +9,7 @@ use base_db::Edition;
 use cargo_metadata::{CargoOpt, MetadataCommand};
 use la_arena::{Arena, Idx};
 use paths::{AbsPath, AbsPathBuf};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Deserialize;
 use serde_json::from_value;
 
@@ -58,20 +57,6 @@ pub enum RustLibSource {
     Discover,
 }
 
-/// Crates to disable `#[cfg(test)]` on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UnsetTestCrates {
-    None,
-    Only(Vec<String>),
-    All,
-}
-
-impl Default for UnsetTestCrates {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CargoFeatures {
     All,
@@ -100,8 +85,7 @@ pub struct CargoConfig {
     pub sysroot_src: Option<AbsPathBuf>,
     /// rustc private crate source
     pub rustc_source: Option<RustLibSource>,
-    /// crates to disable `#[cfg(test)]` on
-    pub unset_test_crates: UnsetTestCrates,
+    pub cfg_overrides: CfgOverrides,
     /// Invoke `cargo check` through the RUSTC_WRAPPER.
     pub wrap_rustc_in_build_scripts: bool,
     /// The command to run instead of `cargo check` for building build scripts.
@@ -112,27 +96,6 @@ pub struct CargoConfig {
     pub extra_env: FxHashMap<String, String>,
     pub invocation_strategy: InvocationStrategy,
     pub invocation_location: InvocationLocation,
-}
-
-impl CargoConfig {
-    pub fn cfg_overrides(&self) -> CfgOverrides {
-        match &self.unset_test_crates {
-            UnsetTestCrates::None => CfgOverrides::Selective(iter::empty().collect()),
-            UnsetTestCrates::Only(unset_test_crates) => CfgOverrides::Selective(
-                unset_test_crates
-                    .iter()
-                    .cloned()
-                    .zip(iter::repeat_with(|| {
-                        cfg::CfgDiff::new(Vec::new(), vec![cfg::CfgAtom::Flag("test".into())])
-                            .unwrap()
-                    }))
-                    .collect(),
-            ),
-            UnsetTestCrates::All => CfgOverrides::Wildcard(
-                cfg::CfgDiff::new(Vec::new(), vec![cfg::CfgAtom::Flag("test".into())]).unwrap(),
-            ),
-        }
-    }
 }
 
 pub type Package = Idx<PackageData>;
@@ -489,6 +452,21 @@ impl CargoWorkspace {
 
         // not in this workspace
         None
+    }
+
+    /// Returns the union of the features of all member crates in this workspace.
+    pub fn workspace_features(&self) -> FxHashSet<String> {
+        self.packages()
+            .filter_map(|package| {
+                let package = &self[package];
+                if package.is_member {
+                    Some(package.features.keys().cloned())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect()
     }
 
     fn is_unique(&self, name: &str) -> bool {

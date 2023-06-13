@@ -3,23 +3,21 @@
 use std::{borrow::Cow, collections::HashMap, fmt::Write, iter, ops::Range};
 
 use base_db::{CrateId, FileId};
-use chalk_ir::{
-    fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable},
-    DebruijnIndex, Mutability, ProjectionTy,
-};
+use chalk_ir::Mutability;
 use either::Either;
 use hir_def::{
     builtin_type::BuiltinType,
     data::adt::{StructFlags, VariantData},
     lang_item::{lang_attr, LangItem},
     layout::{TagEncoding, Variants},
-    AdtId, DefWithBodyId, EnumVariantId, FunctionId, GeneralConstId, HasModule, ItemContainerId,
-    Lookup, StaticId, TypeOrConstParamId, VariantId,
+    AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
+    VariantId,
 };
-use hir_expand::{name::Name, InFile};
+use hir_expand::InFile;
 use intern::Interned;
 use la_arena::ArenaMap;
 use rustc_hash::{FxHashMap, FxHashSet};
+use stdx::never;
 use syntax::{SyntaxNodePtr, TextRange};
 use triomphe::Arc;
 
@@ -27,14 +25,13 @@ use crate::{
     consteval::{intern_const_scalar, try_const_usize, ConstEvalError},
     db::HirDatabase,
     display::{ClosureStyle, HirDisplay},
-    from_placeholder_idx,
-    infer::{normalize, PointerCast},
-    layout::{layout_of_ty, Layout, LayoutError, RustcEnumVariantIdx},
+    infer::PointerCast,
+    layout::{Layout, LayoutError, RustcEnumVariantIdx},
     mapping::from_chalk,
-    method_resolution::{is_dyn_method, lookup_impl_const, lookup_impl_method},
+    method_resolution::{is_dyn_method, lookup_impl_method},
     name, static_lifetime,
     traits::FnTrait,
-    utils::{generics, ClosureSubst, Generics},
+    utils::{detect_variant_from_bytes, ClosureSubst},
     CallableDefId, ClosureId, Const, ConstScalar, FnDefId, GenericArgData, Interner, MemoryMap,
     Substitution, TraitEnvironment, Ty, TyBuilder, TyExt, TyKind,
 };
@@ -80,7 +77,7 @@ impl VTableMap {
         id
     }
 
-    fn ty(&self, id: usize) -> Result<&Ty> {
+    pub(crate) fn ty(&self, id: usize) -> Result<&Ty> {
         self.id_to_ty.get(id).ok_or(MirEvalError::InvalidVTableId(id))
     }
 
@@ -279,7 +276,6 @@ pub enum MirEvalError {
     /// Means that code had undefined behavior. We don't try to actively detect UB, but if it was detected
     /// then use this type of error.
     UndefinedBehavior(String),
-    GenericArgNotProvided(TypeOrConstParamId, Substitution),
     Panic(String),
     MirLowerError(FunctionId, MirLowerError),
     MirLowerErrorForClosure(ClosureId, MirLowerError),
@@ -309,7 +305,12 @@ impl MirEvalError {
             match func {
                 Either::Left(func) => {
                     let function_name = db.function_data(*func);
-                    writeln!(f, "In function {} ({:?})", function_name.name, func)?;
+                    writeln!(
+                        f,
+                        "In function {} ({:?})",
+                        function_name.name.display(db.upcast()),
+                        func
+                    )?;
                 }
                 Either::Right(clos) => {
                     writeln!(f, "In {:?}", clos)?;
@@ -343,26 +344,13 @@ impl MirEvalError {
                     ty.display(db).with_closure_style(ClosureStyle::ClosureWithId).to_string()
                 )?;
             }
-            MirEvalError::GenericArgNotProvided(id, subst) => {
-                let parent = id.parent;
-                let param = &db.generic_params(parent).type_or_consts[id.local_id];
-                writeln!(
-                    f,
-                    "Generic arg not provided for {}",
-                    param.name().unwrap_or(&Name::missing())
-                )?;
-                writeln!(f, "Provided args: [")?;
-                for g in subst.iter(Interner) {
-                    write!(f, "    {},", g.display(db).to_string())?;
-                }
-                writeln!(f, "]")?;
-            }
             MirEvalError::MirLowerError(func, err) => {
                 let function_name = db.function_data(*func);
                 writeln!(
                     f,
                     "MIR lowering for function `{}` ({:?}) failed due:",
-                    function_name.name, func
+                    function_name.name.display(db.upcast()),
+                    func
                 )?;
                 err.pretty_print(f, db, span_formatter)?;
             }
@@ -410,7 +398,6 @@ impl std::fmt::Debug for MirEvalError {
             Self::TypeIsUnsized(ty, it) => write!(f, "{ty:?} is unsized. {it} should be sized."),
             Self::ExecutionLimitExceeded => write!(f, "execution limit exceeded"),
             Self::StackOverflow => write!(f, "stack overflow"),
-            Self::GenericArgNotProvided(..) => f.debug_tuple("GenericArgNotProvided").finish(),
             Self::MirLowerError(arg0, arg1) => {
                 f.debug_tuple("MirLowerError").field(arg0).field(arg1).finish()
             }
@@ -465,14 +452,12 @@ impl DropFlags {
 struct Locals<'a> {
     ptr: &'a ArenaMap<LocalId, Interval>,
     body: &'a MirBody,
-    subst: &'a Substitution,
     drop_flags: DropFlags,
 }
 
 pub fn interpret_mir(
     db: &dyn HirDatabase,
     body: &MirBody,
-    subst: Substitution,
     // FIXME: This is workaround. Ideally, const generics should have a separate body (issue #7434), but now
     // they share their body with their parent, so in MIR lowering we have locals of the parent body, which
     // might have placeholders. With this argument, we (wrongly) assume that every placeholder type has
@@ -483,17 +468,11 @@ pub fn interpret_mir(
     let ty = body.locals[return_slot()].ty.clone();
     let mut evaluator = Evaluator::new(db, body, assert_placeholder_ty_is_unused);
     let x: Result<Const> = (|| {
-        let ty = evaluator.ty_filler(&ty, &subst, body.owner)?;
-        let bytes = evaluator.interpret_mir(&body, None.into_iter(), subst.clone())?;
+        let bytes = evaluator.interpret_mir(&body, None.into_iter())?;
         let mut memory_map = evaluator.create_memory_map(
             &bytes,
             &ty,
-            &Locals {
-                ptr: &ArenaMap::new(),
-                body: &body,
-                subst: &subst,
-                drop_flags: DropFlags::default(),
-            },
+            &Locals { ptr: &ArenaMap::new(), body: &body, drop_flags: DropFlags::default() },
         )?;
         memory_map.vtable = evaluator.vtable_map.clone();
         return Ok(intern_const_scalar(ConstScalar::Bytes(bytes, memory_map), ty));
@@ -559,8 +538,7 @@ impl Evaluator<'_> {
         locals: &'a Locals<'a>,
     ) -> Result<(Address, Ty, Option<IntervalOrOwned>)> {
         let mut addr = locals.ptr[p.local].addr;
-        let mut ty: Ty =
-            self.ty_filler(&locals.body.locals[p.local].ty, locals.subst, locals.body.owner)?;
+        let mut ty: Ty = locals.body.locals[p.local].ty.clone();
         let mut metadata: Option<IntervalOrOwned> = None; // locals are always sized
         for proj in &*p.projection {
             let prev_ty = ty.clone();
@@ -683,17 +661,13 @@ impl Evaluator<'_> {
         Ok((addr, ty, metadata))
     }
 
-    fn layout(&self, ty: &Ty) -> Result<Layout> {
-        layout_of_ty(self.db, ty, self.crate_id)
+    fn layout(&self, ty: &Ty) -> Result<Arc<Layout>> {
+        self.db
+            .layout_of_ty(ty.clone(), self.crate_id)
             .map_err(|e| MirEvalError::LayoutError(e, ty.clone()))
     }
 
-    fn layout_filled(&self, ty: &Ty, locals: &Locals<'_>) -> Result<Layout> {
-        let ty = &self.ty_filler(ty, locals.subst, locals.body.owner)?;
-        self.layout(ty)
-    }
-
-    fn layout_adt(&self, adt: AdtId, subst: Substitution) -> Result<Layout> {
+    fn layout_adt(&self, adt: AdtId, subst: Substitution) -> Result<Arc<Layout>> {
         self.db.layout_of_adt(adt, subst.clone(), self.crate_id).map_err(|e| {
             MirEvalError::LayoutError(e, TyKind::Adt(chalk_ir::AdtId(adt), subst).intern(Interner))
         })
@@ -729,7 +703,6 @@ impl Evaluator<'_> {
         &mut self,
         body: &MirBody,
         args: impl Iterator<Item = Vec<u8>>,
-        subst: Substitution,
     ) -> Result<Vec<u8>> {
         if let Some(x) = self.stack_depth_limit.checked_sub(1) {
             self.stack_depth_limit = x;
@@ -737,12 +710,8 @@ impl Evaluator<'_> {
             return Err(MirEvalError::StackOverflow);
         }
         let mut current_block_idx = body.start_block;
-        let mut locals = Locals {
-            ptr: &ArenaMap::new(),
-            body: &body,
-            subst: &subst,
-            drop_flags: DropFlags::default(),
-        };
+        let mut locals =
+            Locals { ptr: &ArenaMap::new(), body: &body, drop_flags: DropFlags::default() };
         let (locals_ptr, stack_size) = {
             let mut stack_ptr = self.stack.len();
             let addr = body
@@ -876,7 +845,17 @@ impl Evaluator<'_> {
                 }
                 Owned(r)
             }
-            Rvalue::Len(_) => not_supported!("rvalue len"),
+            Rvalue::Len(p) => {
+                let (_, _, metadata) = self.place_addr_and_ty_and_metadata(p, locals)?;
+                match metadata {
+                    Some(m) => m,
+                    None => {
+                        return Err(MirEvalError::TypeError(
+                            "type without metadata is used for Rvalue::Len",
+                        ));
+                    }
+                }
+            }
             Rvalue::UnaryOp(op, val) => {
                 let mut c = self.eval_operand(val, locals)?.get(&self)?;
                 let mut ty = self.operand_ty(val, locals)?;
@@ -892,7 +871,7 @@ impl Evaluator<'_> {
                             Owned(c.to_le_bytes().into())
                         }
                         chalk_ir::FloatTy::F64 => {
-                            let c = -from_bytes!(f32, c);
+                            let c = -from_bytes!(f64, c);
                             Owned(c.to_le_bytes().into())
                         }
                     }
@@ -918,7 +897,7 @@ impl Evaluator<'_> {
                     Owned(c)
                 }
             }
-            Rvalue::CheckedBinaryOp(op, lhs, rhs) => {
+            Rvalue::CheckedBinaryOp(op, lhs, rhs) => 'binary_op: {
                 let lc = self.eval_operand(lhs, locals)?;
                 let rc = self.eval_operand(rhs, locals)?;
                 let mut lc = lc.get(&self)?;
@@ -927,10 +906,17 @@ impl Evaluator<'_> {
                 while let TyKind::Ref(_, _, z) = ty.kind(Interner) {
                     ty = z.clone();
                     let size = if ty.kind(Interner) == &TyKind::Str {
-                        let ns = from_bytes!(usize, &lc[self.ptr_size()..self.ptr_size() * 2]);
+                        if *op != BinOp::Eq {
+                            never!("Only eq is builtin for `str`");
+                        }
+                        let ls = from_bytes!(usize, &lc[self.ptr_size()..self.ptr_size() * 2]);
+                        let rs = from_bytes!(usize, &rc[self.ptr_size()..self.ptr_size() * 2]);
+                        if ls != rs {
+                            break 'binary_op Owned(vec![0]);
+                        }
                         lc = &lc[..self.ptr_size()];
                         rc = &rc[..self.ptr_size()];
-                        ns
+                        ls
                     } else {
                         self.size_of_sized(&ty, locals, "operand of binary op")?
                     };
@@ -1074,7 +1060,7 @@ impl Evaluator<'_> {
                     }
                     return Ok(Owned(0u128.to_le_bytes().to_vec()));
                 };
-                match layout.variants {
+                match &layout.variants {
                     Variants::Single { index } => {
                         let r = self.const_eval_discriminant(EnumVariantId {
                             parent: enum_id,
@@ -1096,14 +1082,14 @@ impl Evaluator<'_> {
                             TagEncoding::Niche { untagged_variant, niche_start, .. } => {
                                 let tag = &bytes[offset..offset + size];
                                 let candidate_tag = i128::from_le_bytes(pad16(tag, false))
-                                    .wrapping_sub(niche_start as i128)
+                                    .wrapping_sub(*niche_start as i128)
                                     as usize;
                                 let variant = variants
                                     .iter_enumerated()
                                     .map(|(x, _)| x)
-                                    .filter(|x| *x != untagged_variant)
+                                    .filter(|x| x != untagged_variant)
                                     .nth(candidate_tag)
-                                    .unwrap_or(untagged_variant)
+                                    .unwrap_or(*untagged_variant)
                                     .0;
                                 let result = self.const_eval_discriminant(EnumVariantId {
                                     parent: enum_id,
@@ -1116,7 +1102,7 @@ impl Evaluator<'_> {
                 }
             }
             Rvalue::Repeat(x, len) => {
-                let len = match try_const_usize(self.db, len) {
+                let len = match try_const_usize(self.db, &len) {
                     Some(x) => x as usize,
                     None => not_supported!("non evaluatable array len in repeat Rvalue"),
                 };
@@ -1148,7 +1134,7 @@ impl Evaluator<'_> {
                         Owned(r)
                     }
                     AggregateKind::Tuple(ty) => {
-                        let layout = self.layout_filled(&ty, locals)?;
+                        let layout = self.layout(&ty)?;
                         Owned(self.make_by_layout(
                             layout.size.bytes_usize(),
                             &layout,
@@ -1168,9 +1154,8 @@ impl Evaluator<'_> {
                         Owned(result)
                     }
                     AggregateKind::Adt(x, subst) => {
-                        let subst = self.subst_filler(subst, locals);
                         let (size, variant_layout, tag) =
-                            self.layout_of_variant(*x, subst, locals)?;
+                            self.layout_of_variant(*x, subst.clone(), locals)?;
                         Owned(self.make_by_layout(
                             size,
                             &variant_layout,
@@ -1179,7 +1164,7 @@ impl Evaluator<'_> {
                         )?)
                     }
                     AggregateKind::Closure(ty) => {
-                        let layout = self.layout_filled(&ty, locals)?;
+                        let layout = self.layout(&ty)?;
                         Owned(self.make_by_layout(
                             layout.size.bytes_usize(),
                             &layout,
@@ -1214,14 +1199,24 @@ impl Evaluator<'_> {
                         // This is no-op
                         Borrowed(self.eval_operand(operand, locals)?)
                     }
-                    x => not_supported!("pointer cast {x:?}"),
+                    PointerCast::ArrayToPointer => {
+                        // We should remove the metadata part if the current type is slice
+                        Borrowed(self.eval_operand(operand, locals)?.slice(0..self.ptr_size()))
+                    }
                 },
                 CastKind::DynStar => not_supported!("dyn star cast"),
                 CastKind::IntToInt
                 | CastKind::PointerExposeAddress
                 | CastKind::PointerFromExposedAddress => {
-                    // FIXME: handle signed cast
-                    let current = pad16(self.eval_operand(operand, locals)?.get(&self)?, false);
+                    let current_ty = self.operand_ty(operand, locals)?;
+                    let is_signed = match current_ty.kind(Interner) {
+                        TyKind::Scalar(s) => match s {
+                            chalk_ir::Scalar::Int(_) => true,
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    let current = pad16(self.eval_operand(operand, locals)?.get(&self)?, is_signed);
                     let dest_size =
                         self.size_of_sized(target_ty, locals, "destination of int to int cast")?;
                     Owned(current[0..dest_size].to_vec())
@@ -1229,12 +1224,6 @@ impl Evaluator<'_> {
                 CastKind::FloatToInt => not_supported!("float to int cast"),
                 CastKind::FloatToFloat => not_supported!("float to float cast"),
                 CastKind::IntToFloat => not_supported!("float to int cast"),
-                CastKind::PtrToPtr => {
-                    let current = pad16(self.eval_operand(operand, locals)?.get(&self)?, false);
-                    let dest_size =
-                        self.size_of_sized(target_ty, locals, "destination of ptr to ptr cast")?;
-                    Owned(current[0..dest_size].to_vec())
-                }
                 CastKind::FnPtrToPtr => not_supported!("fn ptr to ptr cast"),
             },
         })
@@ -1294,8 +1283,8 @@ impl Evaluator<'_> {
                                 r.extend(len.to_le_bytes().into_iter());
                                 Owned(r)
                             }
-                            _ => {
-                                not_supported!("slice unsizing from non arrays")
+                            t => {
+                                not_supported!("slice unsizing from non array type {t:?}")
                             }
                         },
                     }
@@ -1321,7 +1310,7 @@ impl Evaluator<'_> {
         x: VariantId,
         subst: Substitution,
         locals: &Locals<'_>,
-    ) -> Result<(usize, Layout, Option<(usize, usize, i128)>)> {
+    ) -> Result<(usize, Arc<Layout>, Option<(usize, usize, i128)>)> {
         let adt = x.adt_id();
         if let DefWithBodyId::VariantId(f) = locals.body.owner {
             if let VariantId::EnumVariantId(x) = x {
@@ -1334,7 +1323,7 @@ impl Evaluator<'_> {
             }
         }
         let layout = self.layout_adt(adt, subst)?;
-        Ok(match layout.variants {
+        Ok(match &layout.variants {
             Variants::Single { .. } => (layout.size.bytes_usize(), layout, None),
             Variants::Multiple { variants, tag, tag_encoding, .. } => {
                 let cx = self
@@ -1351,22 +1340,22 @@ impl Evaluator<'_> {
                 let have_tag = match tag_encoding {
                     TagEncoding::Direct => true,
                     TagEncoding::Niche { untagged_variant, niche_variants: _, niche_start } => {
-                        if untagged_variant == rustc_enum_variant_idx {
+                        if *untagged_variant == rustc_enum_variant_idx {
                             false
                         } else {
                             discriminant = (variants
                                 .iter_enumerated()
-                                .filter(|(x, _)| *x != untagged_variant)
+                                .filter(|(x, _)| x != untagged_variant)
                                 .position(|(x, _)| x == rustc_enum_variant_idx)
                                 .unwrap() as i128)
-                                .wrapping_add(niche_start as i128);
+                                .wrapping_add(*niche_start as i128);
                             true
                         }
                     }
                 };
                 (
                     layout.size.bytes_usize(),
-                    variant_layout,
+                    Arc::new(variant_layout),
                     if have_tag {
                         Some((
                             layout.fields.offset(0).bytes_usize(),
@@ -1413,15 +1402,7 @@ impl Evaluator<'_> {
             Operand::Constant(konst) => {
                 let data = &konst.data(Interner);
                 match &data.value {
-                    chalk_ir::ConstValue::BoundVar(b) => {
-                        let c = locals
-                            .subst
-                            .as_slice(Interner)
-                            .get(b.index)
-                            .ok_or(MirEvalError::TypeError("missing generic arg"))?
-                            .assert_const_ref(Interner);
-                        self.eval_operand(&Operand::Constant(c.clone()), locals)?
-                    }
+                    chalk_ir::ConstValue::BoundVar(_) => not_supported!("bound var constant"),
                     chalk_ir::ConstValue::InferenceVar(_) => {
                         not_supported!("inference var constant")
                     }
@@ -1465,29 +1446,8 @@ impl Evaluator<'_> {
                 self.patch_addresses(&patch_map, &memory_map.vtable, addr, ty, locals)?;
                 Interval::new(addr, size)
             }
-            ConstScalar::UnevaluatedConst(const_id, subst) => {
-                let mut const_id = *const_id;
-                let mut subst = self.subst_filler(subst, locals);
-                if let GeneralConstId::ConstId(c) = const_id {
-                    let (c, s) = lookup_impl_const(
-                        self.db,
-                        self.db.trait_environment_for_body(locals.body.owner),
-                        c,
-                        subst,
-                    );
-                    const_id = GeneralConstId::ConstId(c);
-                    subst = s;
-                }
-                let c = self.db.const_eval(const_id.into(), subst).map_err(|e| {
-                    let name = const_id.name(self.db.upcast());
-                    MirEvalError::ConstEvalError(name, Box::new(e))
-                })?;
-                if let chalk_ir::ConstValue::Concrete(c) = &c.data(Interner).value {
-                    if let ConstScalar::Bytes(_, _) = &c.interned {
-                        return self.allocate_const_in_heap(&c, ty, locals, konst);
-                    }
-                }
-                not_supported!("failing at evaluating unevaluated const");
+            ConstScalar::UnevaluatedConst(..) => {
+                not_supported!("unevaluated const present in monomorphized mir");
             }
             ConstScalar::Unknown => not_supported!("evaluating unknown const"),
         })
@@ -1549,7 +1509,7 @@ impl Evaluator<'_> {
                 }
             }
         }
-        let layout = self.layout_filled(ty, locals);
+        let layout = self.layout(ty);
         if self.assert_placeholder_ty_is_unused {
             if matches!(layout, Err(MirEvalError::LayoutError(LayoutError::HasPlaceholder, _))) {
                 return Ok(Some((0, 1)));
@@ -1570,120 +1530,10 @@ impl Evaluator<'_> {
         }
     }
 
-    /// Uses `ty_filler` to fill an entire subst
-    fn subst_filler(&self, subst: &Substitution, locals: &Locals<'_>) -> Substitution {
-        Substitution::from_iter(
-            Interner,
-            subst.iter(Interner).map(|x| match x.data(Interner) {
-                chalk_ir::GenericArgData::Ty(ty) => {
-                    let Ok(ty) = self.ty_filler(ty, locals.subst, locals.body.owner) else {
-                        return x.clone();
-                    };
-                    chalk_ir::GenericArgData::Ty(ty).intern(Interner)
-                }
-                _ => x.clone(),
-            }),
-        )
-    }
-
-    /// This function substitutes placeholders of the body with the provided subst, effectively plays
-    /// the rule of monomorphization. In addition to placeholders, it substitutes opaque types (return
-    /// position impl traits) with their underlying type.
-    fn ty_filler(&self, ty: &Ty, subst: &Substitution, owner: DefWithBodyId) -> Result<Ty> {
-        struct Filler<'a> {
-            db: &'a dyn HirDatabase,
-            subst: &'a Substitution,
-            generics: Option<Generics>,
-        }
-        impl FallibleTypeFolder<Interner> for Filler<'_> {
-            type Error = MirEvalError;
-
-            fn as_dyn(&mut self) -> &mut dyn FallibleTypeFolder<Interner, Error = Self::Error> {
-                self
-            }
-
-            fn interner(&self) -> Interner {
-                Interner
-            }
-
-            fn try_fold_ty(
-                &mut self,
-                ty: Ty,
-                outer_binder: DebruijnIndex,
-            ) -> std::result::Result<Ty, Self::Error> {
-                match ty.kind(Interner) {
-                    TyKind::AssociatedType(id, subst) => {
-                        // I don't know exactly if and why this is needed, but it looks like `normalize_ty` likes
-                        // this kind of associated types.
-                        Ok(TyKind::Alias(chalk_ir::AliasTy::Projection(ProjectionTy {
-                            associated_ty_id: *id,
-                            substitution: subst.clone().try_fold_with(self, outer_binder)?,
-                        }))
-                        .intern(Interner))
-                    }
-                    TyKind::OpaqueType(id, subst) => {
-                        let impl_trait_id = self.db.lookup_intern_impl_trait_id((*id).into());
-                        let subst = subst.clone().try_fold_with(self.as_dyn(), outer_binder)?;
-                        match impl_trait_id {
-                            crate::ImplTraitId::ReturnTypeImplTrait(func, idx) => {
-                                let infer = self.db.infer(func.into());
-                                let filler = &mut Filler {
-                                    db: self.db,
-                                    subst: &subst,
-                                    generics: Some(generics(self.db.upcast(), func.into())),
-                                };
-                                filler.try_fold_ty(infer.type_of_rpit[idx].clone(), outer_binder)
-                            }
-                            crate::ImplTraitId::AsyncBlockTypeImplTrait(_, _) => {
-                                not_supported!("async block impl trait");
-                            }
-                        }
-                    }
-                    _ => ty.try_super_fold_with(self.as_dyn(), outer_binder),
-                }
-            }
-
-            fn try_fold_free_placeholder_ty(
-                &mut self,
-                idx: chalk_ir::PlaceholderIndex,
-                _outer_binder: DebruijnIndex,
-            ) -> std::result::Result<Ty, Self::Error> {
-                let x = from_placeholder_idx(self.db, idx);
-                let Some(idx) = self.generics.as_ref().and_then(|g| g.param_idx(x)) else {
-                    not_supported!("missing idx in generics");
-                };
-                Ok(self
-                    .subst
-                    .as_slice(Interner)
-                    .get(idx)
-                    .and_then(|x| x.ty(Interner))
-                    .ok_or_else(|| MirEvalError::GenericArgNotProvided(x, self.subst.clone()))?
-                    .clone())
-            }
-        }
-        let g_def = match owner {
-            DefWithBodyId::FunctionId(f) => Some(f.into()),
-            DefWithBodyId::StaticId(_) => None,
-            DefWithBodyId::ConstId(f) => Some(f.into()),
-            DefWithBodyId::VariantId(f) => Some(f.into()),
-        };
-        let generics = g_def.map(|g_def| generics(self.db.upcast(), g_def));
-        let filler = &mut Filler { db: self.db, subst, generics };
-        Ok(normalize(
-            self.db,
-            self.trait_env.clone(),
-            ty.clone().try_fold_with(filler, DebruijnIndex::INNERMOST)?,
-        ))
-    }
-
     fn heap_allocate(&mut self, size: usize, _align: usize) -> Address {
         let pos = self.heap.len();
         self.heap.extend(iter::repeat(0).take(size));
         Address::Heap(pos)
-    }
-
-    pub fn interpret_mir_with_no_arg(&mut self, body: &MirBody) -> Result<Vec<u8>> {
-        self.interpret_mir(&body, vec![].into_iter(), Substitution::empty(Interner))
     }
 
     fn detect_fn_trait(&self, def: FunctionId) -> Option<FnTrait> {
@@ -1701,36 +1551,107 @@ impl Evaluator<'_> {
     }
 
     fn create_memory_map(&self, bytes: &[u8], ty: &Ty, locals: &Locals<'_>) -> Result<MemoryMap> {
-        // FIXME: support indirect references
-        let mut mm = MemoryMap::default();
-        match ty.kind(Interner) {
-            TyKind::Ref(_, _, t) => {
-                let size = self.size_align_of(t, locals)?;
-                match size {
-                    Some((size, _)) => {
-                        let addr_usize = from_bytes!(usize, bytes);
-                        mm.insert(
-                            addr_usize,
-                            self.read_memory(Address::from_usize(addr_usize), size)?.to_vec(),
-                        )
-                    }
-                    None => {
-                        let element_size = match t.kind(Interner) {
-                            TyKind::Str => 1,
-                            TyKind::Slice(t) => {
-                                self.size_of_sized(t, locals, "slice inner type")?
+        fn rec(
+            this: &Evaluator<'_>,
+            bytes: &[u8],
+            ty: &Ty,
+            locals: &Locals<'_>,
+            mm: &mut MemoryMap,
+        ) -> Result<()> {
+            match ty.kind(Interner) {
+                TyKind::Ref(_, _, t) => {
+                    let size = this.size_align_of(t, locals)?;
+                    match size {
+                        Some((size, _)) => {
+                            let addr_usize = from_bytes!(usize, bytes);
+                            mm.insert(
+                                addr_usize,
+                                this.read_memory(Address::from_usize(addr_usize), size)?.to_vec(),
+                            )
+                        }
+                        None => {
+                            let mut check_inner = None;
+                            let (addr, meta) = bytes.split_at(bytes.len() / 2);
+                            let element_size = match t.kind(Interner) {
+                                TyKind::Str => 1,
+                                TyKind::Slice(t) => {
+                                    check_inner = Some(t);
+                                    this.size_of_sized(t, locals, "slice inner type")?
+                                }
+                                TyKind::Dyn(_) => {
+                                    let t = this.vtable_map.ty_of_bytes(meta)?;
+                                    check_inner = Some(t);
+                                    this.size_of_sized(t, locals, "dyn concrete type")?
+                                }
+                                _ => return Ok(()),
+                            };
+                            let count = match t.kind(Interner) {
+                                TyKind::Dyn(_) => 1,
+                                _ => from_bytes!(usize, meta),
+                            };
+                            let size = element_size * count;
+                            let addr = Address::from_bytes(addr)?;
+                            let b = this.read_memory(addr, size)?;
+                            mm.insert(addr.to_usize(), b.to_vec());
+                            if let Some(ty) = check_inner {
+                                for i in 0..count {
+                                    let offset = element_size * i;
+                                    rec(this, &b[offset..offset + element_size], &ty, locals, mm)?;
+                                }
                             }
-                            _ => return Ok(mm), // FIXME: support other kind of unsized types
-                        };
-                        let (addr, meta) = bytes.split_at(bytes.len() / 2);
-                        let size = element_size * from_bytes!(usize, meta);
-                        let addr = Address::from_bytes(addr)?;
-                        mm.insert(addr.to_usize(), self.read_memory(addr, size)?.to_vec());
+                        }
                     }
                 }
+                chalk_ir::TyKind::Tuple(_, subst) => {
+                    let layout = this.layout(ty)?;
+                    for (id, ty) in subst.iter(Interner).enumerate() {
+                        let ty = ty.assert_ty_ref(Interner); // Tuple only has type argument
+                        let offset = layout.fields.offset(id).bytes_usize();
+                        let size = this.layout(ty)?.size.bytes_usize();
+                        rec(this, &bytes[offset..offset + size], ty, locals, mm)?;
+                    }
+                }
+                chalk_ir::TyKind::Adt(adt, subst) => match adt.0 {
+                    AdtId::StructId(s) => {
+                        let data = this.db.struct_data(s);
+                        let layout = this.layout(ty)?;
+                        let field_types = this.db.field_types(s.into());
+                        for (f, _) in data.variant_data.fields().iter() {
+                            let offset = layout
+                                .fields
+                                .offset(u32::from(f.into_raw()) as usize)
+                                .bytes_usize();
+                            let ty = &field_types[f].clone().substitute(Interner, subst);
+                            let size = this.layout(ty)?.size.bytes_usize();
+                            rec(this, &bytes[offset..offset + size], ty, locals, mm)?;
+                        }
+                    }
+                    AdtId::EnumId(e) => {
+                        let layout = this.layout(ty)?;
+                        if let Some((v, l)) =
+                            detect_variant_from_bytes(&layout, this.db, this.crate_id, bytes, e)
+                        {
+                            let data = &this.db.enum_data(e).variants[v].variant_data;
+                            let field_types = this
+                                .db
+                                .field_types(EnumVariantId { parent: e, local_id: v }.into());
+                            for (f, _) in data.fields().iter() {
+                                let offset =
+                                    l.fields.offset(u32::from(f.into_raw()) as usize).bytes_usize();
+                                let ty = &field_types[f].clone().substitute(Interner, subst);
+                                let size = this.layout(ty)?.size.bytes_usize();
+                                rec(this, &bytes[offset..offset + size], ty, locals, mm)?;
+                            }
+                        }
+                    }
+                    AdtId::UnionId(_) => (),
+                },
+                _ => (),
             }
-            _ => (),
+            Ok(())
         }
+        let mut mm = MemoryMap::default();
+        rec(self, bytes, ty, locals, &mut mm)?;
         Ok(mm)
     }
 
@@ -1843,21 +1764,24 @@ impl Evaluator<'_> {
     ) -> Result<()> {
         let mir_body = self
             .db
-            .mir_body_for_closure(closure)
+            .monomorphized_mir_body_for_closure(
+                closure,
+                generic_args.clone(),
+                self.trait_env.clone(),
+            )
             .map_err(|x| MirEvalError::MirLowerErrorForClosure(closure, x))?;
-        let arg_bytes = iter::once(Ok(closure_data.get(self)?.to_owned()))
+        let closure_data = if mir_body.locals[mir_body.param_locals[0]].ty.as_reference().is_some()
+        {
+            closure_data.addr.to_bytes()
+        } else {
+            closure_data.get(self)?.to_owned()
+        };
+        let arg_bytes = iter::once(Ok(closure_data))
             .chain(args.iter().map(|x| Ok(x.get(&self)?.to_owned())))
             .collect::<Result<Vec<_>>>()?;
-        let bytes = self
-            .interpret_mir(&mir_body, arg_bytes.into_iter(), generic_args.clone())
-            .map_err(|e| {
-                MirEvalError::InFunction(
-                    Either::Right(closure),
-                    Box::new(e),
-                    span,
-                    locals.body.owner,
-                )
-            })?;
+        let bytes = self.interpret_mir(&mir_body, arg_bytes.into_iter()).map_err(|e| {
+            MirEvalError::InFunction(Either::Right(closure), Box::new(e), span, locals.body.owner)
+        })?;
         destination.write_from_bytes(self, &bytes)
     }
 
@@ -1871,7 +1795,7 @@ impl Evaluator<'_> {
         span: MirSpan,
     ) -> Result<()> {
         let def: CallableDefId = from_chalk(self.db, def);
-        let generic_args = self.subst_filler(generic_args, &locals);
+        let generic_args = generic_args.clone();
         match def {
             CallableDefId::FunctionId(def) => {
                 if let Some(_) = self.detect_fn_trait(def) {
@@ -1976,14 +1900,21 @@ impl Evaluator<'_> {
         span: MirSpan,
         destination: Interval,
     ) -> Result<()> {
-        let generic_args = self.subst_filler(&generic_args, &locals);
         let def = imp.into();
-        let mir_body = self.db.mir_body(def).map_err(|e| MirEvalError::MirLowerError(imp, e))?;
-        let result = self
-            .interpret_mir(&mir_body, arg_bytes.iter().cloned(), generic_args)
+        let mir_body = self
+            .db
+            .monomorphized_mir_body(def, generic_args, self.trait_env.clone())
             .map_err(|e| {
-                MirEvalError::InFunction(Either::Left(imp), Box::new(e), span, locals.body.owner)
+                MirEvalError::InFunction(
+                    Either::Left(imp),
+                    Box::new(MirEvalError::MirLowerError(imp, e)),
+                    span,
+                    locals.body.owner,
+                )
             })?;
+        let result = self.interpret_mir(&mir_body, arg_bytes.iter().cloned()).map_err(|e| {
+            MirEvalError::InFunction(Either::Left(imp), Box::new(e), span, locals.body.owner)
+        })?;
         destination.write_from_bytes(self, &result)?;
         Ok(())
     }
@@ -2070,7 +2001,11 @@ impl Evaluator<'_> {
             Ok(r) => Ok(r),
             Err(e) => {
                 let data = self.db.enum_data(variant.parent);
-                let name = format!("{}::{}", data.name, data.variants[variant.local_id].name);
+                let name = format!(
+                    "{}::{}",
+                    data.name.display(self.db.upcast()),
+                    data.variants[variant.local_id].name.display(self.db.upcast())
+                );
                 Err(MirEvalError::ConstEvalError(name, Box::new(e)))
             }
         }

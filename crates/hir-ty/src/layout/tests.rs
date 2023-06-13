@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use base_db::fixture::WithFixture;
 use chalk_ir::{AdtId, TyKind};
+use either::Either;
 use hir_def::db::DefDatabase;
+use triomphe::Arc;
 
 use crate::{
     db::HirDatabase,
@@ -11,47 +13,56 @@ use crate::{
     Interner, Substitution,
 };
 
-use super::layout_of_ty;
-
 mod closure;
 
 fn current_machine_data_layout() -> String {
     project_model::target_data_layout::get(None, None, &HashMap::default()).unwrap()
 }
 
-fn eval_goal(ra_fixture: &str, minicore: &str) -> Result<Layout, LayoutError> {
+fn eval_goal(ra_fixture: &str, minicore: &str) -> Result<Arc<Layout>, LayoutError> {
     let target_data_layout = current_machine_data_layout();
     let ra_fixture = format!(
         "{minicore}//- /main.rs crate:test target_data_layout:{target_data_layout}\n{ra_fixture}",
     );
 
     let (db, file_ids) = TestDB::with_many_files(&ra_fixture);
-    let (adt_id, module_id) = file_ids
+    let (adt_or_type_alias_id, module_id) = file_ids
         .into_iter()
         .find_map(|file_id| {
             let module_id = db.module_for_file(file_id);
             let def_map = module_id.def_map(&db);
             let scope = &def_map[module_id.local_id].scope;
-            let adt_id = scope.declarations().find_map(|x| match x {
+            let adt_or_type_alias_id = scope.declarations().find_map(|x| match x {
                 hir_def::ModuleDefId::AdtId(x) => {
                     let name = match x {
                         hir_def::AdtId::StructId(x) => db.struct_data(x).name.to_smol_str(),
                         hir_def::AdtId::UnionId(x) => db.union_data(x).name.to_smol_str(),
                         hir_def::AdtId::EnumId(x) => db.enum_data(x).name.to_smol_str(),
                     };
-                    (name == "Goal").then_some(x)
+                    (name == "Goal").then_some(Either::Left(x))
+                }
+                hir_def::ModuleDefId::TypeAliasId(x) => {
+                    let name = db.type_alias_data(x).name.to_smol_str();
+                    (name == "Goal").then_some(Either::Right(x))
                 }
                 _ => None,
             })?;
-            Some((adt_id, module_id))
+            Some((adt_or_type_alias_id, module_id))
         })
         .unwrap();
-    let goal_ty = TyKind::Adt(AdtId(adt_id), Substitution::empty(Interner)).intern(Interner);
-    layout_of_ty(&db, &goal_ty, module_id.krate())
+    let goal_ty = match adt_or_type_alias_id {
+        Either::Left(adt_id) => {
+            TyKind::Adt(AdtId(adt_id), Substitution::empty(Interner)).intern(Interner)
+        }
+        Either::Right(ty_id) => {
+            db.ty(ty_id.into()).substitute(Interner, &Substitution::empty(Interner))
+        }
+    };
+    db.layout_of_ty(goal_ty, module_id.krate())
 }
 
 /// A version of `eval_goal` for types that can not be expressed in ADTs, like closures and `impl Trait`
-fn eval_expr(ra_fixture: &str, minicore: &str) -> Result<Layout, LayoutError> {
+fn eval_expr(ra_fixture: &str, minicore: &str) -> Result<Arc<Layout>, LayoutError> {
     let target_data_layout = current_machine_data_layout();
     let ra_fixture = format!(
         "{minicore}//- /main.rs crate:test target_data_layout:{target_data_layout}\nfn main(){{let goal = {{{ra_fixture}}};}}",
@@ -75,7 +86,7 @@ fn eval_expr(ra_fixture: &str, minicore: &str) -> Result<Layout, LayoutError> {
     let b = hir_body.bindings.iter().find(|x| x.1.name.to_smol_str() == "goal").unwrap().0;
     let infer = db.infer(adt_id.into());
     let goal_ty = infer.type_of_binding[b].clone();
-    layout_of_ty(&db, &goal_ty, module_id.krate())
+    db.layout_of_ty(goal_ty, module_id.krate())
 }
 
 #[track_caller]
@@ -381,8 +392,21 @@ fn niche_optimization() {
 #[test]
 fn const_eval() {
     size_and_align! {
+        struct Goal([i32; 2 + 2]);
+    }
+    size_and_align! {
         const X: usize = 5;
         struct Goal([i32; X]);
+    }
+    size_and_align! {
+        mod foo {
+            pub(super) const BAR: usize = 5;
+        }
+        struct Ar<T>([T; foo::BAR]);
+        struct Goal(Ar<Ar<i32>>);
+    }
+    size_and_align! {
+        type Goal = [u8; 2 + 2];
     }
 }
 

@@ -27,10 +27,25 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HoverConfig {
     pub links_in_hover: bool,
-    pub memory_layout: bool,
+    pub memory_layout: Option<MemoryLayoutHoverConfig>,
     pub documentation: bool,
     pub keywords: bool,
     pub format: HoverDocFormat,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLayoutHoverConfig {
+    pub size: Option<MemoryLayoutHoverRenderKind>,
+    pub offset: Option<MemoryLayoutHoverRenderKind>,
+    pub alignment: Option<MemoryLayoutHoverRenderKind>,
+    pub niches: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MemoryLayoutHoverRenderKind {
+    Decimal,
+    Hexadecimal,
+    Both,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,7 +71,7 @@ impl HoverAction {
                     mod_path: render::path(
                         db,
                         it.module(db)?,
-                        it.name(db).map(|name| name.to_string()),
+                        it.name(db).map(|name| name.display(db).to_string()),
                     ),
                     nav: it.try_to_nav(db)?,
                 })

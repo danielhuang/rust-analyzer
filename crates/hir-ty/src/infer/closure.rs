@@ -9,10 +9,7 @@ use chalk_ir::{
 };
 use hir_def::{
     data::adt::VariantData,
-    hir::{
-        Array, BinaryOp, BindingAnnotation, BindingId, CaptureBy, Expr, ExprId, Pat, PatId,
-        Statement, UnaryOp,
-    },
+    hir::{Array, BinaryOp, BindingId, CaptureBy, Expr, ExprId, Pat, PatId, Statement, UnaryOp},
     lang_item::LangItem,
     resolver::{resolver_for_expr, ResolveValueResult, ValueNs},
     DefWithBodyId, FieldId, HasModule, VariantId,
@@ -28,9 +25,9 @@ use crate::{
     mir::{BorrowKind, MirSpan, ProjectionElem},
     static_lifetime, to_chalk_trait_id,
     traits::FnTrait,
-    utils::{self, generics, pattern_matching_dereference_count, Generics},
-    Adjust, Adjustment, Binders, ChalkTraitId, ClosureId, DynTy, FnPointer, FnSig, Interner,
-    Substitution, Ty, TyExt,
+    utils::{self, generics, Generics},
+    Adjust, Adjustment, Binders, BindingMode, ChalkTraitId, ClosureId, DynTy, FnPointer, FnSig,
+    Interner, Substitution, Ty, TyExt,
 };
 
 use super::{Expectation, InferenceContext};
@@ -181,7 +178,7 @@ impl CapturedItem {
 
     pub fn display_place(&self, owner: DefWithBodyId, db: &dyn HirDatabase) -> String {
         let body = db.body(owner);
-        let mut result = body[self.place.local].name.to_string();
+        let mut result = body[self.place.local].name.display(db.upcast()).to_string();
         let mut field_need_paren = false;
         for proj in &self.place.projections {
             match proj {
@@ -239,6 +236,24 @@ pub(crate) struct CapturedItemWithoutTy {
 
 impl CapturedItemWithoutTy {
     fn with_ty(self, ctx: &mut InferenceContext<'_>) -> CapturedItem {
+        let ty = self.place.ty(ctx).clone();
+        let ty = match &self.kind {
+            CaptureKind::ByValue => ty,
+            CaptureKind::ByRef(bk) => {
+                let m = match bk {
+                    BorrowKind::Mut { .. } => Mutability::Mut,
+                    _ => Mutability::Not,
+                };
+                TyKind::Ref(m, static_lifetime(), ty).intern(Interner)
+            }
+        };
+        return CapturedItem {
+            place: self.place,
+            kind: self.kind,
+            span: self.span,
+            ty: replace_placeholder_with_binder(ctx.db, ctx.owner, ty),
+        };
+
         fn replace_placeholder_with_binder(
             db: &dyn HirDatabase,
             owner: DefWithBodyId,
@@ -259,48 +274,37 @@ impl CapturedItemWithoutTy {
                     Interner
                 }
 
+                fn try_fold_free_placeholder_const(
+                    &mut self,
+                    ty: chalk_ir::Ty<Interner>,
+                    idx: chalk_ir::PlaceholderIndex,
+                    outer_binder: DebruijnIndex,
+                ) -> Result<chalk_ir::Const<Interner>, Self::Error> {
+                    let x = from_placeholder_idx(self.db, idx);
+                    let Some(idx) = self.generics.param_idx(x) else {
+                        return Err(());
+                    };
+                    Ok(BoundVar::new(outer_binder, idx).to_const(Interner, ty))
+                }
+
                 fn try_fold_free_placeholder_ty(
                     &mut self,
                     idx: chalk_ir::PlaceholderIndex,
-                    _outer_binder: DebruijnIndex,
+                    outer_binder: DebruijnIndex,
                 ) -> std::result::Result<Ty, Self::Error> {
                     let x = from_placeholder_idx(self.db, idx);
                     let Some(idx) = self.generics.param_idx(x) else {
                         return Err(());
                     };
-                    Ok(TyKind::BoundVar(BoundVar::new(DebruijnIndex::INNERMOST, idx))
-                        .intern(Interner))
+                    Ok(BoundVar::new(outer_binder, idx).to_ty(Interner))
                 }
             }
-            let g_def = match owner {
-                DefWithBodyId::FunctionId(f) => Some(f.into()),
-                DefWithBodyId::StaticId(_) => None,
-                DefWithBodyId::ConstId(f) => Some(f.into()),
-                DefWithBodyId::VariantId(f) => Some(f.into()),
-            };
-            let Some(generics) = g_def.map(|g_def| generics(db.upcast(), g_def)) else {
+            let Some(generic_def) = owner.as_generic_def_id() else {
                 return Binders::empty(Interner, ty);
             };
-            let filler = &mut Filler { db, generics };
+            let filler = &mut Filler { db, generics: generics(db.upcast(), generic_def) };
             let result = ty.clone().try_fold_with(filler, DebruijnIndex::INNERMOST).unwrap_or(ty);
             make_binders(db, &filler.generics, result)
-        }
-        let ty = self.place.ty(ctx).clone();
-        let ty = match &self.kind {
-            CaptureKind::ByValue => ty,
-            CaptureKind::ByRef(bk) => {
-                let m = match bk {
-                    BorrowKind::Mut { .. } => Mutability::Mut,
-                    _ => Mutability::Not,
-                };
-                TyKind::Ref(m, static_lifetime(), ty).intern(Interner)
-            }
-        };
-        CapturedItem {
-            place: self.place,
-            kind: self.kind,
-            span: self.span,
-            ty: replace_placeholder_with_binder(ctx.db, ctx.owner, ty),
         }
     }
 }
@@ -471,13 +475,7 @@ impl InferenceContext<'_> {
                             if let Some(initializer) = initializer {
                                 self.walk_expr(*initializer);
                                 if let Some(place) = self.place_of_expr(*initializer) {
-                                    let ty = self.expr_ty(*initializer);
-                                    self.consume_with_pat(
-                                        place,
-                                        ty,
-                                        BindingAnnotation::Unannotated,
-                                        *pat,
-                                    );
+                                    self.consume_with_pat(place, *pat);
                                 }
                             }
                         }
@@ -490,8 +488,7 @@ impl InferenceContext<'_> {
                     self.consume_expr(*tail);
                 }
             }
-            Expr::While { condition, body, label: _ }
-            | Expr::For { iterable: condition, pat: _, body, label: _ } => {
+            Expr::While { condition, body, label: _ } => {
                 self.consume_expr(*condition);
                 self.consume_expr(*body);
             }
@@ -643,7 +640,21 @@ impl InferenceContext<'_> {
             }
             None => *result = Some(ck),
         };
-        self.body.walk_pats(pat, &mut |p| match &self.body[p] {
+
+        self.walk_pat_inner(
+            pat,
+            &mut update_result,
+            BorrowKind::Mut { allow_two_phase_borrow: false },
+        );
+    }
+
+    fn walk_pat_inner(
+        &mut self,
+        p: PatId,
+        update_result: &mut impl FnMut(CaptureKind),
+        mut for_mut: BorrowKind,
+    ) {
+        match &self.body[p] {
             Pat::Ref { .. }
             | Pat::Box { .. }
             | Pat::Missing
@@ -678,13 +689,15 @@ impl InferenceContext<'_> {
                     }
                 }
                 crate::BindingMode::Ref(r) => match r {
-                    Mutability::Mut => update_result(CaptureKind::ByRef(BorrowKind::Mut {
-                        allow_two_phase_borrow: false,
-                    })),
+                    Mutability::Mut => update_result(CaptureKind::ByRef(for_mut)),
                     Mutability::Not => update_result(CaptureKind::ByRef(BorrowKind::Shared)),
                 },
             },
-        });
+        }
+        if self.result.pat_adjustments.get(&p).map_or(false, |x| !x.is_empty()) {
+            for_mut = BorrowKind::Unique;
+        }
+        self.body.walk_pats_shallow(p, |p| self.walk_pat_inner(p, update_result, for_mut));
     }
 
     fn expr_ty(&self, expr: ExprId) -> Ty {
@@ -767,41 +780,37 @@ impl InferenceContext<'_> {
         }
     }
 
-    fn consume_with_pat(
-        &mut self,
-        mut place: HirPlace,
-        mut ty: Ty,
-        mut bm: BindingAnnotation,
-        pat: PatId,
-    ) {
+    fn consume_with_pat(&mut self, mut place: HirPlace, pat: PatId) {
+        let cnt = self.result.pat_adjustments.get(&pat).map(|x| x.len()).unwrap_or_default();
+        place.projections = place
+            .projections
+            .iter()
+            .cloned()
+            .chain((0..cnt).map(|_| ProjectionElem::Deref))
+            .collect::<Vec<_>>()
+            .into();
         match &self.body[pat] {
             Pat::Missing | Pat::Wild => (),
             Pat::Tuple { args, ellipsis } => {
-                pattern_matching_dereference(&mut ty, &mut bm, &mut place);
                 let (al, ar) = args.split_at(ellipsis.unwrap_or(args.len()));
-                let subst = match ty.kind(Interner) {
-                    TyKind::Tuple(_, s) => s,
+                let field_count = match self.result[pat].kind(Interner) {
+                    TyKind::Tuple(_, s) => s.len(Interner),
                     _ => return,
                 };
-                let fields = subst.iter(Interner).map(|x| x.assert_ty_ref(Interner)).enumerate();
+                let fields = 0..field_count;
                 let it = al.iter().zip(fields.clone()).chain(ar.iter().rev().zip(fields.rev()));
-                for (arg, (i, ty)) in it {
+                for (arg, i) in it {
                     let mut p = place.clone();
                     p.projections.push(ProjectionElem::TupleOrClosureField(i));
-                    self.consume_with_pat(p, ty.clone(), bm, *arg);
+                    self.consume_with_pat(p, *arg);
                 }
             }
             Pat::Or(pats) => {
                 for pat in pats.iter() {
-                    self.consume_with_pat(place.clone(), ty.clone(), bm, *pat);
+                    self.consume_with_pat(place.clone(), *pat);
                 }
             }
             Pat::Record { args, .. } => {
-                pattern_matching_dereference(&mut ty, &mut bm, &mut place);
-                let subst = match ty.kind(Interner) {
-                    TyKind::Adt(_, s) => s,
-                    _ => return,
-                };
                 let Some(variant) = self.result.variant_resolution_for_pat(pat) else {
                     return;
                 };
@@ -811,7 +820,6 @@ impl InferenceContext<'_> {
                     }
                     VariantId::StructId(s) => {
                         let vd = &*self.db.struct_data(s).variant_data;
-                        let field_types = self.db.field_types(variant);
                         for field_pat in args.iter() {
                             let arg = field_pat.pat;
                             let Some(local_id) = vd.field(&field_pat.name) else {
@@ -822,12 +830,7 @@ impl InferenceContext<'_> {
                                 parent: variant.into(),
                                 local_id,
                             }));
-                            self.consume_with_pat(
-                                p,
-                                field_types[local_id].clone().substitute(Interner, subst),
-                                bm,
-                                arg,
-                            );
+                            self.consume_with_pat(p, arg);
                         }
                     }
                 }
@@ -838,26 +841,20 @@ impl InferenceContext<'_> {
             | Pat::Path(_)
             | Pat::Lit(_) => self.consume_place(place, pat.into()),
             Pat::Bind { id, subpat: _ } => {
-                let mode = self.body.bindings[*id].mode;
-                if matches!(mode, BindingAnnotation::Ref | BindingAnnotation::RefMut) {
-                    bm = mode;
-                }
-                let capture_kind = match bm {
-                    BindingAnnotation::Unannotated | BindingAnnotation::Mutable => {
+                let mode = self.result.binding_modes[*id];
+                let capture_kind = match mode {
+                    BindingMode::Move => {
                         self.consume_place(place, pat.into());
                         return;
                     }
-                    BindingAnnotation::Ref => BorrowKind::Shared,
-                    BindingAnnotation::RefMut => BorrowKind::Mut { allow_two_phase_borrow: false },
+                    BindingMode::Ref(Mutability::Not) => BorrowKind::Shared,
+                    BindingMode::Ref(Mutability::Mut) => {
+                        BorrowKind::Mut { allow_two_phase_borrow: false }
+                    }
                 };
                 self.add_capture(place, CaptureKind::ByRef(capture_kind), pat.into());
             }
             Pat::TupleStruct { path: _, args, ellipsis } => {
-                pattern_matching_dereference(&mut ty, &mut bm, &mut place);
-                let subst = match ty.kind(Interner) {
-                    TyKind::Adt(_, s) => s,
-                    _ => return,
-                };
                 let Some(variant) = self.result.variant_resolution_for_pat(pat) else {
                     return;
                 };
@@ -871,29 +868,20 @@ impl InferenceContext<'_> {
                         let fields = vd.fields().iter();
                         let it =
                             al.iter().zip(fields.clone()).chain(ar.iter().rev().zip(fields.rev()));
-                        let field_types = self.db.field_types(variant);
                         for (arg, (i, _)) in it {
                             let mut p = place.clone();
                             p.projections.push(ProjectionElem::Field(FieldId {
                                 parent: variant.into(),
                                 local_id: i,
                             }));
-                            self.consume_with_pat(
-                                p,
-                                field_types[i].clone().substitute(Interner, subst),
-                                bm,
-                                *arg,
-                            );
+                            self.consume_with_pat(p, *arg);
                         }
                     }
                 }
             }
             Pat::Ref { pat, mutability: _ } => {
-                if let Some((inner, _, _)) = ty.as_reference() {
-                    ty = inner.clone();
-                    place.projections.push(ProjectionElem::Deref);
-                    self.consume_with_pat(place, ty, bm, *pat)
-                }
+                place.projections.push(ProjectionElem::Deref);
+                self.consume_with_pat(place, *pat)
             }
             Pat::Box { .. } => (), // not supported
         }
@@ -1021,13 +1009,4 @@ fn apply_adjusts_to_place(mut r: HirPlace, adjustments: &[Adjustment]) -> Option
         }
     }
     Some(r)
-}
-
-fn pattern_matching_dereference(
-    cond_ty: &mut Ty,
-    binding_mode: &mut BindingAnnotation,
-    cond_place: &mut HirPlace,
-) {
-    let cnt = pattern_matching_dereference_count(cond_ty, binding_mode);
-    cond_place.projections.extend((0..cnt).map(|_| ProjectionElem::Deref));
 }

@@ -24,8 +24,8 @@ use crate::{
     AdtId, AssocItemId, ConstId, ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExternBlockId,
     FunctionId, GenericDefId, GenericParamId, HasModule, ImplId, ItemContainerId, LifetimeParamId,
     LocalModuleId, Lookup, Macro2Id, MacroId, MacroRulesId, ModuleDefId, ModuleId, ProcMacroId,
-    StaticId, StructId, TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId,
-    VariantId,
+    StaticId, StructId, TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, TypeOwnerId,
+    TypeParamId, VariantId,
 };
 
 #[derive(Debug, Clone)]
@@ -586,8 +586,9 @@ impl Resolver {
             }));
             if let Some(block) = expr_scopes.block(scope_id) {
                 let def_map = db.block_def_map(block);
-                let root = def_map.root();
-                resolver.scopes.push(Scope::BlockScope(ModuleItemMap { def_map, module_id: root }));
+                resolver
+                    .scopes
+                    .push(Scope::BlockScope(ModuleItemMap { def_map, module_id: DefMap::ROOT }));
                 // FIXME: This adds as many module scopes as there are blocks, but resolving in each
                 // already traverses all parents, so this is O(n²). I think we could only store the
                 // innermost module scope instead?
@@ -753,8 +754,7 @@ fn resolver_for_scope_(
     for scope in scope_chain.into_iter().rev() {
         if let Some(block) = scopes.block(scope) {
             let def_map = db.block_def_map(block);
-            let root = def_map.root();
-            r = r.push_block_scope(def_map, root);
+            r = r.push_block_scope(def_map, DefMap::ROOT);
             // FIXME: This adds as many module scopes as there are blocks, but resolving in each
             // already traverses all parents, so this is O(n²). I think we could only store the
             // innermost module scope instead?
@@ -1009,6 +1009,24 @@ impl HasResolver for ExternBlockId {
     }
 }
 
+impl HasResolver for TypeOwnerId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        match self {
+            TypeOwnerId::FunctionId(x) => x.resolver(db),
+            TypeOwnerId::StaticId(x) => x.resolver(db),
+            TypeOwnerId::ConstId(x) => x.resolver(db),
+            TypeOwnerId::InTypeConstId(x) => x.lookup(db).owner.resolver(db),
+            TypeOwnerId::AdtId(x) => x.resolver(db),
+            TypeOwnerId::TraitId(x) => x.resolver(db),
+            TypeOwnerId::TraitAliasId(x) => x.resolver(db),
+            TypeOwnerId::TypeAliasId(x) => x.resolver(db),
+            TypeOwnerId::ImplId(x) => x.resolver(db),
+            TypeOwnerId::EnumVariantId(x) => x.resolver(db),
+            TypeOwnerId::ModuleId(x) => x.resolver(db),
+        }
+    }
+}
+
 impl HasResolver for DefWithBodyId {
     fn resolver(self, db: &dyn DefDatabase) -> Resolver {
         match self {
@@ -1016,6 +1034,7 @@ impl HasResolver for DefWithBodyId {
             DefWithBodyId::FunctionId(f) => f.resolver(db),
             DefWithBodyId::StaticId(s) => s.resolver(db),
             DefWithBodyId::VariantId(v) => v.parent.resolver(db),
+            DefWithBodyId::InTypeConstId(c) => c.lookup(db).owner.resolver(db),
         }
     }
 }
@@ -1043,6 +1062,12 @@ impl HasResolver for GenericDefId {
             GenericDefId::EnumVariantId(inner) => inner.parent.resolver(db),
             GenericDefId::ConstId(inner) => inner.resolver(db),
         }
+    }
+}
+
+impl HasResolver for EnumVariantId {
+    fn resolver(self, db: &dyn DefDatabase) -> Resolver {
+        self.parent.resolver(db)
     }
 }
 

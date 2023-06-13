@@ -27,6 +27,7 @@ use ide_db::{
 use itertools::Itertools;
 use proc_macro_api::{MacroDylib, ProcMacroServer};
 use project_model::{PackageRoot, ProjectWorkspace, WorkspaceBuildScripts};
+use stdx::{format_to, thread::ThreadIntent};
 use syntax::SmolStr;
 use triomphe::Arc;
 use vfs::{file_set::FileSetConfig, AbsPath, AbsPathBuf, ChangeKind};
@@ -109,7 +110,7 @@ impl GlobalState {
 
         if self.proc_macro_changed {
             status.health = lsp_ext::Health::Warning;
-            message.push_str("Proc-macros have changed and need to be rebuild.\n\n");
+            message.push_str("Proc-macros have changed and need to be rebuilt.\n\n");
         }
         if let Err(_) = self.fetch_build_data_error() {
             status.health = lsp_ext::Health::Warning;
@@ -133,6 +134,15 @@ impl GlobalState {
             status.health = lsp_ext::Health::Warning;
             message.push_str("Failed to discover workspace.\n");
             message.push_str("Consider adding the `Cargo.toml` of the workspace to the [`linkedProjects`](https://rust-analyzer.github.io/manual.html#rust-analyzer.linkedProjects) setting.\n\n");
+        }
+        if let Some(err) = &self.config_errors {
+            status.health = lsp_ext::Health::Warning;
+            format_to!(message, "{err}\n");
+        }
+        if let Some(err) = &self.last_flycheck_error {
+            status.health = lsp_ext::Health::Warning;
+            message.push_str(err);
+            message.push('\n');
         }
 
         for ws in self.workspaces.iter() {
@@ -175,7 +185,7 @@ impl GlobalState {
     pub(crate) fn fetch_workspaces(&mut self, cause: Cause) {
         tracing::info!(%cause, "will fetch workspaces");
 
-        self.task_pool.handle.spawn_with_sender({
+        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, {
             let linked_projects = self.config.linked_projects();
             let detached_files = self.config.detached_files().to_vec();
             let cargo_config = self.config.cargo();
@@ -250,7 +260,7 @@ impl GlobalState {
         tracing::info!(%cause, "will fetch build data");
         let workspaces = Arc::clone(&self.workspaces);
         let config = self.config.cargo();
-        self.task_pool.handle.spawn_with_sender(move |sender| {
+        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
             sender.send(Task::FetchBuildData(BuildDataProgress::Begin)).unwrap();
 
             let progress = {
@@ -270,7 +280,7 @@ impl GlobalState {
         let dummy_replacements = self.config.dummy_replacements().clone();
         let proc_macro_clients = self.proc_macro_clients.clone();
 
-        self.task_pool.handle.spawn_with_sender(move |sender| {
+        self.task_pool.handle.spawn_with_sender(ThreadIntent::Worker, move |sender| {
             sender.send(Task::LoadProcMacros(ProcMacroProgress::Begin)).unwrap();
 
             let dummy_replacements = &dummy_replacements;

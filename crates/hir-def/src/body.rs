@@ -118,7 +118,8 @@ impl Body {
         let _p = profile::span("body_with_source_map_query");
         let mut params = None;
 
-        let (file_id, module, body, is_async_fn) = {
+        let mut is_async_fn = false;
+        let InFile { file_id, value: body } = {
             match def {
                 DefWithBodyId::FunctionId(f) => {
                     let data = db.function_data(f);
@@ -138,31 +139,27 @@ impl Body {
                             }),
                         )
                     });
-                    (
-                        src.file_id,
-                        f.module(db),
-                        src.value.body().map(ast::Expr::from),
-                        data.has_async_kw(),
-                    )
+                    is_async_fn = data.has_async_kw();
+                    src.map(|it| it.body().map(ast::Expr::from))
                 }
                 DefWithBodyId::ConstId(c) => {
                     let c = c.lookup(db);
                     let src = c.source(db);
-                    (src.file_id, c.module(db), src.value.body(), false)
+                    src.map(|it| it.body())
                 }
                 DefWithBodyId::StaticId(s) => {
                     let s = s.lookup(db);
                     let src = s.source(db);
-                    (src.file_id, s.module(db), src.value.body(), false)
+                    src.map(|it| it.body())
                 }
                 DefWithBodyId::VariantId(v) => {
-                    let e = v.parent.lookup(db);
                     let src = v.parent.child_source(db);
-                    let variant = &src.value[v.local_id];
-                    (src.file_id, e.container, variant.expr(), false)
+                    src.map(|it| it[v.local_id].expr())
                 }
+                DefWithBodyId::InTypeConstId(c) => c.lookup(db).id.map(|_| c.source(db).expr()),
             }
         };
+        let module = def.module(db);
         let expander = Expander::new(db, file_id, module);
         let (mut body, source_map) =
             Body::new(db, def, expander, params, body, module.krate, is_async_fn);
@@ -227,9 +224,8 @@ impl Body {
         });
     }
 
-    pub fn walk_pats(&self, pat_id: PatId, f: &mut impl FnMut(PatId)) {
+    pub fn walk_pats_shallow(&self, pat_id: PatId, mut f: impl FnMut(PatId)) {
         let pat = &self[pat_id];
-        f(pat_id);
         match pat {
             Pat::Range { .. }
             | Pat::Lit(..)
@@ -239,22 +235,27 @@ impl Body {
             | Pat::Missing => {}
             &Pat::Bind { subpat, .. } => {
                 if let Some(subpat) = subpat {
-                    self.walk_pats(subpat, f);
+                    f(subpat);
                 }
             }
             Pat::Or(args) | Pat::Tuple { args, .. } | Pat::TupleStruct { args, .. } => {
-                args.iter().copied().for_each(|p| self.walk_pats(p, f));
+                args.iter().copied().for_each(|p| f(p));
             }
-            Pat::Ref { pat, .. } => self.walk_pats(*pat, f),
+            Pat::Ref { pat, .. } => f(*pat),
             Pat::Slice { prefix, slice, suffix } => {
                 let total_iter = prefix.iter().chain(slice.iter()).chain(suffix.iter());
-                total_iter.copied().for_each(|p| self.walk_pats(p, f));
+                total_iter.copied().for_each(|p| f(p));
             }
             Pat::Record { args, .. } => {
-                args.iter().for_each(|RecordFieldPat { pat, .. }| self.walk_pats(*pat, f));
+                args.iter().for_each(|RecordFieldPat { pat, .. }| f(*pat));
             }
-            Pat::Box { inner } => self.walk_pats(*inner, f),
+            Pat::Box { inner } => f(*inner),
         }
+    }
+
+    pub fn walk_pats(&self, pat_id: PatId, f: &mut impl FnMut(PatId)) {
+        f(pat_id);
+        self.walk_pats_shallow(pat_id, |p| self.walk_pats(p, f));
     }
 }
 

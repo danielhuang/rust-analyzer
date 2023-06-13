@@ -408,7 +408,6 @@ dependencies = [
  "cargo_metadata",
  "command-group",
  "crossbeam-channel",
- "jod-thread",
  "paths",
  "rustc-hash",
  "serde",
@@ -1278,6 +1277,7 @@ dependencies = [
  "paths",
  "proc-macro-api",
  "proc-macro-test",
+ "stdx",
  "tt",
 ]
 
@@ -1334,6 +1334,7 @@ dependencies = [
  "cargo_metadata",
  "cfg",
  "expect-test",
+ "itertools",
  "la-arena",
  "paths",
  "profile",
@@ -1493,7 +1494,6 @@ dependencies = [
  "ide-db",
  "ide-ssr",
  "itertools",
- "jod-thread",
  "lsp-server",
  "lsp-types",
  "mbe",
@@ -1518,7 +1518,6 @@ dependencies = [
  "syntax",
  "test-utils",
  "thiserror",
- "threadpool",
  "tikv-jemallocator",
  "toolchain",
  "tracing",
@@ -1712,6 +1711,8 @@ version = "0.0.0"
 dependencies = [
  "always-assert",
  "backtrace",
+ "crossbeam-channel",
+ "jod-thread",
  "libc",
  "miow",
  "winapi",
@@ -1820,15 +1821,6 @@ checksum = "3fdd6f064ccff2d6567adcb3873ca630700f00b5ad3f060c25b5dcfd9a4ce152"
 dependencies = [
  "cfg-if",
  "once_cell",
-]
-
-[[package]]
-name = "threadpool"
-version = "1.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
-dependencies = [
- "num_cpus",
 ]
 
 [[package]]
@@ -2123,9 +2115,9 @@ name = "vfs-notify"
 version = "0.0.0"
 dependencies = [
  "crossbeam-channel",
- "jod-thread",
  "notify",
  "paths",
+ "stdx",
  "tracing",
  "vfs",
  "walkdir",

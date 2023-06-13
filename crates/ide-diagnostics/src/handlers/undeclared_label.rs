@@ -8,7 +8,7 @@ pub(crate) fn undeclared_label(
     let name = &d.name;
     Diagnostic::new(
         "undeclared-label",
-        format!("use of undeclared label `{name}`"),
+        format!("use of undeclared label `{}`", name.display(ctx.sema.db)),
         ctx.sema.diagnostics_display_range(d.node.clone().map(|it| it.into())).range,
     )
 }
@@ -28,6 +28,31 @@ fn foo() {
     continue 'a;
   //^^^^^^^^^^^ error: continue outside of loop
            //^^ error: use of undeclared label `'a`
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn for_loop() {
+        check_diagnostics(
+            r#"
+//- minicore: iterator
+fn foo() {
+    'xxx: for _ in unknown {
+        'yyy: for _ in unknown {
+            break 'xxx;
+            continue 'yyy;
+            break 'zzz;
+                //^^^^ error: use of undeclared label `'zzz`
+        }
+        continue 'xxx;
+        continue 'yyy;
+               //^^^^ error: use of undeclared label `'yyy`
+        break 'xxx;
+        break 'yyy;
+            //^^^^ error: use of undeclared label `'yyy`
+    }
 }
 "#,
         );

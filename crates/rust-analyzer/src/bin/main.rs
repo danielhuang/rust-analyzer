@@ -78,7 +78,16 @@ fn try_main(flags: flags::RustAnalyzer) -> Result<()> {
                 println!("rust-analyzer {}", rust_analyzer::version());
                 return Ok(());
             }
-            with_extra_thread("LspServer", run_server)?;
+
+            // rust-analyzer’s “main thread” is actually
+            // a secondary latency-sensitive thread with an increased stack size.
+            // We use this thread intent because any delay in the main loop
+            // will make actions like hitting enter in the editor slow.
+            with_extra_thread(
+                "LspServer",
+                stdx::thread::ThreadIntent::LatencySensitive,
+                run_server,
+            )?;
         }
         flags::RustAnalyzerCmd::Parse(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::Symbols(cmd) => cmd.run()?,
@@ -136,14 +145,17 @@ const STACK_SIZE: usize = 1024 * 1024 * 8;
 /// space.
 fn with_extra_thread(
     thread_name: impl Into<String>,
+    thread_intent: stdx::thread::ThreadIntent,
     f: impl FnOnce() -> Result<()> + Send + 'static,
 ) -> Result<()> {
-    let handle =
-        std::thread::Builder::new().name(thread_name.into()).stack_size(STACK_SIZE).spawn(f)?;
-    match handle.join() {
-        Ok(res) => res,
-        Err(panic) => std::panic::resume_unwind(panic),
-    }
+    let handle = stdx::thread::Builder::new(thread_intent)
+        .name(thread_name.into())
+        .stack_size(STACK_SIZE)
+        .spawn(f)?;
+
+    handle.join()?;
+
+    Ok(())
 }
 
 fn run_server() -> Result<()> {

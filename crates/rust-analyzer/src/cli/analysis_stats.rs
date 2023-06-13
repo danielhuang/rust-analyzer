@@ -221,6 +221,7 @@ impl flags::AnalysisStats {
                     .rev()
                     .filter_map(|it| it.name(db))
                     .chain(Some(a.name(db)))
+                    .map(|it| it.display(db).to_string())
                     .join("::");
                 println!("Data layout for {full_name} failed due {e:?}");
             }
@@ -248,6 +249,7 @@ impl flags::AnalysisStats {
                     .rev()
                     .filter_map(|it| it.name(db))
                     .chain(c.name(db))
+                    .map(|it| it.display(db).to_string())
                     .join("::");
                 println!("Const eval for {full_name} failed due {e:?}");
             }
@@ -274,6 +276,7 @@ impl flags::AnalysisStats {
                     .rev()
                     .filter_map(|it| it.name(db))
                     .chain(Some(f.name(db)))
+                    .map(|it| it.display(db).to_string())
                     .join("::");
                 println!("Mir body for {full_name} failed due {e:?}");
             }
@@ -325,16 +328,24 @@ impl flags::AnalysisStats {
         let analysis = host.analysis();
         for f in funcs.iter().copied() {
             let name = f.name(db);
-            let full_name = f
-                .module(db)
-                .path_to_root(db)
+            let module = f.module(db);
+            let full_name = module
+                .krate()
+                .display_name(db)
+                .map(|x| x.canonical_name().to_string())
                 .into_iter()
-                .rev()
-                .filter_map(|it| it.name(db))
-                .chain(Some(f.name(db)))
+                .chain(
+                    module
+                        .path_to_root(db)
+                        .into_iter()
+                        .filter_map(|it| it.name(db))
+                        .rev()
+                        .chain(Some(f.name(db)))
+                        .map(|it| it.display(db).to_string()),
+                )
                 .join("::");
             if let Some(only_name) = self.only.as_deref() {
-                if name.to_string() != only_name && full_name != only_name {
+                if name.display(db).to_string() != only_name && full_name != only_name {
                     continue;
                 }
             }
@@ -376,7 +387,7 @@ impl flags::AnalysisStats {
                                 end.col,
                             ));
                         } else {
-                            bar.println(format!("{name}: Unknown type",));
+                            bar.println(format!("{}: Unknown type", name.display(db)));
                         }
                     }
                     true
@@ -431,7 +442,7 @@ impl flags::AnalysisStats {
                         } else {
                             bar.println(format!(
                                 "{}: Expected {}, got {}",
-                                name,
+                                name.display(db),
                                 mismatch.expected.display(db),
                                 mismatch.actual.display(db)
                             ));
@@ -479,7 +490,7 @@ impl flags::AnalysisStats {
                                 end.col,
                             ));
                         } else {
-                            bar.println(format!("{name}: Unknown type",));
+                            bar.println(format!("{}: Unknown type", name.display(db)));
                         }
                     }
                     true
@@ -533,7 +544,7 @@ impl flags::AnalysisStats {
                         } else {
                             bar.println(format!(
                                 "{}: Expected {}, got {}",
-                                name,
+                                name.display(db),
                                 mismatch.expected.display(db),
                                 mismatch.actual.display(db)
                             ));

@@ -19,12 +19,11 @@ use lsp_server::ErrorCode;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    CodeLens, CompletionItem, DocumentFormattingParams, FoldingRange, FoldingRangeParams,
-    HoverContents, InlayHint, InlayHintParams, Location, LocationLink, Position,
-    PrepareRenameResponse, Range, RenameParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensRangeParams,
-    SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation, SymbolTag,
-    TextDocumentIdentifier, Url, WorkspaceEdit,
+    CodeLens, CompletionItem, FoldingRange, FoldingRangeParams, HoverContents, InlayHint,
+    InlayHintParams, Location, LocationLink, Position, PrepareRenameResponse, Range, RenameParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensRangeParams, SemanticTokensRangeResult, SemanticTokensResult, SymbolInformation,
+    SymbolTag, TextDocumentIdentifier, Url, WorkspaceEdit,
 };
 use project_model::{ManifestPath, ProjectWorkspace, TargetKind};
 use serde_json::json;
@@ -116,13 +115,14 @@ pub(crate) fn handle_analyzer_status(
 
 pub(crate) fn handle_memory_usage(state: &mut GlobalState, _: ()) -> Result<String> {
     let _p = profile::span("handle_memory_usage");
-    let mut mem = state.analysis_host.per_query_memory_usage();
-    mem.push(("Remaining".into(), profile::memory_usage().allocated));
+    let mem = state.analysis_host.per_query_memory_usage();
 
     let mut out = String::new();
-    for (name, bytes) in mem {
-        format_to!(out, "{:>8} {}\n", bytes, name);
+    for (name, bytes, entries) in mem {
+        format_to!(out, "{:>8} {:>6} {}\n", bytes, entries, name);
     }
+    format_to!(out, "{:>8}        Remaining\n", profile::memory_usage().allocated);
+
     Ok(out)
 }
 
@@ -521,7 +521,10 @@ pub(crate) fn handle_workspace_symbol(
 
             #[allow(deprecated)]
             let info = SymbolInformation {
-                name: nav.name.to_string(),
+                name: match &nav.alias {
+                    Some(alias) => format!("{} (alias for {})", alias, nav.name),
+                    None => format!("{}", nav.name),
+                },
                 kind: nav
                     .kind
                     .map(to_proto::symbol_kind)
@@ -766,20 +769,25 @@ pub(crate) fn handle_runnables(
     let config = snap.config.runnables();
     match cargo_spec {
         Some(spec) => {
+            let all_targets = !snap.analysis.is_crate_no_std(spec.crate_id)?;
             for cmd in ["check", "test"] {
+                let mut cargo_args =
+                    vec![cmd.to_owned(), "--package".to_owned(), spec.package.clone()];
+                if all_targets {
+                    cargo_args.push("--all-targets".to_owned());
+                }
                 res.push(lsp_ext::Runnable {
-                    label: format!("cargo {cmd} -p {} --all-targets", spec.package),
+                    label: format!(
+                        "cargo {cmd} -p {}{all_targets}",
+                        spec.package,
+                        all_targets = if all_targets { " --all-targets" } else { "" }
+                    ),
                     location: None,
                     kind: lsp_ext::RunnableKind::Cargo,
                     args: lsp_ext::CargoRunnable {
                         workspace_root: Some(spec.workspace_root.clone().into()),
                         override_cargo: config.override_cargo.clone(),
-                        cargo_args: vec![
-                            cmd.to_string(),
-                            "--package".to_string(),
-                            spec.package.clone(),
-                            "--all-targets".to_string(),
-                        ],
+                        cargo_args,
                         cargo_extra_args: config.cargo_extra_args.clone(),
                         executable_args: Vec::new(),
                         expect_test: None,
@@ -1072,7 +1080,7 @@ pub(crate) fn handle_references(
 
 pub(crate) fn handle_formatting(
     snap: GlobalStateSnapshot,
-    params: DocumentFormattingParams,
+    params: lsp_types::DocumentFormattingParams,
 ) -> Result<Option<Vec<lsp_types::TextEdit>>> {
     let _p = profile::span("handle_formatting");
 

@@ -173,8 +173,8 @@ impl<'a> InferenceContext<'a> {
             }
             Expr::Const(id) => {
                 self.with_breakable_ctx(BreakableKind::Border, None, None, |this| {
-                    let (_, expr) = this.db.lookup_intern_anonymous_const(*id);
-                    this.infer_expr(expr, expected)
+                    let loc = this.db.lookup_intern_anonymous_const(*id);
+                    this.infer_expr(loc.root, expected)
                 })
                 .1
             }
@@ -204,24 +204,6 @@ impl<'a> InferenceContext<'a> {
                         condition,
                         &Expectation::HasType(this.result.standard_types.bool_.clone()),
                     );
-                    this.infer_expr(body, &Expectation::HasType(TyBuilder::unit()));
-                });
-
-                // the body may not run, so it diverging doesn't mean we diverge
-                self.diverges = Diverges::Maybe;
-                TyBuilder::unit()
-            }
-            &Expr::For { iterable, body, pat, label } => {
-                let iterable_ty = self.infer_expr(iterable, &Expectation::none());
-                let into_iter_ty =
-                    self.resolve_associated_type(iterable_ty, self.resolve_into_iter_item());
-                let pat_ty = self
-                    .resolve_associated_type(into_iter_ty.clone(), self.resolve_iterator_item());
-
-                self.result.type_of_for_iterator.insert(tgt_expr, into_iter_ty);
-
-                self.infer_top_pat(pat, &pat_ty);
-                self.with_breakable_ctx(BreakableKind::Loop, None, label, |this| {
                     this.infer_expr(body, &Expectation::HasType(TyBuilder::unit()));
                 });
 
@@ -575,6 +557,9 @@ impl<'a> InferenceContext<'a> {
                     let field_ty = field_def.map_or(self.err_ty(), |it| {
                         field_types[it.local_id].clone().substitute(Interner, &substs)
                     });
+                    // Field type might have some unknown types
+                    // FIXME: we may want to emit a single type variable for all instance of type fields?
+                    let field_ty = self.insert_type_vars(field_ty);
                     self.infer_expr_coerce(field.expr, &Expectation::has_type(field_ty));
                 }
                 if let Some(expr) = spread {
@@ -871,9 +856,15 @@ impl<'a> InferenceContext<'a> {
             },
             Expr::Underscore => {
                 // Underscore expressions may only appear in assignee expressions,
-                // which are handled by `infer_assignee_expr()`, so any underscore
-                // expression reaching this branch is an error.
-                self.err_ty()
+                // which are handled by `infer_assignee_expr()`.
+                // Any other underscore expression is an error, we render a specialized diagnostic
+                // to let the user know what type is expected though.
+                let expected = expected.to_option(&mut self.table).unwrap_or_else(|| self.err_ty());
+                self.push_diagnostic(InferenceDiagnostic::TypedHole {
+                    expr: tgt_expr,
+                    expected: expected.clone(),
+                });
+                expected
             }
         };
         // use a new type variable if we got unknown here
@@ -998,12 +989,13 @@ impl<'a> InferenceContext<'a> {
             }
             &Array::Repeat { initializer, repeat } => {
                 self.infer_expr_coerce(initializer, &Expectation::has_type(elem_ty.clone()));
-                self.infer_expr(
-                    repeat,
-                    &Expectation::HasType(
-                        TyKind::Scalar(Scalar::Uint(UintTy::Usize)).intern(Interner),
-                    ),
-                );
+                let usize = TyKind::Scalar(Scalar::Uint(UintTy::Usize)).intern(Interner);
+                match self.body[repeat] {
+                    Expr::Underscore => {
+                        self.write_expr_ty(repeat, usize);
+                    }
+                    _ => _ = self.infer_expr(repeat, &Expectation::HasType(usize)),
+                }
 
                 (
                     elem_ty,
@@ -1022,7 +1014,8 @@ impl<'a> InferenceContext<'a> {
                 )
             }
         };
-
+        // Try to evaluate unevaluated constant, and insert variable if is not possible.
+        let len = self.table.insert_const_vars_shallow(len);
         TyKind::Array(elem_ty, len).intern(Interner)
     }
 
@@ -1678,9 +1671,10 @@ impl<'a> InferenceContext<'a> {
                 } else {
                     param_ty
                 };
-                if !coercion_target.is_unknown()
-                    && self.coerce(Some(arg), &ty, &coercion_target).is_err()
-                {
+                // The function signature may contain some unknown types, so we need to insert
+                // type vars here to avoid type mismatch false positive.
+                let coercion_target = self.insert_type_vars(coercion_target);
+                if self.coerce(Some(arg), &ty, &coercion_target).is_err() {
                     self.result.type_mismatches.insert(
                         arg.into(),
                         TypeMismatch { expected: coercion_target, actual: ty.clone() },
@@ -1721,6 +1715,7 @@ impl<'a> InferenceContext<'a> {
                         const_or_path_to_chalk(
                             this.db,
                             &this.resolver,
+                            this.owner.into(),
                             ty,
                             c,
                             ParamLoweringMode::Placeholder,

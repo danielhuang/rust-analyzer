@@ -15,11 +15,11 @@ use triomphe::Arc;
 
 use super::{InferOk, InferResult, InferenceContext, TypeError};
 use crate::{
-    db::HirDatabase, fold_tys_and_consts, static_lifetime, to_chalk_trait_id, traits::FnTrait,
-    AliasEq, AliasTy, BoundVar, Canonical, Const, ConstValue, DebruijnIndex, GenericArg,
-    GenericArgData, Goal, Guidance, InEnvironment, InferenceVar, Interner, Lifetime, ParamKind,
-    ProjectionTy, ProjectionTyExt, Scalar, Solution, Substitution, TraitEnvironment, Ty, TyBuilder,
-    TyExt, TyKind, VariableKind,
+    consteval::unknown_const, db::HirDatabase, fold_tys_and_consts, static_lifetime,
+    to_chalk_trait_id, traits::FnTrait, AliasEq, AliasTy, BoundVar, Canonical, Const, ConstValue,
+    DebruijnIndex, GenericArg, GenericArgData, Goal, Guidance, InEnvironment, InferenceVar,
+    Interner, Lifetime, ParamKind, ProjectionTy, ProjectionTyExt, Scalar, Solution, Substitution,
+    TraitEnvironment, Ty, TyBuilder, TyExt, TyKind, VariableKind,
 };
 
 impl<'a> InferenceContext<'a> {
@@ -256,10 +256,10 @@ impl<'a> InferenceTable<'a> {
                                 {
                                     eval
                                 } else {
-                                    c
+                                    unknown_const(c.data(Interner).ty.clone())
                                 }
                             } else {
-                                c
+                                unknown_const(c.data(Interner).ty.clone())
                             }
                         }
                         _ => c,
@@ -781,8 +781,16 @@ impl<'a> InferenceTable<'a> {
     pub(super) fn insert_const_vars_shallow(&mut self, c: Const) -> Const {
         let data = c.data(Interner);
         match &data.value {
-            ConstValue::Concrete(cc) => match cc.interned {
+            ConstValue::Concrete(cc) => match &cc.interned {
                 crate::ConstScalar::Unknown => self.new_const_var(data.ty.clone()),
+                // try to evaluate unevaluated const. Replace with new var if const eval failed.
+                crate::ConstScalar::UnevaluatedConst(id, subst) => {
+                    if let Ok(eval) = self.db.const_eval(*id, subst.clone()) {
+                        eval
+                    } else {
+                        self.new_const_var(data.ty.clone())
+                    }
+                }
                 _ => c,
             },
             _ => c,

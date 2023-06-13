@@ -29,8 +29,10 @@
 //!     future: pin
 //!     generator: pin
 //!     hash:
+//!     include:
 //!     index: sized
 //!     infallible:
+//!     int_impl: size_of, transmute
 //!     iterator: option
 //!     iterators: iterator, fn
 //!     manually_drop: drop
@@ -38,10 +40,12 @@
 //!     option: panic
 //!     ord: eq, option
 //!     panic: fmt
+//!     phantom_data:
 //!     pin:
 //!     range:
 //!     result:
 //!     send: sized
+//!     size_of: sized
 //!     sized:
 //!     slice:
 //!     sync: sized
@@ -119,6 +123,11 @@ pub mod marker {
     #[lang = "tuple_trait"]
     pub trait Tuple {}
     // endregion:fn
+
+    // region:phantom_data
+    #[lang = "phantom_data"]
+    pub struct PhantomData<T: ?Sized>;
+    // endregion:phantom_data
 }
 
 // region:default
@@ -338,6 +347,12 @@ pub mod mem {
         pub fn transmute<Src, Dst>(src: Src) -> Dst;
     }
     // endregion:transmute
+
+    // region:size_of
+    extern "rust-intrinsic" {
+        pub fn size_of<T>() -> usize;
+    }
+    // endregion:size_of
 }
 
 pub mod ptr {
@@ -720,6 +735,19 @@ pub mod ops {
     pub trait AddAssign<Rhs = Self> {
         fn add_assign(&mut self, rhs: Rhs);
     }
+
+    // region:builtin_impls
+    macro_rules! add_impl {
+        ($($t:ty)*) => ($(
+            impl const Add for $t {
+                type Output = $t;
+                fn add(self, other: $t) -> $t { self + other }
+            }
+        )*)
+    }
+
+    add_impl! { usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 f32 f64 }
+    // endregion:builtin_impls
     // endregion:add
 
     // region:generator
@@ -932,6 +960,13 @@ pub mod option {
             match self {
                 Some(val) => val,
                 None => panic!("called `Option::unwrap()` on a `None` value"),
+            }
+        }
+
+        pub const fn as_ref(&self) -> Option<&T> {
+            match self {
+                Some(x) => Some(x),
+                None => None,
             }
         }
 
@@ -1248,6 +1283,14 @@ mod macros {
         }
     }
     // endregion:derive
+
+    // region:include
+    #[rustc_builtin_macro]
+    #[macro_export]
+    macro_rules! include {
+        ($file:expr $(,)?) => {{ /* compiler built-in */ }};
+    }
+    // endregion:include
 }
 
 // region:non_zero
@@ -1271,6 +1314,25 @@ impl bool {
     }
 }
 // endregion:bool_impl
+
+// region:int_impl
+macro_rules! impl_int {
+    ($($t:ty)*) => {
+        $(
+            impl $t {
+                pub const fn from_ne_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
+                    unsafe { mem::transmute(bytes) }
+                }
+            }
+        )*
+    }
+}
+
+impl_int! {
+    usize u8 u16 u32 u64 u128
+    isize i8 i16 i32 i64 i128
+}
+// endregion:int_impl
 
 // region:error
 pub mod error {

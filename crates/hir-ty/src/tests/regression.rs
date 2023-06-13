@@ -246,6 +246,7 @@ fn infer_std_crash_5() {
     // taken from rustc
     check_infer(
         r#"
+        //- minicore: iterator
         fn extra_compiler_flags() {
             for content in doesnt_matter {
                 let name = if doesnt_matter {
@@ -264,6 +265,15 @@ fn infer_std_crash_5() {
         "#,
         expect![[r#"
             26..322 '{     ...   } }': ()
+            32..320 'for co...     }': fn into_iter<{unknown}>({unknown}) -> <{unknown} as IntoIterator>::IntoIter
+            32..320 'for co...     }': {unknown}
+            32..320 'for co...     }': !
+            32..320 'for co...     }': {unknown}
+            32..320 'for co...     }': &mut {unknown}
+            32..320 'for co...     }': fn next<{unknown}>(&mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            32..320 'for co...     }': Option<{unknown}>
+            32..320 'for co...     }': ()
+            32..320 'for co...     }': ()
             32..320 'for co...     }': ()
             36..43 'content': {unknown}
             47..60 'doesnt_matter': {unknown}
@@ -886,13 +896,13 @@ fn flush(&self) {
 "#,
         expect![[r#"
             123..127 'self': &Mutex<T>
-            150..152 '{}': MutexGuard<T>
+            150..152 '{}': MutexGuard<'_, T>
             234..238 'self': &{unknown}
             240..290 '{     ...()); }': ()
             250..251 'w': &Mutex<BufWriter>
             276..287 '*(w.lock())': BufWriter
             278..279 'w': &Mutex<BufWriter>
-            278..286 'w.lock()': MutexGuard<BufWriter>
+            278..286 'w.lock()': MutexGuard<'_, BufWriter>
         "#]],
     );
 }
@@ -1215,6 +1225,7 @@ fn mamba(a: U32!(), p: u32) -> u32 {
 fn for_loop_block_expr_iterable() {
     check_infer(
         r#"
+//- minicore: iterator
 fn test() {
     for _ in { let x = 0; } {
         let y = 0;
@@ -1223,8 +1234,17 @@ fn test() {
         "#,
         expect![[r#"
             10..68 '{     ...   } }': ()
+            16..66 'for _ ...     }': fn into_iter<()>(()) -> <() as IntoIterator>::IntoIter
+            16..66 'for _ ...     }': IntoIterator::IntoIter<()>
+            16..66 'for _ ...     }': !
+            16..66 'for _ ...     }': IntoIterator::IntoIter<()>
+            16..66 'for _ ...     }': &mut IntoIterator::IntoIter<()>
+            16..66 'for _ ...     }': fn next<IntoIterator::IntoIter<()>>(&mut IntoIterator::IntoIter<()>) -> Option<<IntoIterator::IntoIter<()> as Iterator>::Item>
+            16..66 'for _ ...     }': Option<Iterator::Item<IntoIterator::IntoIter<()>>>
             16..66 'for _ ...     }': ()
-            20..21 '_': {unknown}
+            16..66 'for _ ...     }': ()
+            16..66 'for _ ...     }': ()
+            20..21 '_': Iterator::Item<IntoIterator::IntoIter<()>>
             25..39 '{ let x = 0; }': ()
             31..32 'x': i32
             35..36 '0': i32
@@ -1835,5 +1855,126 @@ fn foo() {
         }
     }
 }",
+    );
+}
+
+#[test]
+fn regression_14844() {
+    check_no_mismatches(
+        r#"
+pub type Ty = Unknown;
+
+pub struct Inner<T>();
+
+pub struct Outer {
+    pub inner: Inner<Ty>,
+}
+
+fn main() {
+    _ = Outer {
+        inner: Inner::<i32>(),
+    };
+}
+        "#,
+    );
+    check_no_mismatches(
+        r#"
+pub const ONE: usize = 1;
+
+pub struct Inner<const P: usize>();
+
+pub struct Outer {
+    pub inner: Inner<ONE>,
+}
+
+fn main() {
+    _ = Outer {
+        inner: Inner::<1>(),
+    };
+}
+        "#,
+    );
+    check_no_mismatches(
+        r#"
+pub const ONE: usize = unknown();
+
+pub struct Inner<const P: usize>();
+
+pub struct Outer {
+    pub inner: Inner<ONE>,
+}
+
+fn main() {
+    _ = Outer {
+        inner: Inner::<1>(),
+    };
+}
+        "#,
+    );
+    check_no_mismatches(
+        r#"
+pub const N: usize = 2 + 2;
+
+fn f(t: [u8; N]) {}
+
+fn main() {
+    let a = [1, 2, 3, 4];
+    f(a);
+    let b = [1; 4];
+    let c: [u8; N] = b;
+    let d = [1; N];
+    let e: [u8; N] = d;
+    let f = [1; N];
+    let g = match f {
+        [a, b, c, d] => a + b + c + d,
+    };
+}
+        "#,
+    );
+}
+
+#[test]
+fn regression_14844_2() {
+    check_no_mismatches(
+        r#"
+//- minicore: fn
+pub const ONE: usize = 1;
+
+pub type MyInner = Inner<ONE>;
+
+pub struct Inner<const P: usize>();
+
+impl Inner<1> {
+    fn map<F>(&self, func: F) -> bool
+    where
+        F: Fn(&MyInner) -> bool,
+    {
+        func(self)
+    }
+}
+        "#,
+    );
+}
+
+#[test]
+fn dont_crash_on_slice_unsizing() {
+    check_no_mismatches(
+        r#"
+//- minicore: slice, unsize, coerce_unsized
+trait Tr {
+    fn f(self);
+}
+
+impl Tr for [i32] {
+    fn f(self) {
+        let t;
+        x(t);
+    }
+}
+
+fn x(a: [i32; 4]) {
+    let b = a.f();
+}
+        "#,
     );
 }

@@ -79,7 +79,7 @@ fn eval_goal(db: &TestDB, file_id: FileId) -> Result<Const, ConstEvalError> {
         .declarations()
         .find_map(|x| match x {
             hir_def::ModuleDefId::ConstId(x) => {
-                if db.const_data(x).name.as_ref()?.to_string() == "GOAL" {
+                if db.const_data(x).name.as_ref()?.display(db).to_string() == "GOAL" {
                     Some(x)
                 } else {
                     None
@@ -157,16 +157,29 @@ fn casts() {
         r#"
     //- minicore: coerce_unsized, index, slice
     const GOAL: usize = {
+        let a = &[10, 20, 30, 40] as &[i32];
+        a.len()
+    };
+        "#,
+        4,
+    );
+    check_number(
+        r#"
+    //- minicore: coerce_unsized, index, slice
+    const GOAL: usize = {
         let a = [10, 20, 3, 15];
         let x: &[i32] = &a;
         let y: *const [i32] = x;
         let z = y as *const [u8]; // slice fat pointer cast don't touch metadata
+        let q = z as *const str;
+        let p = q as *const [u8];
         let w = unsafe { &*z };
         w.len()
     };
         "#,
         4,
     );
+    check_number(r#"const GOAL: i32 = -12i8 as i32"#, -12);
 }
 
 #[test]
@@ -987,11 +1000,15 @@ fn path_pattern_matching() {
 
     const MY_SEASON: Season = Summer;
 
+    impl Season {
+        const FALL: Season = Fall;
+    }
+
     const fn f(x: Season) -> i32 {
         match x {
             Spring => 1,
             MY_SEASON => 2,
-            Fall => 3,
+            Season::FALL => 3,
             Winter => 4,
         }
     }
@@ -1018,16 +1035,39 @@ fn pattern_matching_literal() {
     );
     check_number(
         r#"
-    const fn f(x: &str) -> u8 {
+    const fn f(x: &str) -> i32 {
         match x {
-            "foo" => 1,
-            "bar" => 10,
-            _ => 100,
+            "f" => 1,
+            "foo" => 10,
+            "" => 100,
+            "bar" => 1000,
+            _ => 10000,
         }
     }
-    const GOAL: u8 = f("foo") + f("bar");
+    const GOAL: i32 = f("f") + f("foo") * 2 + f("") * 3 + f("bar") * 4;
         "#,
-        11,
+        4321,
+    );
+}
+
+#[test]
+fn pattern_matching_range() {
+    check_number(
+        r#"
+    pub const L: i32 = 6;
+    mod x {
+        pub const R: i32 = 100;
+    }
+    const fn f(x: i32) -> i32 {
+        match x {
+            -1..=5 => x * 10,
+            L..=x::R => x * 100,
+            _ => x,
+        }
+    }
+    const GOAL: i32 = f(-1) + f(2) + f(100) + f(-2) + f(1000);
+        "#,
+        11008,
     );
 }
 
@@ -1044,6 +1084,22 @@ fn pattern_matching_slice() {
     const GOAL: usize = f(&[10, 20, 3, 15, 1000, 60, 16]);
         "#,
         10 + 4 + 60 + 16,
+    );
+    check_number(
+        r#"
+    //- minicore: slice, index, coerce_unsized, copy
+    const fn f(x: &[usize]) -> usize {
+        match x {
+            [] => 0,
+            [a] => *a,
+            &[a, b] => a + b,
+            [a, b @ .., c, d] => *a + b.len() + *c + *d,
+        }
+    }
+    const GOAL: usize = f(&[]) + f(&[10]) + f(&[100, 100])
+        + f(&[1000, 1000, 1000]) + f(&[10000, 57, 34, 46, 10000, 10000]);
+        "#,
+        33213,
     );
 }
 
@@ -1996,6 +2052,17 @@ fn extern_weak_statics() {
 }
 
 #[test]
+fn from_ne_bytes() {
+    check_number(
+        r#"
+//- minicore: int_impl
+const GOAL: u32 = u32::from_ne_bytes([44, 1, 0, 0]);
+        "#,
+        300,
+    );
+}
+
+#[test]
 fn enums() {
     check_number(
         r#"
@@ -2104,6 +2171,26 @@ fn const_generic_subst_fn() {
     const GOAL: usize = f::<2>(3);
     "#,
         11,
+    );
+    check_number(
+        r#"
+    fn f<const N: usize>(x: [i32; N]) -> usize {
+        N
+    }
+
+    trait ArrayExt {
+        fn f(self) -> usize;
+    }
+
+    impl<T, const N: usize> ArrayExt for [T; N] {
+        fn g(self) -> usize {
+            f(self)
+        }
+    }
+
+    const GOAL: usize = f([1, 2, 5]);
+    "#,
+        3,
     );
 }
 

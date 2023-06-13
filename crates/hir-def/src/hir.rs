@@ -26,7 +26,7 @@ use crate::{
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
     path::{GenericArgs, Path},
     type_ref::{Mutability, Rawness, TypeRef},
-    AnonymousConstId, BlockId,
+    BlockId, ConstBlockId,
 };
 
 pub use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp};
@@ -94,6 +94,13 @@ pub enum Literal {
     // could not be used directly here, to understand how the wrapper works go to definition of
     // FloatTypeWrapper
     Float(FloatTypeWrapper, Option<BuiltinFloat>),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+/// Used in range patterns.
+pub enum LiteralOrConst {
+    Literal(Literal),
+    Const(Path),
 }
 
 impl Literal {
@@ -174,7 +181,7 @@ pub enum Expr {
         statements: Box<[Statement]>,
         tail: Option<ExprId>,
     },
-    Const(AnonymousConstId),
+    Const(ConstBlockId),
     Unsafe {
         id: Option<BlockId>,
         statements: Box<[Statement]>,
@@ -186,12 +193,6 @@ pub enum Expr {
     },
     While {
         condition: ExprId,
-        body: ExprId,
-        label: Option<LabelId>,
-    },
-    For {
-        iterable: ExprId,
-        pat: PatId,
         body: ExprId,
         label: Option<LabelId>,
     },
@@ -382,10 +383,6 @@ impl Expr {
                 f(*condition);
                 f(*body);
             }
-            Expr::For { iterable, body, .. } => {
-                f(*iterable);
-                f(*body);
-            }
             Expr::Call { callee, args, .. } => {
                 f(*callee);
                 args.iter().copied().for_each(f);
@@ -490,6 +487,16 @@ impl BindingAnnotation {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub enum BindingProblems {
+    /// https://doc.rust-lang.org/stable/error_codes/E0416.html
+    BoundMoreThanOnce,
+    /// https://doc.rust-lang.org/stable/error_codes/E0409.html
+    BoundInconsistently,
+    /// https://doc.rust-lang.org/stable/error_codes/E0408.html
+    NotBoundAcrossAll,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Binding {
     pub name: Name,
     pub mode: BindingAnnotation,
@@ -497,6 +504,7 @@ pub struct Binding {
     /// Id of the closure/generator that owns this binding. If it is owned by the
     /// top level expression, this field would be `None`.
     pub owner: Option<ExprId>,
+    pub problems: Option<BindingProblems>,
 }
 
 impl Binding {
@@ -526,7 +534,7 @@ pub enum Pat {
     Tuple { args: Box<[PatId]>, ellipsis: Option<usize> },
     Or(Box<[PatId]>),
     Record { path: Option<Box<Path>>, args: Box<[RecordFieldPat]>, ellipsis: bool },
-    Range { start: ExprId, end: ExprId },
+    Range { start: Option<Box<LiteralOrConst>>, end: Option<Box<LiteralOrConst>> },
     Slice { prefix: Box<[PatId]>, slice: Option<PatId>, suffix: Box<[PatId]> },
     Path(Box<Path>),
     Lit(ExprId),

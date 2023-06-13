@@ -84,7 +84,10 @@ pub use crate::{
     file_structure::{StructureNode, StructureNodeKind},
     folding_ranges::{Fold, FoldKind},
     highlight_related::{HighlightRelatedConfig, HighlightedRange},
-    hover::{HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult},
+    hover::{
+        HoverAction, HoverConfig, HoverDocFormat, HoverGotoTypeData, HoverResult,
+        MemoryLayoutHoverConfig, MemoryLayoutHoverRenderKind,
+    },
     inlay_hints::{
         AdjustmentHints, AdjustmentHintsMode, ClosureReturnTypeHints, DiscriminantHints, InlayHint,
         InlayHintLabel, InlayHintLabelPart, InlayHintPosition, InlayHintsConfig, InlayKind,
@@ -178,7 +181,7 @@ impl AnalysisHost {
     }
 
     /// NB: this clears the database
-    pub fn per_query_memory_usage(&mut self) -> Vec<(String, profile::Bytes)> {
+    pub fn per_query_memory_usage(&mut self) -> Vec<(String, profile::Bytes, usize)> {
         self.db.per_query_memory_usage()
     }
     pub fn request_cancellation(&mut self) {
@@ -405,7 +408,7 @@ impl Analysis {
         self.with_db(|db| {
             symbol_index::world_symbols(db, query)
                 .into_iter() // xx: should we make this a par iter?
-                .filter_map(|s| s.def.try_to_nav(db))
+                .filter_map(|s| s.try_to_nav(db))
                 .collect::<Vec<_>>()
         })
     }
@@ -529,6 +532,11 @@ impl Analysis {
     /// Returns the edition of the given crate.
     pub fn crate_edition(&self, crate_id: CrateId) -> Cancellable<Edition> {
         self.with_db(|db| db.crate_graph()[crate_id].edition)
+    }
+
+    /// Returns true if this crate has `no_std` or `no_core` specified.
+    pub fn is_crate_no_std(&self, crate_id: CrateId) -> Cancellable<bool> {
+        self.with_db(|db| hir::db::DefDatabase::crate_def_map(db, crate_id).is_no_std())
     }
 
     /// Returns the root file of the given crate.

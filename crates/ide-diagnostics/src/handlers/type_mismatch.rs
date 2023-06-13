@@ -645,6 +645,47 @@ fn h() {
     }
 
     #[test]
+    fn unknown_type_in_function_signature() {
+        check_diagnostics(
+            r#"
+struct X<T>(T);
+
+fn foo(x: X<Unknown>) {}
+fn test1() {
+    // Unknown might be `i32`, so we should not emit type mismatch here.
+    foo(X(42));
+}
+fn test2() {
+    foo(42);
+      //^^ error: expected X<{unknown}>, found i32
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn evaluate_const_generics_in_types() {
+        check_diagnostics(
+            r#"
+pub const ONE: usize = 1;
+
+pub struct Inner<const P: usize>();
+
+pub struct Outer {
+    pub inner: Inner<ONE>,
+}
+
+fn main() {
+    _ = Outer {
+        inner: Inner::<2>(),
+             //^^^^^^^^^^^^ error: expected Inner<1>, found Inner<2>
+    };
+}
+"#,
+        );
+    }
+
+    #[test]
     fn type_mismatch_pat_smoke_test() {
         check_diagnostics(
             r#"

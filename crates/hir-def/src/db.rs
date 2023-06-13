@@ -16,21 +16,22 @@ use crate::{
         TraitAliasData, TraitData, TypeAliasData,
     },
     generics::GenericParams,
-    hir::ExprId,
     import_map::ImportMap,
     item_tree::{AttrOwner, ItemTree},
     lang_item::{LangItem, LangItemTarget, LangItems},
     nameres::{diagnostics::DefDiagnostic, DefMap},
     visibility::{self, Visibility},
-    AnonymousConstId, AttrDefId, BlockId, BlockLoc, ConstId, ConstLoc, DefWithBodyId, EnumId,
-    EnumLoc, ExternBlockId, ExternBlockLoc, FunctionId, FunctionLoc, GenericDefId, ImplId, ImplLoc,
-    LocalEnumVariantId, LocalFieldId, Macro2Id, Macro2Loc, MacroRulesId, MacroRulesLoc,
-    ProcMacroId, ProcMacroLoc, StaticId, StaticLoc, StructId, StructLoc, TraitAliasId,
-    TraitAliasLoc, TraitId, TraitLoc, TypeAliasId, TypeAliasLoc, UnionId, UnionLoc, VariantId,
+    AttrDefId, BlockId, BlockLoc, ConstBlockId, ConstBlockLoc, ConstId, ConstLoc, DefWithBodyId,
+    EnumId, EnumLoc, ExternBlockId, ExternBlockLoc, FunctionId, FunctionLoc, GenericDefId, ImplId,
+    ImplLoc, InTypeConstId, InTypeConstLoc, LocalEnumVariantId, LocalFieldId, Macro2Id, Macro2Loc,
+    MacroRulesId, MacroRulesLoc, ProcMacroId, ProcMacroLoc, StaticId, StaticLoc, StructId,
+    StructLoc, TraitAliasId, TraitAliasLoc, TraitId, TraitLoc, TypeAliasId, TypeAliasLoc, UnionId,
+    UnionLoc, VariantId,
 };
 
 #[salsa::query_group(InternDatabaseStorage)]
 pub trait InternDatabase: SourceDatabase {
+    // region: items
     #[salsa::interned]
     fn intern_function(&self, loc: FunctionLoc) -> FunctionId;
     #[salsa::interned]
@@ -54,15 +55,19 @@ pub trait InternDatabase: SourceDatabase {
     #[salsa::interned]
     fn intern_extern_block(&self, loc: ExternBlockLoc) -> ExternBlockId;
     #[salsa::interned]
-    fn intern_block(&self, loc: BlockLoc) -> BlockId;
-    #[salsa::interned]
     fn intern_macro2(&self, loc: Macro2Loc) -> Macro2Id;
     #[salsa::interned]
     fn intern_proc_macro(&self, loc: ProcMacroLoc) -> ProcMacroId;
     #[salsa::interned]
     fn intern_macro_rules(&self, loc: MacroRulesLoc) -> MacroRulesId;
+    // endregion: items
+
     #[salsa::interned]
-    fn intern_anonymous_const(&self, id: (DefWithBodyId, ExprId)) -> AnonymousConstId;
+    fn intern_block(&self, loc: BlockLoc) -> BlockId;
+    #[salsa::interned]
+    fn intern_anonymous_const(&self, id: ConstBlockLoc) -> ConstBlockId;
+    #[salsa::interned]
+    fn intern_in_type_const(&self, id: InTypeConstLoc) -> InTypeConstId;
 }
 
 #[salsa::query_group(DefDatabaseStorage)]
@@ -198,14 +203,13 @@ pub trait DefDatabase: InternDatabase + ExpandDatabase + Upcast<dyn ExpandDataba
 
     // endregion:attrs
 
-    #[salsa::invoke(LangItems::crate_lang_items_query)]
-    fn crate_lang_items(&self, krate: CrateId) -> Arc<LangItems>;
-
     #[salsa::invoke(LangItems::lang_item_query)]
     fn lang_item(&self, start_crate: CrateId, item: LangItem) -> Option<LangItemTarget>;
 
     #[salsa::invoke(ImportMap::import_map_query)]
     fn import_map(&self, krate: CrateId) -> Arc<ImportMap>;
+
+    // region:visibilities
 
     #[salsa::invoke(visibility::field_visibilities_query)]
     fn field_visibilities(&self, var: VariantId) -> Arc<ArenaMap<LocalFieldId, Visibility>>;
@@ -217,8 +221,14 @@ pub trait DefDatabase: InternDatabase + ExpandDatabase + Upcast<dyn ExpandDataba
     #[salsa::invoke(visibility::const_visibility_query)]
     fn const_visibility(&self, def: ConstId) -> Visibility;
 
+    // endregion:visibilities
+
+    #[salsa::invoke(LangItems::crate_lang_items_query)]
+    fn crate_lang_items(&self, krate: CrateId) -> Arc<LangItems>;
+
     #[salsa::transparent]
     fn crate_limits(&self, crate_id: CrateId) -> CrateLimits;
+
     #[salsa::transparent]
     fn recursion_limit(&self, crate_id: CrateId) -> u32;
 

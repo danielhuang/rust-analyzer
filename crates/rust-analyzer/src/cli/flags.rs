@@ -92,6 +92,8 @@ xflags::xflags! {
             optional --disable-build-scripts
             /// Don't use expand proc macros.
             optional --disable-proc-macros
+            /// Run a custom proc-macro-srv binary.
+            optional --proc-macro-srv path: PathBuf
         }
 
         cmd ssr {
@@ -112,6 +114,9 @@ xflags::xflags! {
 
         cmd scip {
             required path: PathBuf
+
+            /// The output path where the SCIP file will be written to. Defaults to `index.scip`.
+            optional --output path: PathBuf
         }
     }
 }
@@ -186,6 +191,7 @@ pub struct Diagnostics {
 
     pub disable_build_scripts: bool,
     pub disable_proc_macros: bool,
+    pub proc_macro_srv: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -208,6 +214,7 @@ pub struct Lsif {
 #[derive(Debug)]
 pub struct Scip {
     pub path: PathBuf,
+    pub output: Option<PathBuf>,
 }
 
 impl RustAnalyzer {

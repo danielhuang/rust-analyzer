@@ -19,7 +19,7 @@ use triomphe::Arc;
 use vfs::AnchoredPathBuf;
 
 use crate::{
-    config::Config,
+    config::{Config, ConfigError},
     diagnostics::{CheckFixes, DiagnosticCollection},
     from_proto,
     line_index::{LineEndings, LineIndex},
@@ -52,24 +52,34 @@ pub(crate) type ReqQueue = lsp_server::ReqQueue<(String, Instant), ReqHandler>;
 pub(crate) struct GlobalState {
     sender: Sender<lsp_server::Message>,
     req_queue: ReqQueue,
+
     pub(crate) task_pool: Handle<TaskPool<Task>, Receiver<Task>>,
-    pub(crate) loader: Handle<Box<dyn vfs::loader::Handle>, Receiver<vfs::loader::Message>>,
+    pub(crate) fmt_pool: Handle<TaskPool<Task>, Receiver<Task>>,
+
     pub(crate) config: Arc<Config>,
+    pub(crate) config_errors: Option<ConfigError>,
     pub(crate) analysis_host: AnalysisHost,
     pub(crate) diagnostics: DiagnosticCollection,
     pub(crate) mem_docs: MemDocs,
+    pub(crate) source_root_config: SourceRootConfig,
     pub(crate) semantic_tokens_cache: Arc<Mutex<FxHashMap<Url, SemanticTokens>>>,
+
+    // status
     pub(crate) shutdown_requested: bool,
     pub(crate) last_reported_status: Option<lsp_ext::ServerStatusParams>,
-    pub(crate) source_root_config: SourceRootConfig,
 
+    // proc macros
     pub(crate) proc_macro_changed: bool,
     pub(crate) proc_macro_clients: Arc<[anyhow::Result<ProcMacroServer>]>,
 
+    // Flycheck
     pub(crate) flycheck: Arc<[FlycheckHandle]>,
     pub(crate) flycheck_sender: Sender<flycheck::Message>,
     pub(crate) flycheck_receiver: Receiver<flycheck::Message>,
+    pub(crate) last_flycheck_error: Option<String>,
 
+    // VFS
+    pub(crate) loader: Handle<Box<dyn vfs::loader::Handle>, Receiver<vfs::loader::Message>>,
     pub(crate) vfs: Arc<RwLock<(vfs::Vfs, IntMap<FileId, LineEndings>)>>,
     pub(crate) vfs_config_version: u32,
     pub(crate) vfs_progress_config_version: u32,
@@ -102,11 +112,12 @@ pub(crate) struct GlobalState {
     /// the user just adds comments or whitespace to Cargo.toml, we do not want
     /// to invalidate any salsa caches.
     pub(crate) workspaces: Arc<Vec<ProjectWorkspace>>,
+
+    // op queues
     pub(crate) fetch_workspaces_queue: OpQueue<(), Option<Vec<anyhow::Result<ProjectWorkspace>>>>,
     pub(crate) fetch_build_data_queue:
         OpQueue<(), (Arc<Vec<ProjectWorkspace>>, Vec<anyhow::Result<WorkspaceBuildScripts>>)>,
     pub(crate) fetch_proc_macros_queue: OpQueue<Vec<ProcMacroPaths>, bool>,
-
     pub(crate) prime_caches_queue: OpQueue,
 }
 
@@ -141,6 +152,11 @@ impl GlobalState {
             let handle = TaskPool::new_with_threads(sender, config.main_loop_num_threads());
             Handle { handle, receiver }
         };
+        let fmt_pool = {
+            let (sender, receiver) = unbounded();
+            let handle = TaskPool::new_with_threads(sender, 1);
+            Handle { handle, receiver }
+        };
 
         let mut analysis_host = AnalysisHost::new(config.lru_parse_query_capacity());
         if let Some(capacities) = config.lru_query_capacities() {
@@ -151,6 +167,7 @@ impl GlobalState {
             sender,
             req_queue: ReqQueue::default(),
             task_pool,
+            fmt_pool,
             loader,
             config: Arc::new(config.clone()),
             analysis_host,
@@ -160,6 +177,7 @@ impl GlobalState {
             shutdown_requested: false,
             last_reported_status: None,
             source_root_config: SourceRootConfig::default(),
+            config_errors: Default::default(),
 
             proc_macro_changed: false,
             // FIXME: use `Arc::from_iter` when it becomes available
@@ -169,6 +187,7 @@ impl GlobalState {
             flycheck: Arc::from(Vec::new()),
             flycheck_sender,
             flycheck_receiver,
+            last_flycheck_error: None,
 
             vfs: Arc::new(RwLock::new((vfs::Vfs::default(), IntMap::default()))),
             vfs_config_version: 0,

@@ -1,10 +1,14 @@
 //! Helper functions for working with def, which don't need to be a separate
 //! query, but can't be computed directly from `*Data` (ie, which need a `db`).
 
-use std::iter;
+use std::{hash::Hash, iter};
 
 use base_db::CrateId;
-use chalk_ir::{cast::Cast, fold::Shift, BoundVar, DebruijnIndex, Mutability};
+use chalk_ir::{
+    cast::Cast,
+    fold::{FallibleTypeFolder, Shift},
+    BoundVar, DebruijnIndex,
+};
 use either::Either;
 use hir_def::{
     db::DefDatabase,
@@ -12,12 +16,12 @@ use hir_def::{
         GenericParams, TypeOrConstParamData, TypeParamProvenance, WherePredicate,
         WherePredicateTypeTarget,
     },
-    hir::BindingAnnotation,
     lang_item::LangItem,
     resolver::{HasResolver, TypeNs},
     type_ref::{TraitBoundModifier, TypeRef},
-    ConstParamId, FunctionId, GenericDefId, ItemContainerId, Lookup, TraitId, TypeAliasId,
-    TypeOrConstParamId, TypeParamId,
+    ConstParamId, EnumId, EnumVariantId, FunctionId, GenericDefId, ItemContainerId,
+    LocalEnumVariantId, Lookup, OpaqueInternableThing, TraitId, TypeAliasId, TypeOrConstParamId,
+    TypeParamId,
 };
 use hir_expand::name::Name;
 use intern::Interned;
@@ -26,8 +30,12 @@ use smallvec::{smallvec, SmallVec};
 use stdx::never;
 
 use crate::{
-    db::HirDatabase, ChalkTraitId, GenericArg, Interner, Substitution, TraitRef, TraitRefExt, Ty,
-    TyExt, WhereClause,
+    consteval::unknown_const,
+    db::HirDatabase,
+    layout::{Layout, TagEncoding},
+    mir::pad16,
+    ChalkTraitId, Const, ConstScalar, GenericArg, Interner, Substitution, TraitRef, TraitRefExt,
+    Ty, WhereClause,
 };
 
 pub(crate) fn fn_traits(
@@ -387,19 +395,98 @@ pub fn is_fn_unsafe_to_call(db: &dyn HirDatabase, func: FunctionId) -> bool {
     }
 }
 
-pub(crate) fn pattern_matching_dereference_count(
-    cond_ty: &mut Ty,
-    binding_mode: &mut BindingAnnotation,
-) -> usize {
-    let mut r = 0;
-    while let Some((ty, _, mu)) = cond_ty.as_reference() {
-        if mu == Mutability::Mut && *binding_mode != BindingAnnotation::Ref {
-            *binding_mode = BindingAnnotation::RefMut;
-        } else {
-            *binding_mode = BindingAnnotation::Ref;
-        }
-        *cond_ty = ty.clone();
-        r += 1;
+pub(crate) struct UnevaluatedConstEvaluatorFolder<'a> {
+    pub(crate) db: &'a dyn HirDatabase,
+}
+
+impl FallibleTypeFolder<Interner> for UnevaluatedConstEvaluatorFolder<'_> {
+    type Error = ();
+
+    fn as_dyn(&mut self) -> &mut dyn FallibleTypeFolder<Interner, Error = ()> {
+        self
     }
-    r
+
+    fn interner(&self) -> Interner {
+        Interner
+    }
+
+    fn try_fold_const(
+        &mut self,
+        constant: Const,
+        _outer_binder: DebruijnIndex,
+    ) -> Result<Const, Self::Error> {
+        if let chalk_ir::ConstValue::Concrete(c) = &constant.data(Interner).value {
+            if let ConstScalar::UnevaluatedConst(id, subst) = &c.interned {
+                if let Ok(eval) = self.db.const_eval(*id, subst.clone()) {
+                    return Ok(eval);
+                } else {
+                    return Ok(unknown_const(constant.data(Interner).ty.clone()));
+                }
+            }
+        }
+        Ok(constant)
+    }
+}
+
+pub(crate) fn detect_variant_from_bytes<'a>(
+    layout: &'a Layout,
+    db: &dyn HirDatabase,
+    krate: CrateId,
+    b: &[u8],
+    e: EnumId,
+) -> Option<(LocalEnumVariantId, &'a Layout)> {
+    let (var_id, var_layout) = match &layout.variants {
+        hir_def::layout::Variants::Single { index } => (index.0, &*layout),
+        hir_def::layout::Variants::Multiple { tag, tag_encoding, variants, .. } => {
+            let target_data_layout = db.target_data_layout(krate)?;
+            let size = tag.size(&*target_data_layout).bytes_usize();
+            let offset = layout.fields.offset(0).bytes_usize(); // The only field on enum variants is the tag field
+            let tag = i128::from_le_bytes(pad16(&b[offset..offset + size], false));
+            match tag_encoding {
+                TagEncoding::Direct => {
+                    let x = variants.iter_enumerated().find(|x| {
+                        db.const_eval_discriminant(EnumVariantId { parent: e, local_id: x.0 .0 })
+                            == Ok(tag)
+                    })?;
+                    (x.0 .0, x.1)
+                }
+                TagEncoding::Niche { untagged_variant, niche_start, .. } => {
+                    let candidate_tag = tag.wrapping_sub(*niche_start as i128) as usize;
+                    let variant = variants
+                        .iter_enumerated()
+                        .map(|(x, _)| x)
+                        .filter(|x| x != untagged_variant)
+                        .nth(candidate_tag)
+                        .unwrap_or(*untagged_variant);
+                    (variant.0, &variants[variant])
+                }
+            }
+        }
+    };
+    Some((var_id, var_layout))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct InTypeConstIdMetadata(pub(crate) Ty);
+
+impl OpaqueInternableThing for InTypeConstIdMetadata {
+    fn dyn_hash(&self, mut state: &mut dyn std::hash::Hasher) {
+        self.hash(&mut state);
+    }
+
+    fn dyn_eq(&self, other: &dyn OpaqueInternableThing) -> bool {
+        other.as_any().downcast_ref::<Self>().map_or(false, |x| self == x)
+    }
+
+    fn dyn_clone(&self) -> Box<dyn OpaqueInternableThing> {
+        Box::new(self.clone())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn box_any(&self) -> Box<dyn std::any::Any> {
+        Box::new(self.clone())
+    }
 }

@@ -41,6 +41,23 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
     #[salsa::invoke(crate::mir::mir_body_for_closure_query)]
     fn mir_body_for_closure(&self, def: ClosureId) -> Result<Arc<MirBody>, MirLowerError>;
 
+    #[salsa::invoke(crate::mir::monomorphized_mir_body_query)]
+    #[salsa::cycle(crate::mir::monomorphized_mir_body_recover)]
+    fn monomorphized_mir_body(
+        &self,
+        def: DefWithBodyId,
+        subst: Substitution,
+        env: Arc<crate::TraitEnvironment>,
+    ) -> Result<Arc<MirBody>, MirLowerError>;
+
+    #[salsa::invoke(crate::mir::monomorphized_mir_body_for_closure_query)]
+    fn monomorphized_mir_body_for_closure(
+        &self,
+        def: ClosureId,
+        subst: Substitution,
+        env: Arc<crate::TraitEnvironment>,
+    ) -> Result<Arc<MirBody>, MirLowerError>;
+
     #[salsa::invoke(crate::mir::borrowck_query)]
     fn borrowck(&self, def: DefWithBodyId) -> Result<Arc<[BorrowckResult]>, MirLowerError>;
 
@@ -84,7 +101,11 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
         def: AdtId,
         subst: Substitution,
         krate: CrateId,
-    ) -> Result<Layout, LayoutError>;
+    ) -> Result<Arc<Layout>, LayoutError>;
+
+    #[salsa::invoke(crate::layout::layout_of_ty_query)]
+    #[salsa::cycle(crate::layout::layout_of_ty_recover)]
+    fn layout_of_ty(&self, ty: Ty, krate: CrateId) -> Result<Arc<Layout>, LayoutError>;
 
     #[salsa::invoke(crate::layout::target_data_layout_query)]
     fn target_data_layout(&self, krate: CrateId) -> Option<Arc<TargetDataLayout>>;
@@ -243,14 +264,21 @@ pub trait HirDatabase: DefDatabase + Upcast<dyn DefDatabase> {
 
 fn infer_wait(db: &dyn HirDatabase, def: DefWithBodyId) -> Arc<InferenceResult> {
     let _p = profile::span("infer:wait").detail(|| match def {
-        DefWithBodyId::FunctionId(it) => db.function_data(it).name.to_string(),
-        DefWithBodyId::StaticId(it) => db.static_data(it).name.clone().to_string(),
-        DefWithBodyId::ConstId(it) => {
-            db.const_data(it).name.clone().unwrap_or_else(Name::missing).to_string()
+        DefWithBodyId::FunctionId(it) => db.function_data(it).name.display(db.upcast()).to_string(),
+        DefWithBodyId::StaticId(it) => {
+            db.static_data(it).name.clone().display(db.upcast()).to_string()
         }
+        DefWithBodyId::ConstId(it) => db
+            .const_data(it)
+            .name
+            .clone()
+            .unwrap_or_else(Name::missing)
+            .display(db.upcast())
+            .to_string(),
         DefWithBodyId::VariantId(it) => {
-            db.enum_data(it.parent).variants[it.local_id].name.to_string()
+            db.enum_data(it.parent).variants[it.local_id].name.display(db.upcast()).to_string()
         }
+        DefWithBodyId::InTypeConstId(it) => format!("in type const {it:?}"),
     });
     db.infer_query(def)
 }

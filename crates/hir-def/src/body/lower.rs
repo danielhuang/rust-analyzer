@@ -30,9 +30,9 @@ use crate::{
     db::DefDatabase,
     expander::Expander,
     hir::{
-        dummy_expr_id, Array, Binding, BindingAnnotation, BindingId, CaptureBy, ClosureKind, Expr,
-        ExprId, Label, LabelId, Literal, MatchArm, Movability, Pat, PatId, RecordFieldPat,
-        RecordLitField, Statement,
+        dummy_expr_id, Array, Binding, BindingAnnotation, BindingId, BindingProblems, CaptureBy,
+        ClosureKind, Expr, ExprId, Label, LabelId, Literal, LiteralOrConst, MatchArm, Movability,
+        Pat, PatId, RecordFieldPat, RecordLitField, Statement,
     },
     item_scope::BuiltinShadowMode,
     lang_item::LangItem,
@@ -40,7 +40,7 @@ use crate::{
     nameres::{DefMap, MacroSubNs},
     path::{GenericArgs, Path},
     type_ref::{Mutability, Rawness, TypeRef},
-    AdtId, BlockId, BlockLoc, DefWithBodyId, ModuleDefId, UnresolvedMacro,
+    AdtId, BlockId, BlockLoc, ConstBlockLoc, DefWithBodyId, ModuleDefId, UnresolvedMacro,
 };
 
 pub(super) fn lower(
@@ -141,6 +141,8 @@ impl RibKind {
 #[derive(Debug, Default)]
 struct BindingList {
     map: FxHashMap<Name, BindingId>,
+    is_used: FxHashMap<BindingId, bool>,
+    reject_new: bool,
 }
 
 impl BindingList {
@@ -150,7 +152,27 @@ impl BindingList {
         name: Name,
         mode: BindingAnnotation,
     ) -> BindingId {
-        *self.map.entry(name).or_insert_with_key(|n| ec.alloc_binding(n.clone(), mode))
+        let id = *self.map.entry(name).or_insert_with_key(|n| ec.alloc_binding(n.clone(), mode));
+        if ec.body.bindings[id].mode != mode {
+            ec.body.bindings[id].problems = Some(BindingProblems::BoundInconsistently);
+        }
+        self.check_is_used(ec, id);
+        id
+    }
+
+    fn check_is_used(&mut self, ec: &mut ExprCollector<'_>, id: BindingId) {
+        match self.is_used.get(&id) {
+            None => {
+                if self.reject_new {
+                    ec.body.bindings[id].problems = Some(BindingProblems::NotBoundAcrossAll);
+                }
+            }
+            Some(true) => {
+                ec.body.bindings[id].problems = Some(BindingProblems::BoundMoreThanOnce);
+            }
+            Some(false) => {}
+        }
+        self.is_used.insert(id, true);
     }
 }
 
@@ -275,7 +297,10 @@ impl ExprCollector<'_> {
                         let (result_expr_id, prev_binding_owner) =
                             this.initialize_binding_owner(syntax_ptr);
                         let inner_expr = this.collect_block(e);
-                        let x = this.db.intern_anonymous_const((this.owner, inner_expr));
+                        let x = this.db.intern_anonymous_const(ConstBlockLoc {
+                            parent: this.owner,
+                            root: inner_expr,
+                        });
                         this.body.exprs[result_expr_id] = Expr::Const(x);
                         this.current_binding_owner = prev_binding_owner;
                         result_expr_id
@@ -295,13 +320,7 @@ impl ExprCollector<'_> {
 
                 self.alloc_expr(Expr::While { condition, body, label }, syntax_ptr)
             }
-            ast::Expr::ForExpr(e) => {
-                let label = e.label().map(|label| self.collect_label(label));
-                let iterable = self.collect_expr_opt(e.iterable());
-                let pat = self.collect_pat_top(e.pat());
-                let body = self.collect_labelled_block_opt(label, e.loop_body());
-                self.alloc_expr(Expr::For { iterable, pat, body, label }, syntax_ptr)
-            }
+            ast::Expr::ForExpr(e) => self.collect_for_loop(syntax_ptr, e),
             ast::Expr::CallExpr(e) => {
                 let is_rustc_box = {
                     let attrs = e.attrs();
@@ -548,9 +567,18 @@ impl ExprCollector<'_> {
                 self.alloc_expr(Expr::BinaryOp { lhs, rhs, op }, syntax_ptr)
             }
             ast::Expr::TupleExpr(e) => {
-                let exprs = e.fields().map(|expr| self.collect_expr(expr)).collect();
+                let mut exprs: Vec<_> = e.fields().map(|expr| self.collect_expr(expr)).collect();
+                // if there is a leading comma, the user is most likely to type out a leading expression
+                // so we insert a missing expression at the beginning for IDE features
+                if comma_follows_token(e.l_paren_token()) {
+                    exprs.insert(0, self.missing_expr());
+                }
+
                 self.alloc_expr(
-                    Expr::Tuple { exprs, is_assignee_expr: self.is_lowering_assignee_expr },
+                    Expr::Tuple {
+                        exprs: exprs.into_boxed_slice(),
+                        is_assignee_expr: self.is_lowering_assignee_expr,
+                    },
                     syntax_ptr,
                 )
             }
@@ -701,6 +729,93 @@ impl ExprCollector<'_> {
         *tail = Some(next_tail);
         self.current_try_block_label = old_label;
         expr_id
+    }
+
+    /// Desugar `ast::ForExpr` from: `[opt_ident]: for <pat> in <head> <body>` into:
+    /// ```ignore (pseudo-rust)
+    /// match IntoIterator::into_iter(<head>) {
+    ///     mut iter => {
+    ///         [opt_ident]: loop {
+    ///             match Iterator::next(&mut iter) {
+    ///                 None => break,
+    ///                 Some(<pat>) => <body>,
+    ///             };
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    fn collect_for_loop(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::ForExpr) -> ExprId {
+        let (into_iter_fn, iter_next_fn, option_some, option_none) = 'if_chain: {
+            if let Some(into_iter_fn) = LangItem::IntoIterIntoIter.path(self.db, self.krate) {
+                if let Some(iter_next_fn) = LangItem::IteratorNext.path(self.db, self.krate) {
+                    if let Some(option_some) = LangItem::OptionSome.path(self.db, self.krate) {
+                        if let Some(option_none) = LangItem::OptionNone.path(self.db, self.krate) {
+                            break 'if_chain (into_iter_fn, iter_next_fn, option_some, option_none);
+                        }
+                    }
+                }
+            }
+            // Some of the needed lang items are missing, so we can't desugar
+            return self.alloc_expr(Expr::Missing, syntax_ptr);
+        };
+        let head = self.collect_expr_opt(e.iterable());
+        let into_iter_fn_expr = self.alloc_expr(Expr::Path(into_iter_fn), syntax_ptr.clone());
+        let iterator = self.alloc_expr(
+            Expr::Call {
+                callee: into_iter_fn_expr,
+                args: Box::new([head]),
+                is_assignee_expr: false,
+            },
+            syntax_ptr.clone(),
+        );
+        let none_arm = MatchArm {
+            pat: self.alloc_pat_desugared(Pat::Path(Box::new(option_none))),
+            guard: None,
+            expr: self.alloc_expr(Expr::Break { expr: None, label: None }, syntax_ptr.clone()),
+        };
+        let some_pat = Pat::TupleStruct {
+            path: Some(Box::new(option_some)),
+            args: Box::new([self.collect_pat_top(e.pat())]),
+            ellipsis: None,
+        };
+        let label = e.label().map(|label| self.collect_label(label));
+        let some_arm = MatchArm {
+            pat: self.alloc_pat_desugared(some_pat),
+            guard: None,
+            expr: self.with_opt_labeled_rib(label, |this| {
+                this.collect_expr_opt(e.loop_body().map(|x| x.into()))
+            }),
+        };
+        let iter_name = Name::generate_new_name();
+        let iter_binding = self.alloc_binding(iter_name.clone(), BindingAnnotation::Mutable);
+        let iter_expr = self.alloc_expr(Expr::Path(Path::from(iter_name)), syntax_ptr.clone());
+        let iter_expr_mut = self.alloc_expr(
+            Expr::Ref { expr: iter_expr, rawness: Rawness::Ref, mutability: Mutability::Mut },
+            syntax_ptr.clone(),
+        );
+        let iter_next_fn_expr = self.alloc_expr(Expr::Path(iter_next_fn), syntax_ptr.clone());
+        let iter_next_expr = self.alloc_expr(
+            Expr::Call {
+                callee: iter_next_fn_expr,
+                args: Box::new([iter_expr_mut]),
+                is_assignee_expr: false,
+            },
+            syntax_ptr.clone(),
+        );
+        let loop_inner = self.alloc_expr(
+            Expr::Match { expr: iter_next_expr, arms: Box::new([none_arm, some_arm]) },
+            syntax_ptr.clone(),
+        );
+        let loop_outer =
+            self.alloc_expr(Expr::Loop { body: loop_inner, label }, syntax_ptr.clone());
+        let iter_pat = self.alloc_pat_desugared(Pat::Bind { id: iter_binding, subpat: None });
+        self.alloc_expr(
+            Expr::Match {
+                expr: iterator,
+                arms: Box::new([MatchArm { pat: iter_pat, guard: None, expr: loop_outer }]),
+            },
+            syntax_ptr.clone(),
+        )
     }
 
     /// Desugar `ast::TryExpr` from: `<expr>?` into:
@@ -985,7 +1100,7 @@ impl ExprCollector<'_> {
             match block_id.map(|block_id| (self.db.block_def_map(block_id), block_id)) {
                 Some((def_map, block_id)) => {
                     self.body.block_scopes.push(block_id);
-                    (def_map.module_id(def_map.root()), def_map)
+                    (def_map.module_id(DefMap::ROOT), def_map)
                 }
                 None => (self.expander.module, self.def_map.clone()),
             };
@@ -1101,7 +1216,11 @@ impl ExprCollector<'_> {
             ast::Pat::TupleStructPat(p) => {
                 let path =
                     p.path().and_then(|path| self.expander.parse_path(self.db, path)).map(Box::new);
-                let (args, ellipsis) = self.collect_tuple_pat(p.fields(), binding_list);
+                let (args, ellipsis) = self.collect_tuple_pat(
+                    p.fields(),
+                    comma_follows_token(p.l_paren_token()),
+                    binding_list,
+                );
                 Pat::TupleStruct { path, args, ellipsis }
             }
             ast::Pat::RefPat(p) => {
@@ -1114,13 +1233,42 @@ impl ExprCollector<'_> {
                     p.path().and_then(|path| self.expander.parse_path(self.db, path)).map(Box::new);
                 path.map(Pat::Path).unwrap_or(Pat::Missing)
             }
-            ast::Pat::OrPat(p) => {
-                let pats = p.pats().map(|p| self.collect_pat(p, binding_list)).collect();
-                Pat::Or(pats)
+            ast::Pat::OrPat(p) => 'b: {
+                let prev_is_used = mem::take(&mut binding_list.is_used);
+                let prev_reject_new = mem::take(&mut binding_list.reject_new);
+                let mut pats = Vec::with_capacity(p.pats().count());
+                let mut it = p.pats();
+                let Some(first) = it.next() else {
+                    break 'b Pat::Or(Box::new([]));
+                };
+                pats.push(self.collect_pat(first, binding_list));
+                binding_list.reject_new = true;
+                for rest in it {
+                    for (_, x) in binding_list.is_used.iter_mut() {
+                        *x = false;
+                    }
+                    pats.push(self.collect_pat(rest, binding_list));
+                    for (&id, &x) in binding_list.is_used.iter() {
+                        if !x {
+                            self.body.bindings[id].problems =
+                                Some(BindingProblems::NotBoundAcrossAll);
+                        }
+                    }
+                }
+                binding_list.reject_new = prev_reject_new;
+                let current_is_used = mem::replace(&mut binding_list.is_used, prev_is_used);
+                for (id, _) in current_is_used.into_iter() {
+                    binding_list.check_is_used(self, id);
+                }
+                Pat::Or(pats.into())
             }
             ast::Pat::ParenPat(p) => return self.collect_pat_opt(p.pat(), binding_list),
             ast::Pat::TuplePat(p) => {
-                let (args, ellipsis) = self.collect_tuple_pat(p.fields(), binding_list);
+                let (args, ellipsis) = self.collect_tuple_pat(
+                    p.fields(),
+                    comma_follows_token(p.l_paren_token()),
+                    binding_list,
+                );
                 Pat::Tuple { args, ellipsis }
             }
             ast::Pat::WildcardPat(_) => Pat::Wild,
@@ -1159,22 +1307,12 @@ impl ExprCollector<'_> {
             }
             #[rustfmt::skip] // https://github.com/rust-lang/rustfmt/issues/5676
             ast::Pat::LiteralPat(lit) => 'b: {
-                if let Some(ast_lit) = lit.literal() {
-                    let mut hir_lit: Literal = ast_lit.kind().into();
-                    if lit.minus_token().is_some() {
-                        let Some(h) = hir_lit.negate() else {
-                            break 'b Pat::Missing;
-                        };
-                        hir_lit = h;
-                    }
-                    let expr = Expr::Literal(hir_lit);
-                    let expr_ptr = AstPtr::new(&ast::Expr::Literal(ast_lit));
-                    let expr_id = self.alloc_expr(expr, expr_ptr);
-                    Pat::Lit(expr_id)
-                } else {
-                    Pat::Missing
-                }
-            },
+                let Some((hir_lit, ast_lit)) = pat_literal_to_hir(lit) else { break 'b Pat::Missing };
+                let expr = Expr::Literal(hir_lit);
+                let expr_ptr = AstPtr::new(&ast::Expr::Literal(ast_lit));
+                let expr_id = self.alloc_expr(expr, expr_ptr);
+                Pat::Lit(expr_id)
+            }
             ast::Pat::RestPat(_) => {
                 // `RestPat` requires special handling and should not be mapped
                 // to a Pat. Here we are using `Pat::Missing` as a fallback for
@@ -1215,8 +1353,30 @@ impl ExprCollector<'_> {
                 }
                 None => Pat::Missing,
             },
-            // FIXME: implement
-            ast::Pat::RangePat(_) => Pat::Missing,
+            // FIXME: implement in a way that also builds source map and calculates assoc resolutions in type inference.
+            ast::Pat::RangePat(p) => {
+                let mut range_part_lower = |p: Option<ast::Pat>| {
+                    p.and_then(|x| match &x {
+                        ast::Pat::LiteralPat(x) => {
+                            Some(Box::new(LiteralOrConst::Literal(pat_literal_to_hir(x)?.0)))
+                        }
+                        ast::Pat::IdentPat(p) => {
+                            let name =
+                                p.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
+                            Some(Box::new(LiteralOrConst::Const(name.into())))
+                        }
+                        ast::Pat::PathPat(p) => p
+                            .path()
+                            .and_then(|path| self.expander.parse_path(self.db, path))
+                            .map(LiteralOrConst::Const)
+                            .map(Box::new),
+                        _ => None,
+                    })
+                };
+                let start = range_part_lower(p.start());
+                let end = range_part_lower(p.end());
+                Pat::Range { start, end }
+            }
         };
         let ptr = AstPtr::new(&pat);
         self.alloc_pat(pattern, Either::Left(ptr))
@@ -1232,18 +1392,24 @@ impl ExprCollector<'_> {
     fn collect_tuple_pat(
         &mut self,
         args: AstChildren<ast::Pat>,
+        has_leading_comma: bool,
         binding_list: &mut BindingList,
     ) -> (Box<[PatId]>, Option<usize>) {
         // Find the location of the `..`, if there is one. Note that we do not
         // consider the possibility of there being multiple `..` here.
         let ellipsis = args.clone().position(|p| matches!(p, ast::Pat::RestPat(_)));
         // We want to skip the `..` pattern here, since we account for it above.
-        let args = args
+        let mut args: Vec<_> = args
             .filter(|p| !matches!(p, ast::Pat::RestPat(_)))
             .map(|p| self.collect_pat(p, binding_list))
             .collect();
+        // if there is a leading comma, the user is most likely to type out a leading pattern
+        // so we insert a missing pattern at the beginning for IDE features
+        if has_leading_comma {
+            args.insert(0, self.missing_pat());
+        }
 
-        (args, ellipsis)
+        (args.into_boxed_slice(), ellipsis)
     }
 
     // endregion: patterns
@@ -1335,7 +1501,30 @@ impl ExprCollector<'_> {
         self.label_ribs.pop();
         res
     }
+
+    fn with_opt_labeled_rib<T>(
+        &mut self,
+        label: Option<LabelId>,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        match label {
+            None => f(self),
+            Some(label) => self.with_labeled_rib(label, f),
+        }
+    }
     // endregion: labels
+}
+
+fn pat_literal_to_hir(lit: &ast::LiteralPat) -> Option<(Literal, ast::Literal)> {
+    let ast_lit = lit.literal()?;
+    let mut hir_lit: Literal = ast_lit.kind().into();
+    if lit.minus_token().is_some() {
+        let Some(h) = hir_lit.negate() else {
+            return None;
+        };
+        hir_lit = h;
+    }
+    Some((hir_lit, ast_lit))
 }
 
 impl ExprCollector<'_> {
@@ -1360,6 +1549,7 @@ impl ExprCollector<'_> {
             mode,
             definitions: SmallVec::new(),
             owner: self.current_binding_owner,
+            problems: None,
         })
     }
 
@@ -1389,4 +1579,9 @@ impl ExprCollector<'_> {
     fn alloc_label_desugared(&mut self, label: Label) -> LabelId {
         self.body.labels.alloc(label)
     }
+}
+
+fn comma_follows_token(t: Option<syntax::SyntaxToken>) -> bool {
+    (|| syntax::algo::skip_trivia_token(t?.next_token()?, syntax::Direction::Next))()
+        .map_or(false, |it| it.kind() == syntax::T![,])
 }

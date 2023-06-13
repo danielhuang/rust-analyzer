@@ -77,7 +77,7 @@ pub(crate) enum PrimeCachesProgress {
 
 impl fmt::Debug for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let debug_verbose_not = |not: &Notification, f: &mut fmt::Formatter<'_>| {
+        let debug_non_verbose = |not: &Notification, f: &mut fmt::Formatter<'_>| {
             f.debug_struct("Notification").field("method", &not.method).finish()
         };
 
@@ -86,7 +86,7 @@ impl fmt::Debug for Event {
                 if notification_is::<lsp_types::notification::DidOpenTextDocument>(not)
                     || notification_is::<lsp_types::notification::DidChangeTextDocument>(not)
                 {
-                    return debug_verbose_not(not, f);
+                    return debug_non_verbose(not, f);
                 }
             }
             Event::Task(Task::Response(resp)) => {
@@ -112,38 +112,7 @@ impl GlobalState {
         self.update_status_or_notify();
 
         if self.config.did_save_text_document_dynamic_registration() {
-            let save_registration_options = lsp_types::TextDocumentSaveRegistrationOptions {
-                include_text: Some(false),
-                text_document_registration_options: lsp_types::TextDocumentRegistrationOptions {
-                    document_selector: Some(vec![
-                        lsp_types::DocumentFilter {
-                            language: None,
-                            scheme: None,
-                            pattern: Some("**/*.rs".into()),
-                        },
-                        lsp_types::DocumentFilter {
-                            language: None,
-                            scheme: None,
-                            pattern: Some("**/Cargo.toml".into()),
-                        },
-                        lsp_types::DocumentFilter {
-                            language: None,
-                            scheme: None,
-                            pattern: Some("**/Cargo.lock".into()),
-                        },
-                    ]),
-                },
-            };
-
-            let registration = lsp_types::Registration {
-                id: "textDocument/didSave".to_string(),
-                method: "textDocument/didSave".to_string(),
-                register_options: Some(serde_json::to_value(save_registration_options).unwrap()),
-            };
-            self.send_request::<lsp_types::request::RegisterCapability>(
-                lsp_types::RegistrationParams { registrations: vec![registration] },
-                |_, _| (),
-            );
+            self.register_did_save_capability();
         }
 
         self.fetch_workspaces_queue.request_op("startup".to_string(), ());
@@ -152,15 +121,52 @@ impl GlobalState {
         }
 
         while let Some(event) = self.next_event(&inbox) {
-            if let Event::Lsp(lsp_server::Message::Notification(not)) = &event {
-                if not.method == lsp_types::notification::Exit::METHOD {
-                    return Ok(());
-                }
+            if matches!(
+                &event,
+                Event::Lsp(lsp_server::Message::Notification(Notification { method, .. }))
+                if method == lsp_types::notification::Exit::METHOD
+            ) {
+                return Ok(());
             }
-            self.handle_event(event)?
+            self.handle_event(event)?;
         }
 
         Err("client exited without proper shutdown sequence".into())
+    }
+
+    fn register_did_save_capability(&mut self) {
+        let save_registration_options = lsp_types::TextDocumentSaveRegistrationOptions {
+            include_text: Some(false),
+            text_document_registration_options: lsp_types::TextDocumentRegistrationOptions {
+                document_selector: Some(vec![
+                    lsp_types::DocumentFilter {
+                        language: None,
+                        scheme: None,
+                        pattern: Some("**/*.rs".into()),
+                    },
+                    lsp_types::DocumentFilter {
+                        language: None,
+                        scheme: None,
+                        pattern: Some("**/Cargo.toml".into()),
+                    },
+                    lsp_types::DocumentFilter {
+                        language: None,
+                        scheme: None,
+                        pattern: Some("**/Cargo.lock".into()),
+                    },
+                ]),
+            },
+        };
+
+        let registration = lsp_types::Registration {
+            id: "textDocument/didSave".to_string(),
+            method: "textDocument/didSave".to_string(),
+            register_options: Some(serde_json::to_value(save_registration_options).unwrap()),
+        };
+        self.send_request::<lsp_types::request::RegisterCapability>(
+            lsp_types::RegistrationParams { registrations: vec![registration] },
+            |_, _| (),
+        );
     }
 
     fn next_event(&self, inbox: &Receiver<lsp_server::Message>) -> Option<Event> {
@@ -169,6 +175,9 @@ impl GlobalState {
                 msg.ok().map(Event::Lsp),
 
             recv(self.task_pool.receiver) -> task =>
+                Some(Event::Task(task.unwrap())),
+
+            recv(self.fmt_pool.receiver) -> task =>
                 Some(Event::Task(task.unwrap())),
 
             recv(self.loader.receiver) -> task =>
@@ -184,19 +193,20 @@ impl GlobalState {
         // NOTE: don't count blocking select! call as a loop-turn time
         let _p = profile::span("GlobalState::handle_event");
 
-        tracing::debug!("{:?} handle_event({:?})", loop_start, event);
-        let task_queue_len = self.task_pool.handle.len();
-        if task_queue_len > 0 {
-            tracing::info!("task queue len: {}", task_queue_len);
+        let event_dbg_msg = format!("{event:?}");
+        tracing::debug!("{:?} handle_event({})", loop_start, event_dbg_msg);
+        if tracing::enabled!(tracing::Level::INFO) {
+            let task_queue_len = self.task_pool.handle.len();
+            if task_queue_len > 0 {
+                tracing::info!("task queue len: {}", task_queue_len);
+            }
         }
 
         let was_quiescent = self.is_quiescent();
         match event {
             Event::Lsp(msg) => match msg {
                 lsp_server::Message::Request(req) => self.on_new_request(loop_start, req),
-                lsp_server::Message::Notification(not) => {
-                    self.on_notification(not)?;
-                }
+                lsp_server::Message::Notification(not) => self.on_notification(not)?,
                 lsp_server::Message::Response(resp) => self.complete_request(resp),
             },
             Event::Task(task) => {
@@ -290,7 +300,8 @@ impl GlobalState {
                 }
             }
 
-            if !was_quiescent || state_changed {
+            let client_refresh = !was_quiescent || state_changed;
+            if client_refresh {
                 // Refresh semantic tokens if the client supports it.
                 if self.config.semantic_tokens_refresh() {
                     self.semantic_tokens_cache.lock().clear();
@@ -308,9 +319,9 @@ impl GlobalState {
                 }
             }
 
-            if (!was_quiescent || state_changed || memdocs_added_or_removed)
-                && self.config.publish_diagnostics()
-            {
+            let update_diagnostics = (!was_quiescent || state_changed || memdocs_added_or_removed)
+                && self.config.publish_diagnostics();
+            if update_diagnostics {
                 self.update_diagnostics()
             }
         }
@@ -370,34 +381,38 @@ impl GlobalState {
         }
 
         if let Some((cause, ())) = self.prime_caches_queue.should_start_op() {
-            tracing::debug!(%cause, "will prime caches");
-            let num_worker_threads = self.config.prime_caches_num_threads();
-
-            self.task_pool.handle.spawn_with_sender({
-                let analysis = self.snapshot().analysis;
-                move |sender| {
-                    sender.send(Task::PrimeCaches(PrimeCachesProgress::Begin)).unwrap();
-                    let res = analysis.parallel_prime_caches(num_worker_threads, |progress| {
-                        let report = PrimeCachesProgress::Report(progress);
-                        sender.send(Task::PrimeCaches(report)).unwrap();
-                    });
-                    sender
-                        .send(Task::PrimeCaches(PrimeCachesProgress::End {
-                            cancelled: res.is_err(),
-                        }))
-                        .unwrap();
-                }
-            });
+            self.prime_caches(cause);
         }
 
         self.update_status_or_notify();
 
         let loop_duration = loop_start.elapsed();
         if loop_duration > Duration::from_millis(100) && was_quiescent {
-            tracing::warn!("overly long loop turn: {:?}", loop_duration);
-            self.poke_rust_analyzer_developer(format!("overly long loop turn: {loop_duration:?}"));
+            tracing::warn!("overly long loop turn took {loop_duration:?}: {event_dbg_msg}");
+            self.poke_rust_analyzer_developer(format!(
+                "overly long loop turn took {loop_duration:?}: {event_dbg_msg}"
+            ));
         }
         Ok(())
+    }
+
+    fn prime_caches(&mut self, cause: String) {
+        tracing::debug!(%cause, "will prime caches");
+        let num_worker_threads = self.config.prime_caches_num_threads();
+
+        self.task_pool.handle.spawn_with_sender(stdx::thread::ThreadIntent::Worker, {
+            let analysis = self.snapshot().analysis;
+            move |sender| {
+                sender.send(Task::PrimeCaches(PrimeCachesProgress::Begin)).unwrap();
+                let res = analysis.parallel_prime_caches(num_worker_threads, |progress| {
+                    let report = PrimeCachesProgress::Report(progress);
+                    sender.send(Task::PrimeCaches(report)).unwrap();
+                });
+                sender
+                    .send(Task::PrimeCaches(PrimeCachesProgress::End { cancelled: res.is_err() }))
+                    .unwrap();
+            }
+        });
     }
 
     fn update_status_or_notify(&mut self) {
@@ -407,7 +422,11 @@ impl GlobalState {
 
             if self.config.server_status_notification() {
                 self.send_notification::<lsp_ext::ServerStatusNotification>(status);
-            } else if let (health, Some(message)) = (status.health, &status.message) {
+            } else if let (
+                health @ (lsp_ext::Health::Warning | lsp_ext::Health::Error),
+                Some(message),
+            ) = (status.health, &status.message)
+            {
                 let open_log_button = tracing::enabled!(tracing::Level::ERROR)
                     && (self.fetch_build_data_error().is_err()
                         || self.fetch_workspace_error().is_err());
@@ -586,21 +605,18 @@ impl GlobalState {
                         (Progress::Begin, None)
                     }
                     flycheck::Progress::DidCheckCrate(target) => (Progress::Report, Some(target)),
-                    flycheck::Progress::DidCancel => (Progress::End, None),
+                    flycheck::Progress::DidCancel => {
+                        self.last_flycheck_error = None;
+                        (Progress::End, None)
+                    }
                     flycheck::Progress::DidFailToRestart(err) => {
-                        self.show_and_log_error(
-                            "cargo check failed to start".to_string(),
-                            Some(err),
-                        );
+                        self.last_flycheck_error =
+                            Some(format!("cargo check failed to start: {err}"));
                         return;
                     }
                     flycheck::Progress::DidFinish(result) => {
-                        if let Err(err) = result {
-                            self.show_and_log_error(
-                                "cargo check failed".to_string(),
-                                Some(err.to_string()),
-                            );
-                        }
+                        self.last_flycheck_error =
+                            result.err().map(|err| format!("cargo check failed to start: {err}"));
                         (Progress::End, None)
                     }
                 };
@@ -652,14 +668,43 @@ impl GlobalState {
         use crate::handlers::request as handlers;
 
         dispatcher
+            // Request handlers that must run on the main thread
+            // because they mutate GlobalState:
             .on_sync_mut::<lsp_ext::ReloadWorkspace>(handlers::handle_workspace_reload)
             .on_sync_mut::<lsp_ext::RebuildProcMacros>(handlers::handle_proc_macros_rebuild)
             .on_sync_mut::<lsp_ext::MemoryUsage>(handlers::handle_memory_usage)
             .on_sync_mut::<lsp_ext::ShuffleCrateGraph>(handlers::handle_shuffle_crate_graph)
+            // Request handlers which are related to the user typing
+            // are run on the main thread to reduce latency:
             .on_sync::<lsp_ext::JoinLines>(handlers::handle_join_lines)
             .on_sync::<lsp_ext::OnEnter>(handlers::handle_on_enter)
             .on_sync::<lsp_types::request::SelectionRangeRequest>(handlers::handle_selection_range)
             .on_sync::<lsp_ext::MatchingBrace>(handlers::handle_matching_brace)
+            .on_sync::<lsp_ext::OnTypeFormatting>(handlers::handle_on_type_formatting)
+            // Formatting should be done immediately as the editor might wait on it, but we can't
+            // put it on the main thread as we do not want the main thread to block on rustfmt.
+            // So we have an extra thread just for formatting requests to make sure it gets handled
+            // as fast as possible.
+            .on_fmt_thread::<lsp_types::request::Formatting>(handlers::handle_formatting)
+            .on_fmt_thread::<lsp_types::request::RangeFormatting>(handlers::handle_range_formatting)
+            // We can’t run latency-sensitive request handlers which do semantic
+            // analysis on the main thread because that would block other
+            // requests. Instead, we run these request handlers on higher priority
+            // threads in the threadpool.
+            .on_latency_sensitive::<lsp_types::request::Completion>(handlers::handle_completion)
+            .on_latency_sensitive::<lsp_types::request::ResolveCompletionItem>(
+                handlers::handle_completion_resolve,
+            )
+            .on_latency_sensitive::<lsp_types::request::SemanticTokensFullRequest>(
+                handlers::handle_semantic_tokens_full,
+            )
+            .on_latency_sensitive::<lsp_types::request::SemanticTokensFullDeltaRequest>(
+                handlers::handle_semantic_tokens_full_delta,
+            )
+            .on_latency_sensitive::<lsp_types::request::SemanticTokensRangeRequest>(
+                handlers::handle_semantic_tokens_range,
+            )
+            // All other request handlers
             .on::<lsp_ext::FetchDependencyList>(handlers::fetch_dependency_list)
             .on::<lsp_ext::AnalyzerStatus>(handlers::handle_analyzer_status)
             .on::<lsp_ext::SyntaxTree>(handlers::handle_syntax_tree)
@@ -680,7 +725,6 @@ impl GlobalState {
             .on::<lsp_ext::OpenCargoToml>(handlers::handle_open_cargo_toml)
             .on::<lsp_ext::MoveItem>(handlers::handle_move_item)
             .on::<lsp_ext::WorkspaceSymbol>(handlers::handle_workspace_symbol)
-            .on::<lsp_ext::OnTypeFormatting>(handlers::handle_on_type_formatting)
             .on::<lsp_types::request::DocumentSymbolRequest>(handlers::handle_document_symbol)
             .on::<lsp_types::request::GotoDefinition>(handlers::handle_goto_definition)
             .on::<lsp_types::request::GotoDeclaration>(handlers::handle_goto_declaration)
@@ -688,8 +732,6 @@ impl GlobalState {
             .on::<lsp_types::request::GotoTypeDefinition>(handlers::handle_goto_type_definition)
             .on_no_retry::<lsp_types::request::InlayHintRequest>(handlers::handle_inlay_hints)
             .on::<lsp_types::request::InlayHintResolveRequest>(handlers::handle_inlay_hints_resolve)
-            .on::<lsp_types::request::Completion>(handlers::handle_completion)
-            .on::<lsp_types::request::ResolveCompletionItem>(handlers::handle_completion_resolve)
             .on::<lsp_types::request::CodeLensRequest>(handlers::handle_code_lens)
             .on::<lsp_types::request::CodeLensResolve>(handlers::handle_code_lens_resolve)
             .on::<lsp_types::request::FoldingRangeRequest>(handlers::handle_folding_range)
@@ -697,8 +739,6 @@ impl GlobalState {
             .on::<lsp_types::request::PrepareRenameRequest>(handlers::handle_prepare_rename)
             .on::<lsp_types::request::Rename>(handlers::handle_rename)
             .on::<lsp_types::request::References>(handlers::handle_references)
-            .on::<lsp_types::request::Formatting>(handlers::handle_formatting)
-            .on::<lsp_types::request::RangeFormatting>(handlers::handle_range_formatting)
             .on::<lsp_types::request::DocumentHighlightRequest>(handlers::handle_document_highlight)
             .on::<lsp_types::request::CallHierarchyPrepare>(handlers::handle_call_hierarchy_prepare)
             .on::<lsp_types::request::CallHierarchyIncomingCalls>(
@@ -706,15 +746,6 @@ impl GlobalState {
             )
             .on::<lsp_types::request::CallHierarchyOutgoingCalls>(
                 handlers::handle_call_hierarchy_outgoing,
-            )
-            .on::<lsp_types::request::SemanticTokensFullRequest>(
-                handlers::handle_semantic_tokens_full,
-            )
-            .on::<lsp_types::request::SemanticTokensFullDeltaRequest>(
-                handlers::handle_semantic_tokens_full_delta,
-            )
-            .on::<lsp_types::request::SemanticTokensRangeRequest>(
-                handlers::handle_semantic_tokens_range,
             )
             .on::<lsp_types::request::WillRenameFiles>(handlers::handle_will_rename_files)
             .on::<lsp_ext::Ssr>(handlers::handle_ssr)
@@ -763,8 +794,12 @@ impl GlobalState {
         tracing::trace!("updating notifications for {:?}", subscriptions);
 
         let snapshot = self.snapshot();
-        self.task_pool.handle.spawn(move || {
+
+        // Diagnostics are triggered by the user typing
+        // so we run them on a latency sensitive thread.
+        self.task_pool.handle.spawn(stdx::thread::ThreadIntent::LatencySensitive, move || {
             let _p = profile::span("publish_diagnostics");
+            let _ctx = stdx::panic_context::enter("publish_diagnostics".to_owned());
             let diagnostics = subscriptions
                 .into_iter()
                 .filter_map(|file_id| {

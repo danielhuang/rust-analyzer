@@ -45,16 +45,17 @@ use hir_def::{
     hir::{BindingAnnotation, BindingId, ExprOrPatId, LabelId, Pat},
     item_tree::ItemTreeNode,
     lang_item::LangItemTarget,
-    layout::{self, ReprOptions},
+    layout::{self, ReprOptions, TargetDataLayout},
     macro_id_to_def_id,
     nameres::{self, diagnostics::DefDiagnostic, ModuleOrigin},
     per_ns::PerNs,
     resolver::{HasResolver, Resolver},
     src::HasSource as _,
     AssocItemId, AssocItemLoc, AttrDefId, ConstId, ConstParamId, DefWithBodyId, EnumId,
-    EnumVariantId, FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, LifetimeParamId,
-    LocalEnumVariantId, LocalFieldId, Lookup, MacroExpander, MacroId, ModuleId, StaticId, StructId,
-    TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
+    EnumVariantId, FunctionId, GenericDefId, HasModule, ImplId, InTypeConstId, ItemContainerId,
+    LifetimeParamId, LocalEnumVariantId, LocalFieldId, Lookup, MacroExpander, MacroId, ModuleId,
+    StaticId, StructId, TraitAliasId, TraitId, TypeAliasId, TypeOrConstParamId, TypeParamId,
+    UnionId,
 };
 use hir_expand::{name::name, MacroCallKind};
 use hir_ty::{
@@ -62,14 +63,15 @@ use hir_ty::{
     consteval::{try_const_usize, unknown_const_as_generic, ConstEvalError, ConstExt},
     diagnostics::BodyValidationDiagnostic,
     display::HexifiedConst,
-    layout::{layout_of_ty, Layout, LayoutError, RustcEnumVariantIdx, TagEncoding},
+    layout::{Layout as TyLayout, RustcEnumVariantIdx, TagEncoding},
     method_resolution::{self, TyFingerprint},
     mir::{self, interpret_mir},
     primitive::UintTy,
     traits::FnTrait,
     AliasTy, CallableDefId, CallableSig, Canonical, CanonicalVarKinds, Cast, ClosureId,
     GenericArgData, Interner, ParamKind, QuantifiedWhereClause, Scalar, Substitution,
-    TraitEnvironment, TraitRefExt, Ty, TyBuilder, TyDefId, TyExt, TyKind, WhereClause,
+    TraitEnvironment, TraitRefExt, Ty, TyBuilder, TyDefId, TyExt, TyKind, ValueTyDefId,
+    WhereClause,
 };
 use itertools::Itertools;
 use nameres::diagnostics::DefDiagnosticKind;
@@ -91,10 +93,10 @@ pub use crate::{
         IncorrectCase, InvalidDeriveTarget, MacroDefError, MacroError, MacroExpansionParseError,
         MalformedDerive, MismatchedArgCount, MissingFields, MissingMatchArms, MissingUnsafe,
         MovedOutOfRef, NeedMut, NoSuchField, PrivateAssocItem, PrivateField,
-        ReplaceFilterMapNextWithFindMap, TypeMismatch, UndeclaredLabel, UnimplementedBuiltinMacro,
-        UnreachableLabel, UnresolvedExternCrate, UnresolvedField, UnresolvedImport,
-        UnresolvedMacroCall, UnresolvedMethodCall, UnresolvedModule, UnresolvedProcMacro,
-        UnusedMut,
+        ReplaceFilterMapNextWithFindMap, TypeMismatch, TypedHole, UndeclaredLabel,
+        UnimplementedBuiltinMacro, UnreachableLabel, UnresolvedExternCrate, UnresolvedField,
+        UnresolvedImport, UnresolvedMacroCall, UnresolvedMethodCall, UnresolvedModule,
+        UnresolvedProcMacro, UnusedMut,
     },
     has_source::HasSource,
     semantics::{PathResolution, Semantics, SemanticsScope, TypeInfo, VisibleTraits},
@@ -117,7 +119,7 @@ pub use {
         find_path::PrefixKind,
         import_map,
         lang_item::LangItem,
-        nameres::ModuleSource,
+        nameres::{DefMap, ModuleSource},
         path::{ModPath, PathKind},
         type_ref::{Mutability, TypeRef},
         visibility::Visibility,
@@ -132,6 +134,7 @@ pub use {
     },
     hir_ty::{
         display::{ClosureStyle, HirDisplay, HirDisplayError, HirWrite},
+        layout::LayoutError,
         mir::MirEvalError,
         PointerCast, Safety,
     },
@@ -200,7 +203,7 @@ impl Crate {
 
     pub fn root_module(self, db: &dyn HirDatabase) -> Module {
         let def_map = db.crate_def_map(self.id);
-        Module { id: def_map.module_id(def_map.root()) }
+        Module { id: def_map.module_id(DefMap::ROOT) }
     }
 
     pub fn modules(self, db: &dyn HirDatabase) -> Vec<Module> {
@@ -329,7 +332,7 @@ impl ModuleDef {
             segments.extend(m.name(db))
         }
         segments.reverse();
-        Some(segments.into_iter().join("::"))
+        Some(segments.iter().map(|it| it.display(db.upcast())).join("::"))
     }
 
     pub fn canonical_module_path(
@@ -473,12 +476,11 @@ impl Module {
     /// in the module tree of any target in `Cargo.toml`.
     pub fn crate_root(self, db: &dyn HirDatabase) -> Module {
         let def_map = db.crate_def_map(self.id.krate());
-        Module { id: def_map.module_id(def_map.root()) }
+        Module { id: def_map.module_id(DefMap::ROOT) }
     }
 
-    pub fn is_crate_root(self, db: &dyn HirDatabase) -> bool {
-        let def_map = db.crate_def_map(self.id.krate());
-        def_map.root() == self.id.local_id
+    pub fn is_crate_root(self) -> bool {
+        DefMap::ROOT == self.id.local_id
     }
 
     /// Iterates over all child modules.
@@ -555,7 +557,11 @@ impl Module {
     /// Fills `acc` with the module's diagnostics.
     pub fn diagnostics(self, db: &dyn HirDatabase, acc: &mut Vec<AnyDiagnostic>) {
         let _p = profile::span("Module::diagnostics").detail(|| {
-            format!("{:?}", self.name(db).map_or("<unknown>".into(), |name| name.to_string()))
+            format!(
+                "{:?}",
+                self.name(db)
+                    .map_or("<unknown>".into(), |name| name.display(db.upcast()).to_string())
+            )
         });
         let def_map = self.id.def_map(db.upcast());
         for diag in def_map.diagnostics() {
@@ -957,7 +963,8 @@ impl Field {
     }
 
     pub fn layout(&self, db: &dyn HirDatabase) -> Result<Layout, LayoutError> {
-        layout_of_ty(db, &self.ty(db).ty, self.parent.module(db).krate().into())
+        db.layout_of_ty(self.ty(db).ty.clone(), self.parent.module(db).krate().into())
+            .map(|layout| Layout(layout, db.target_data_layout(self.krate(db).into()).unwrap()))
     }
 
     pub fn parent_def(&self, _db: &dyn HirDatabase) -> VariantDef {
@@ -1001,6 +1008,10 @@ impl Struct {
         Type::from_def(db, self.id)
     }
 
+    pub fn constructor_ty(self, db: &dyn HirDatabase) -> Type {
+        Type::from_value_def(db, self.id)
+    }
+
     pub fn repr(self, db: &dyn HirDatabase) -> Option<ReprOptions> {
         db.struct_data(self.id).repr
     }
@@ -1036,6 +1047,10 @@ impl Union {
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
         Type::from_def(db, self.id)
+    }
+
+    pub fn constructor_ty(self, db: &dyn HirDatabase) -> Type {
+        Type::from_value_def(db, self.id)
     }
 
     pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
@@ -1121,6 +1136,10 @@ impl Enum {
     pub fn is_data_carrying(self, db: &dyn HirDatabase) -> bool {
         self.variants(db).iter().any(|v| !matches!(v.kind(db), StructKind::Unit))
     }
+
+    pub fn layout(self, db: &dyn HirDatabase) -> Result<Layout, LayoutError> {
+        Adt::from(self).layout(db)
+    }
 }
 
 impl HasVisibility for Enum {
@@ -1148,6 +1167,10 @@ impl Variant {
 
     pub fn parent_enum(self, _db: &dyn HirDatabase) -> Enum {
         self.parent
+    }
+
+    pub fn constructor_ty(self, db: &dyn HirDatabase) -> Type {
+        Type::from_value_def(db, EnumVariantId { parent: self.parent.id, local_id: self.id })
     }
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
@@ -1178,26 +1201,16 @@ impl Variant {
         db.const_eval_discriminant(self.into())
     }
 
-    /// Return layout of the variant and tag size of the parent enum.
-    pub fn layout(&self, db: &dyn HirDatabase) -> Result<(Layout, usize), LayoutError> {
+    pub fn layout(&self, db: &dyn HirDatabase) -> Result<Layout, LayoutError> {
         let parent_enum = self.parent_enum(db);
-        let parent_layout = Adt::from(parent_enum).layout(db)?;
-        if let layout::Variants::Multiple { variants, tag, tag_encoding, tag_field: _ } =
-            parent_layout.variants
-        {
-            let tag_size = match tag_encoding {
-                TagEncoding::Direct => {
-                    let target_data_layout = db
-                        .target_data_layout(parent_enum.module(db).krate().id)
-                        .ok_or(LayoutError::TargetLayoutNotAvailable)?;
-                    tag.size(&*target_data_layout).bytes_usize()
-                }
-                TagEncoding::Niche { .. } => 0,
-            };
-            Ok((variants[RustcEnumVariantIdx(self.id)].clone(), tag_size))
-        } else {
-            Ok((parent_layout, 0))
-        }
+        let parent_layout = parent_enum.layout(db)?;
+        Ok(match &parent_layout.0.variants {
+            layout::Variants::Multiple { variants, .. } => Layout(
+                Arc::new(variants[RustcEnumVariantIdx(self.id)].clone()),
+                db.target_data_layout(parent_enum.krate(db).into()).unwrap(),
+            ),
+            _ => parent_layout,
+        })
     }
 }
 
@@ -1230,7 +1243,9 @@ impl Adt {
         if db.generic_params(self.into()).iter().count() != 0 {
             return Err(LayoutError::HasPlaceholder);
         }
-        db.layout_of_adt(self.into(), Substitution::empty(Interner), self.krate(db).id)
+        let krate = self.krate(db).id;
+        db.layout_of_adt(self.into(), Substitution::empty(Interner), krate)
+            .map(|layout| Layout(layout, db.target_data_layout(krate).unwrap()))
     }
 
     /// Turns this ADT into a type. Any type parameters of the ADT will be
@@ -1361,8 +1376,9 @@ pub enum DefWithBody {
     Static(Static),
     Const(Const),
     Variant(Variant),
+    InTypeConst(InTypeConst),
 }
-impl_from!(Function, Const, Static, Variant for DefWithBody);
+impl_from!(Function, Const, Static, Variant, InTypeConst for DefWithBody);
 
 impl DefWithBody {
     pub fn module(self, db: &dyn HirDatabase) -> Module {
@@ -1371,6 +1387,7 @@ impl DefWithBody {
             DefWithBody::Function(f) => f.module(db),
             DefWithBody::Static(s) => s.module(db),
             DefWithBody::Variant(v) => v.module(db),
+            DefWithBody::InTypeConst(c) => c.module(db),
         }
     }
 
@@ -1380,6 +1397,7 @@ impl DefWithBody {
             DefWithBody::Static(s) => Some(s.name(db)),
             DefWithBody::Const(c) => c.name(db),
             DefWithBody::Variant(v) => Some(v.name(db)),
+            DefWithBody::InTypeConst(_) => None,
         }
     }
 
@@ -1390,6 +1408,11 @@ impl DefWithBody {
             DefWithBody::Static(it) => it.ty(db),
             DefWithBody::Const(it) => it.ty(db),
             DefWithBody::Variant(it) => it.parent.variant_body_ty(db),
+            DefWithBody::InTypeConst(it) => Type::new_with_resolver_inner(
+                db,
+                &DefWithBodyId::from(it.id).resolver(db.upcast()),
+                TyKind::Error.intern(Interner),
+            ),
         }
     }
 
@@ -1399,6 +1422,7 @@ impl DefWithBody {
             DefWithBody::Static(it) => it.id.into(),
             DefWithBody::Const(it) => it.id.into(),
             DefWithBody::Variant(it) => it.into(),
+            DefWithBody::InTypeConst(it) => it.id.into(),
         }
     }
 
@@ -1558,6 +1582,16 @@ impl DefWithBody {
                     let expr = expr_syntax(expr);
                     acc.push(BreakOutsideOfLoop { expr, is_break, bad_value_break }.into())
                 }
+                hir_ty::InferenceDiagnostic::TypedHole { expr, expected } => {
+                    let expr = expr_syntax(*expr);
+                    acc.push(
+                        TypedHole {
+                            expr,
+                            expected: Type::new(db, DefWithBodyId::from(self), expected.clone()),
+                        }
+                        .into(),
+                    )
+                }
             }
         }
         for (pat_or_expr, mismatch) in infer.type_mismatches() {
@@ -1619,7 +1653,11 @@ impl DefWithBody {
                     )
                 }
                 let mol = &borrowck_result.mutability_of_locals;
-                for (binding_id, _) in hir_body.bindings.iter() {
+                for (binding_id, binding_data) in hir_body.bindings.iter() {
+                    if binding_data.problems.is_some() {
+                        // We should report specific diagnostics for these problems, not `need-mut` and `unused-mut`.
+                        continue;
+                    }
                     let Some(&local) = mir_body.binding_locals.get(binding_id) else {
                         continue;
                     };
@@ -1769,6 +1807,8 @@ impl DefWithBody {
             DefWithBody::Static(it) => it.into(),
             DefWithBody::Const(it) => it.into(),
             DefWithBody::Variant(it) => it.into(),
+            // FIXME: don't ignore diagnostics for in type const
+            DefWithBody::InTypeConst(_) => return,
         };
         for diag in hir_ty::diagnostics::incorrect_case(db, krate, def.into()) {
             acc.push(diag.into())
@@ -1788,6 +1828,10 @@ impl Function {
 
     pub fn name(self, db: &dyn HirDatabase) -> Name {
         db.function_data(self.id).name.clone()
+    }
+
+    pub fn ty(self, db: &dyn HirDatabase) -> Type {
+        Type::from_value_def(db, self.id)
     }
 
     /// Get this function's return type
@@ -1906,7 +1950,11 @@ impl Function {
         db: &dyn HirDatabase,
         span_formatter: impl Fn(FileId, TextRange) -> String,
     ) -> String {
-        let body = match db.mir_body(self.id.into()) {
+        let body = match db.monomorphized_mir_body(
+            self.id.into(),
+            Substitution::empty(Interner),
+            db.trait_environment(self.id.into()),
+        ) {
             Ok(body) => body,
             Err(e) => {
                 let mut r = String::new();
@@ -1914,8 +1962,7 @@ impl Function {
                 return r;
             }
         };
-        let (result, stdout, stderr) =
-            interpret_mir(db, &body, Substitution::empty(Interner), false);
+        let (result, stdout, stderr) = interpret_mir(db, &body, false);
         let mut text = match result {
             Ok(_) => "pass".to_string(),
             Err(e) => {
@@ -2051,6 +2098,17 @@ impl HasVisibility for Function {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InTypeConst {
+    pub(crate) id: InTypeConstId,
+}
+
+impl InTypeConst {
+    pub fn module(self, db: &dyn HirDatabase) -> Module {
+        Module { id: self.id.lookup(db.upcast()).owner.module(db.upcast()) }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Const {
     pub(crate) id: ConstId,
 }
@@ -2069,24 +2127,12 @@ impl Const {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
-        let data = db.const_data(self.id);
-        let resolver = self.id.resolver(db.upcast());
-        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
-        let ty = ctx.lower_ty(&data.type_ref);
-        Type::new_with_resolver_inner(db, &resolver, ty)
+        Type::from_value_def(db, self.id)
     }
 
     pub fn render_eval(self, db: &dyn HirDatabase) -> Result<String, ConstEvalError> {
         let c = db.const_eval(self.id.into(), Substitution::empty(Interner))?;
         let r = format!("{}", HexifiedConst(c).display(db));
-        // We want to see things like `<utf8-error>` and `<layout-error>` as they are probably bug in our
-        // implementation, but there is no need to show things like `<enum-not-supported>` or `<ref-not-supported>` to
-        // the user.
-        if r.contains("not-supported>") {
-            return Err(ConstEvalError::MirEvalError(MirEvalError::NotSupported(
-                "rendering complex constants".to_string(),
-            )));
-        }
         return Ok(r);
     }
 }
@@ -2120,11 +2166,7 @@ impl Static {
     }
 
     pub fn ty(self, db: &dyn HirDatabase) -> Type {
-        let data = db.static_data(self.id);
-        let resolver = self.id.resolver(db.upcast());
-        let ctx = hir_ty::TyLoweringContext::new(db, &resolver);
-        let ty = ctx.lower_ty(&data.type_ref);
-        Type::new_with_resolver_inner(db, &resolver, ty)
+        Type::from_value_def(db, self.id)
     }
 }
 
@@ -2496,7 +2538,7 @@ impl AsAssocItem for DefWithBody {
         match self {
             DefWithBody::Function(it) => it.as_assoc_item(db),
             DefWithBody::Const(it) => it.as_assoc_item(db),
-            DefWithBody::Static(_) | DefWithBody::Variant(_) => None,
+            DefWithBody::Static(_) | DefWithBody::Variant(_) | DefWithBody::InTypeConst(_) => None,
         }
     }
 }
@@ -2622,14 +2664,22 @@ impl GenericDef {
                 Either::Right(x) => GenericParam::TypeParam(x),
             }
         });
-        let lt_params = generics
+        self.lifetime_params(db)
+            .into_iter()
+            .map(GenericParam::LifetimeParam)
+            .chain(ty_params)
+            .collect()
+    }
+
+    pub fn lifetime_params(self, db: &dyn HirDatabase) -> Vec<LifetimeParam> {
+        let generics = db.generic_params(self.into());
+        generics
             .lifetimes
             .iter()
             .map(|(local_id, _)| LifetimeParam {
                 id: LifetimeParamId { parent: self.into(), local_id },
             })
-            .map(GenericParam::LifetimeParam);
-        lt_params.chain(ty_params).collect()
+            .collect()
     }
 
     pub fn type_params(self, db: &dyn HirDatabase) -> Vec<TypeOrConstParam> {
@@ -2679,8 +2729,8 @@ impl LocalSource {
         self.source.file_id
     }
 
-    pub fn name(&self) -> Option<ast::Name> {
-        self.source.value.name()
+    pub fn name(&self) -> Option<InFile<ast::Name>> {
+        self.source.as_ref().map(|it| it.name()).transpose()
     }
 
     pub fn syntax(&self) -> &SyntaxNode {
@@ -3393,24 +3443,33 @@ impl Type {
         Type { env: environment, ty }
     }
 
-    fn from_def(db: &dyn HirDatabase, def: impl HasResolver + Into<TyDefId>) -> Type {
-        let ty_def = def.into();
-        let parent_subst = match ty_def {
-            TyDefId::TypeAliasId(id) => match id.lookup(db.upcast()).container {
-                ItemContainerId::TraitId(id) => {
-                    let subst = TyBuilder::subst_for_def(db, id, None).fill_with_unknown().build();
-                    Some(subst)
-                }
-                ItemContainerId::ImplId(id) => {
-                    let subst = TyBuilder::subst_for_def(db, id, None).fill_with_unknown().build();
-                    Some(subst)
-                }
-                _ => None,
+    fn from_def(db: &dyn HirDatabase, def: impl Into<TyDefId> + HasResolver) -> Type {
+        let ty = db.ty(def.into());
+        let substs = TyBuilder::unknown_subst(
+            db,
+            match def.into() {
+                TyDefId::AdtId(it) => GenericDefId::AdtId(it),
+                TyDefId::TypeAliasId(it) => GenericDefId::TypeAliasId(it),
+                TyDefId::BuiltinType(_) => return Type::new(db, def, ty.skip_binders().clone()),
             },
-            _ => None,
-        };
-        let ty = TyBuilder::def_ty(db, ty_def, parent_subst).fill_with_unknown().build();
-        Type::new(db, def, ty)
+        );
+        Type::new(db, def, ty.substitute(Interner, &substs))
+    }
+
+    fn from_value_def(db: &dyn HirDatabase, def: impl Into<ValueTyDefId> + HasResolver) -> Type {
+        let ty = db.value_ty(def.into());
+        let substs = TyBuilder::unknown_subst(
+            db,
+            match def.into() {
+                ValueTyDefId::ConstId(it) => GenericDefId::ConstId(it),
+                ValueTyDefId::FunctionId(it) => GenericDefId::FunctionId(it),
+                ValueTyDefId::StructId(it) => GenericDefId::AdtId(AdtId::StructId(it)),
+                ValueTyDefId::UnionId(it) => GenericDefId::AdtId(AdtId::UnionId(it)),
+                ValueTyDefId::EnumVariantId(it) => GenericDefId::EnumVariantId(it),
+                ValueTyDefId::StaticId(_) => return Type::new(db, def, ty.skip_binders().clone()),
+            },
+        );
+        Type::new(db, def, ty.substitute(Interner, &substs))
     }
 
     pub fn new_slice(ty: Type) -> Type {
@@ -3464,6 +3523,14 @@ impl Type {
             TyKind::Scalar(Scalar::Int(_) | Scalar::Uint(_)) => true,
             _ => false,
         }
+    }
+
+    pub fn is_scalar(&self) -> bool {
+        matches!(self.ty.kind(Interner), TyKind::Scalar(_))
+    }
+
+    pub fn is_tuple(&self) -> bool {
+        matches!(self.ty.kind(Interner), TyKind::Tuple(..))
     }
 
     pub fn remove_ref(&self) -> Option<Type> {
@@ -3751,14 +3818,16 @@ impl Type {
         }
     }
 
-    pub fn autoderef<'a>(&'a self, db: &'a dyn HirDatabase) -> impl Iterator<Item = Type> + 'a {
+    /// Returns types that this type dereferences to (including this type itself). The returned
+    /// iterator won't yield the same type more than once even if the deref chain contains a cycle.
+    pub fn autoderef(&self, db: &dyn HirDatabase) -> impl Iterator<Item = Type> + '_ {
         self.autoderef_(db).map(move |ty| self.derived(ty))
     }
 
-    fn autoderef_<'a>(&'a self, db: &'a dyn HirDatabase) -> impl Iterator<Item = Ty> + 'a {
+    fn autoderef_(&self, db: &dyn HirDatabase) -> impl Iterator<Item = Ty> {
         // There should be no inference vars in types passed here
         let canonical = hir_ty::replace_errors_with_variables(&self.ty);
-        autoderef(db, self.env.clone(), canonical).map(|canonical| canonical.value)
+        autoderef(db, self.env.clone(), canonical)
     }
 
     // This would be nicer if it just returned an iterator, but that runs into
@@ -4197,7 +4266,8 @@ impl Type {
     }
 
     pub fn layout(&self, db: &dyn HirDatabase) -> Result<Layout, LayoutError> {
-        layout_of_ty(db, &self.ty, self.env.krate)
+        db.layout_of_ty(self.ty.clone(), self.env.krate)
+            .map(|layout| Layout(layout, db.target_data_layout(self.env.krate).unwrap()))
     }
 }
 
@@ -4305,6 +4375,48 @@ fn closure_source(db: &dyn HirDatabase, closure: ClosureId) -> Option<ast::Closu
     match expr {
         ast::Expr::ClosureExpr(it) => Some(it),
         _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Layout(Arc<TyLayout>, Arc<TargetDataLayout>);
+
+impl Layout {
+    pub fn size(&self) -> u64 {
+        self.0.size.bytes()
+    }
+
+    pub fn align(&self) -> u64 {
+        self.0.align.abi.bytes()
+    }
+
+    pub fn niches(&self) -> Option<u128> {
+        Some(self.0.largest_niche?.available(&*self.1))
+    }
+
+    pub fn field_offset(&self, idx: usize) -> Option<u64> {
+        match self.0.fields {
+            layout::FieldsShape::Primitive => None,
+            layout::FieldsShape::Union(_) => Some(0),
+            layout::FieldsShape::Array { stride, count } => {
+                let i = u64::try_from(idx).ok()?;
+                (i < count).then_some((stride * i).bytes())
+            }
+            layout::FieldsShape::Arbitrary { ref offsets, .. } => Some(offsets.get(idx)?.bytes()),
+        }
+    }
+
+    pub fn enum_tag_size(&self) -> Option<usize> {
+        let tag_size =
+            if let layout::Variants::Multiple { tag, tag_encoding, .. } = &self.0.variants {
+                match tag_encoding {
+                    TagEncoding::Direct => tag.size(&*self.1).bytes_usize(),
+                    TagEncoding::Niche { .. } => 0,
+                }
+            } else {
+                return None;
+            };
+        Some(tag_size)
     }
 }
 
@@ -4454,6 +4566,12 @@ impl HasCrate for Struct {
 }
 
 impl HasCrate for Union {
+    fn krate(&self, db: &dyn HirDatabase) -> Crate {
+        self.module(db).krate()
+    }
+}
+
+impl HasCrate for Enum {
     fn krate(&self, db: &dyn HirDatabase) -> Crate {
         self.module(db).krate()
     }

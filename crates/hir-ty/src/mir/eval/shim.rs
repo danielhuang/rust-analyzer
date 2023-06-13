@@ -1,6 +1,8 @@
 //! Interpret intrinsics, lang items and `extern "C"` wellknown functions which their implementation
 //! is not available.
 
+use std::cmp;
+
 use super::*;
 
 macro_rules! from_bytes {
@@ -236,6 +238,22 @@ impl Evaluator<'_> {
         _span: MirSpan,
     ) -> Result<()> {
         match as_str {
+            "memcmp" => {
+                let [ptr1, ptr2, size] = args else {
+                    return Err(MirEvalError::TypeError("memcmp args are not provided"));
+                };
+                let addr1 = Address::from_bytes(ptr1.get(self)?)?;
+                let addr2 = Address::from_bytes(ptr2.get(self)?)?;
+                let size = from_bytes!(usize, size.get(self)?);
+                let slice1 = self.read_memory(addr1, size)?;
+                let slice2 = self.read_memory(addr2, size)?;
+                let r: i128 = match slice1.cmp(slice2) {
+                    cmp::Ordering::Less => -1,
+                    cmp::Ordering::Equal => 0,
+                    cmp::Ordering::Greater => 1,
+                };
+                destination.write_from_bytes(self, &r.to_le_bytes()[..destination.size])
+            }
             "write" => {
                 let [fd, ptr, len] = args else {
                     return Err(MirEvalError::TypeError("libc::write args are not provided"));
@@ -254,6 +272,7 @@ impl Evaluator<'_> {
                     }
                     _ => not_supported!("write to arbitrary file descriptor"),
                 }
+                destination.write_from_interval(self, len.interval)?;
                 Ok(())
             }
             "pthread_key_create" => {
@@ -313,119 +332,145 @@ impl Evaluator<'_> {
 
     fn exec_intrinsic(
         &mut self,
-        as_str: &str,
+        name: &str,
         args: &[IntervalAndTy],
         generic_args: &Substitution,
         destination: Interval,
         locals: &Locals<'_>,
         span: MirSpan,
     ) -> Result<()> {
-        // We are a single threaded runtime with no UB checking and no optimization, so
-        // we can implement these as normal functions.
-        if let Some(name) = as_str.strip_prefix("atomic_") {
-            let Some(ty) = generic_args.as_slice(Interner).get(0).and_then(|x| x.ty(Interner)) else {
-                return Err(MirEvalError::TypeError("atomic intrinsic generic arg is not provided"));
-            };
-            let Some(arg0) = args.get(0) else {
-                return Err(MirEvalError::TypeError("atomic intrinsic arg0 is not provided"));
-            };
-            let arg0_addr = Address::from_bytes(arg0.get(self)?)?;
-            let arg0_interval = Interval::new(
-                arg0_addr,
-                self.size_of_sized(ty, locals, "atomic intrinsic type arg")?,
-            );
-            if name.starts_with("load_") {
-                return destination.write_from_interval(self, arg0_interval);
-            }
-            let Some(arg1) = args.get(1) else {
-                return Err(MirEvalError::TypeError("atomic intrinsic arg1 is not provided"));
-            };
-            if name.starts_with("store_") {
-                return arg0_interval.write_from_interval(self, arg1.interval);
-            }
-            if name.starts_with("xchg_") {
-                destination.write_from_interval(self, arg0_interval)?;
-                return arg0_interval.write_from_interval(self, arg1.interval);
-            }
-            if name.starts_with("xadd_") {
-                destination.write_from_interval(self, arg0_interval)?;
-                let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
-                let ans = lhs.wrapping_add(rhs);
-                return arg0_interval
-                    .write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-            }
-            if name.starts_with("xsub_") {
-                destination.write_from_interval(self, arg0_interval)?;
-                let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
-                let ans = lhs.wrapping_sub(rhs);
-                return arg0_interval
-                    .write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-            }
-            if name.starts_with("and_") {
-                destination.write_from_interval(self, arg0_interval)?;
-                let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
-                let ans = lhs & rhs;
-                return arg0_interval
-                    .write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-            }
-            if name.starts_with("or_") {
-                destination.write_from_interval(self, arg0_interval)?;
-                let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
-                let ans = lhs | rhs;
-                return arg0_interval
-                    .write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-            }
-            if name.starts_with("xor_") {
-                destination.write_from_interval(self, arg0_interval)?;
-                let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
-                let ans = lhs ^ rhs;
-                return arg0_interval
-                    .write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-            }
-            if name.starts_with("nand_") {
-                destination.write_from_interval(self, arg0_interval)?;
-                let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
-                let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
-                let ans = !(lhs & rhs);
-                return arg0_interval
-                    .write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
-            }
-            let Some(arg2) = args.get(2) else {
-                return Err(MirEvalError::TypeError("atomic intrinsic arg2 is not provided"));
-            };
-            if name.starts_with("cxchg_") || name.starts_with("cxchgweak_") {
-                let dest = if arg1.get(self)? == arg0_interval.get(self)? {
-                    arg0_interval.write_from_interval(self, arg2.interval)?;
-                    (arg1.interval, true)
-                } else {
-                    (arg0_interval, false)
-                };
-                let result_ty = TyKind::Tuple(
-                    2,
-                    Substitution::from_iter(Interner, [ty.clone(), TyBuilder::bool()]),
-                )
-                .intern(Interner);
-                let layout = self.layout(&result_ty)?;
-                let result = self.make_by_layout(
-                    layout.size.bytes_usize(),
-                    &layout,
-                    None,
-                    [
-                        IntervalOrOwned::Borrowed(dest.0),
-                        IntervalOrOwned::Owned(vec![u8::from(dest.1)]),
-                    ]
-                    .into_iter(),
-                )?;
-                return destination.write_from_bytes(self, &result);
-            }
-            not_supported!("unknown atomic intrinsic {name}");
+        if let Some(name) = name.strip_prefix("atomic_") {
+            return self.exec_atomic_intrinsic(name, args, generic_args, destination, locals, span);
         }
-        match as_str {
+        if let Some(name) = name.strip_suffix("f64") {
+            let result = match name {
+                "sqrt" | "sin" | "cos" | "exp" | "exp2" | "log" | "log10" | "log2" | "fabs"
+                | "floor" | "ceil" | "trunc" | "rint" | "nearbyint" | "round" | "roundeven" => {
+                    let [arg] = args else {
+                        return Err(MirEvalError::TypeError("f64 intrinsic signature doesn't match fn (f64) -> f64"));
+                    };
+                    let arg = from_bytes!(f64, arg.get(self)?);
+                    match name {
+                        "sqrt" => arg.sqrt(),
+                        "sin" => arg.sin(),
+                        "cos" => arg.cos(),
+                        "exp" => arg.exp(),
+                        "exp2" => arg.exp2(),
+                        "log" => arg.ln(),
+                        "log10" => arg.log10(),
+                        "log2" => arg.log2(),
+                        "fabs" => arg.abs(),
+                        "floor" => arg.floor(),
+                        "ceil" => arg.ceil(),
+                        "trunc" => arg.trunc(),
+                        // FIXME: these rounds should be different, but only `.round()` is stable now.
+                        "rint" => arg.round(),
+                        "nearbyint" => arg.round(),
+                        "round" => arg.round(),
+                        "roundeven" => arg.round(),
+                        _ => unreachable!(),
+                    }
+                }
+                "pow" | "minnum" | "maxnum" | "copysign" => {
+                    let [arg1, arg2] = args else {
+                        return Err(MirEvalError::TypeError("f64 intrinsic signature doesn't match fn (f64, f64) -> f64"));
+                    };
+                    let arg1 = from_bytes!(f64, arg1.get(self)?);
+                    let arg2 = from_bytes!(f64, arg2.get(self)?);
+                    match name {
+                        "pow" => arg1.powf(arg2),
+                        "minnum" => arg1.min(arg2),
+                        "maxnum" => arg1.max(arg2),
+                        "copysign" => arg1.copysign(arg2),
+                        _ => unreachable!(),
+                    }
+                }
+                "powi" => {
+                    let [arg1, arg2] = args else {
+                        return Err(MirEvalError::TypeError("powif64 signature doesn't match fn (f64, i32) -> f64"));
+                    };
+                    let arg1 = from_bytes!(f64, arg1.get(self)?);
+                    let arg2 = from_bytes!(i32, arg2.get(self)?);
+                    arg1.powi(arg2)
+                }
+                "fma" => {
+                    let [arg1, arg2, arg3] = args else {
+                        return Err(MirEvalError::TypeError("fmaf64 signature doesn't match fn (f64, f64, f64) -> f64"));
+                    };
+                    let arg1 = from_bytes!(f64, arg1.get(self)?);
+                    let arg2 = from_bytes!(f64, arg2.get(self)?);
+                    let arg3 = from_bytes!(f64, arg3.get(self)?);
+                    arg1.mul_add(arg2, arg3)
+                }
+                _ => not_supported!("unknown f64 intrinsic {name}"),
+            };
+            return destination.write_from_bytes(self, &result.to_le_bytes());
+        }
+        if let Some(name) = name.strip_suffix("f32") {
+            let result = match name {
+                "sqrt" | "sin" | "cos" | "exp" | "exp2" | "log" | "log10" | "log2" | "fabs"
+                | "floor" | "ceil" | "trunc" | "rint" | "nearbyint" | "round" | "roundeven" => {
+                    let [arg] = args else {
+                        return Err(MirEvalError::TypeError("f32 intrinsic signature doesn't match fn (f32) -> f32"));
+                    };
+                    let arg = from_bytes!(f32, arg.get(self)?);
+                    match name {
+                        "sqrt" => arg.sqrt(),
+                        "sin" => arg.sin(),
+                        "cos" => arg.cos(),
+                        "exp" => arg.exp(),
+                        "exp2" => arg.exp2(),
+                        "log" => arg.ln(),
+                        "log10" => arg.log10(),
+                        "log2" => arg.log2(),
+                        "fabs" => arg.abs(),
+                        "floor" => arg.floor(),
+                        "ceil" => arg.ceil(),
+                        "trunc" => arg.trunc(),
+                        // FIXME: these rounds should be different, but only `.round()` is stable now.
+                        "rint" => arg.round(),
+                        "nearbyint" => arg.round(),
+                        "round" => arg.round(),
+                        "roundeven" => arg.round(),
+                        _ => unreachable!(),
+                    }
+                }
+                "pow" | "minnum" | "maxnum" | "copysign" => {
+                    let [arg1, arg2] = args else {
+                        return Err(MirEvalError::TypeError("f32 intrinsic signature doesn't match fn (f32, f32) -> f32"));
+                    };
+                    let arg1 = from_bytes!(f32, arg1.get(self)?);
+                    let arg2 = from_bytes!(f32, arg2.get(self)?);
+                    match name {
+                        "pow" => arg1.powf(arg2),
+                        "minnum" => arg1.min(arg2),
+                        "maxnum" => arg1.max(arg2),
+                        "copysign" => arg1.copysign(arg2),
+                        _ => unreachable!(),
+                    }
+                }
+                "powi" => {
+                    let [arg1, arg2] = args else {
+                        return Err(MirEvalError::TypeError("powif32 signature doesn't match fn (f32, i32) -> f32"));
+                    };
+                    let arg1 = from_bytes!(f32, arg1.get(self)?);
+                    let arg2 = from_bytes!(i32, arg2.get(self)?);
+                    arg1.powi(arg2)
+                }
+                "fma" => {
+                    let [arg1, arg2, arg3] = args else {
+                        return Err(MirEvalError::TypeError("fmaf32 signature doesn't match fn (f32, f32, f32) -> f32"));
+                    };
+                    let arg1 = from_bytes!(f32, arg1.get(self)?);
+                    let arg2 = from_bytes!(f32, arg2.get(self)?);
+                    let arg3 = from_bytes!(f32, arg3.get(self)?);
+                    arg1.mul_add(arg2, arg3)
+                }
+                _ => not_supported!("unknown f32 intrinsic {name}"),
+            };
+            return destination.write_from_bytes(self, &result.to_le_bytes());
+        }
+        match name {
             "size_of" => {
                 let Some(ty) = generic_args.as_slice(Interner).get(0).and_then(|x| x.ty(Interner)) else {
                     return Err(MirEvalError::TypeError("size_of generic arg is not provided"));
@@ -437,7 +482,7 @@ impl Evaluator<'_> {
                 let Some(ty) = generic_args.as_slice(Interner).get(0).and_then(|x| x.ty(Interner)) else {
                     return Err(MirEvalError::TypeError("align_of generic arg is not provided"));
                 };
-                let align = self.layout_filled(ty, locals)?.align.abi.bytes();
+                let align = self.layout(ty)?.align.abi.bytes();
                 destination.write_from_bytes(self, &align.to_le_bytes()[0..destination.size])
             }
             "needs_drop" => {
@@ -456,6 +501,22 @@ impl Evaluator<'_> {
                 let ans = lhs.get(self)? == rhs.get(self)?;
                 destination.write_from_bytes(self, &[u8::from(ans)])
             }
+            "saturating_add" => {
+                let [lhs, rhs] = args else {
+                    return Err(MirEvalError::TypeError("saturating_add args are not provided"));
+                };
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let ans = lhs.saturating_add(rhs);
+                let bits = destination.size * 8;
+                // FIXME: signed
+                let is_signed = false;
+                let mx: u128 = if is_signed { (1 << (bits - 1)) - 1 } else { (1 << bits) - 1 };
+                // FIXME: signed
+                let mn: u128 = 0;
+                let ans = cmp::min(mx, cmp::max(mn, ans));
+                destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
+            }
             "wrapping_add" | "unchecked_add" => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::TypeError("wrapping_add args are not provided"));
@@ -472,6 +533,15 @@ impl Evaluator<'_> {
                 let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
                 let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
                 let ans = lhs.wrapping_sub(rhs);
+                destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
+            }
+            "wrapping_mul" | "unchecked_mul" => {
+                let [lhs, rhs] = args else {
+                    return Err(MirEvalError::TypeError("wrapping_mul args are not provided"));
+                };
+                let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
+                let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
+                let ans = lhs.wrapping_mul(rhs);
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
             "unchecked_rem" => {
@@ -498,7 +568,7 @@ impl Evaluator<'_> {
                 })?;
                 destination.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size])
             }
-            "add_with_overflow" => {
+            "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" => {
                 let [lhs, rhs] = args else {
                     return Err(MirEvalError::TypeError("const_eval_select args are not provided"));
                 };
@@ -511,8 +581,14 @@ impl Evaluator<'_> {
                     self.size_of_sized(&lhs.ty, locals, "operand of add_with_overflow")?;
                 let lhs = u128::from_le_bytes(pad16(lhs.get(self)?, false));
                 let rhs = u128::from_le_bytes(pad16(rhs.get(self)?, false));
-                let ans = lhs.wrapping_add(rhs);
-                let is_overflow = false;
+                let (ans, u128overflow) = match name {
+                    "add_with_overflow" => lhs.overflowing_add(rhs),
+                    "sub_with_overflow" => lhs.overflowing_sub(rhs),
+                    "mul_with_overflow" => lhs.overflowing_mul(rhs),
+                    _ => unreachable!(),
+                };
+                let is_overflow = u128overflow
+                    || ans.to_le_bytes()[op_size..].iter().any(|&x| x != 0 && x != 255);
                 let is_overflow = vec![u8::from(is_overflow)];
                 let layout = self.layout(&result_ty)?;
                 let result = self.make_by_layout(
@@ -607,7 +683,110 @@ impl Evaluator<'_> {
                 }
                 self.exec_fn_trait(&args, destination, locals, span)
             }
-            _ => not_supported!("unknown intrinsic {as_str}"),
+            _ => not_supported!("unknown intrinsic {name}"),
         }
+    }
+
+    fn exec_atomic_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[IntervalAndTy],
+        generic_args: &Substitution,
+        destination: Interval,
+        locals: &Locals<'_>,
+        _span: MirSpan,
+    ) -> Result<()> {
+        // We are a single threaded runtime with no UB checking and no optimization, so
+        // we can implement these as normal functions.
+        let Some(ty) = generic_args.as_slice(Interner).get(0).and_then(|x| x.ty(Interner)) else {
+            return Err(MirEvalError::TypeError("atomic intrinsic generic arg is not provided"));
+        };
+        let Some(arg0) = args.get(0) else {
+            return Err(MirEvalError::TypeError("atomic intrinsic arg0 is not provided"));
+        };
+        let arg0_addr = Address::from_bytes(arg0.get(self)?)?;
+        let arg0_interval =
+            Interval::new(arg0_addr, self.size_of_sized(ty, locals, "atomic intrinsic type arg")?);
+        if name.starts_with("load_") {
+            return destination.write_from_interval(self, arg0_interval);
+        }
+        let Some(arg1) = args.get(1) else {
+            return Err(MirEvalError::TypeError("atomic intrinsic arg1 is not provided"));
+        };
+        if name.starts_with("store_") {
+            return arg0_interval.write_from_interval(self, arg1.interval);
+        }
+        if name.starts_with("xchg_") {
+            destination.write_from_interval(self, arg0_interval)?;
+            return arg0_interval.write_from_interval(self, arg1.interval);
+        }
+        if name.starts_with("xadd_") {
+            destination.write_from_interval(self, arg0_interval)?;
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let ans = lhs.wrapping_add(rhs);
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+        }
+        if name.starts_with("xsub_") {
+            destination.write_from_interval(self, arg0_interval)?;
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let ans = lhs.wrapping_sub(rhs);
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+        }
+        if name.starts_with("and_") {
+            destination.write_from_interval(self, arg0_interval)?;
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let ans = lhs & rhs;
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+        }
+        if name.starts_with("or_") {
+            destination.write_from_interval(self, arg0_interval)?;
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let ans = lhs | rhs;
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+        }
+        if name.starts_with("xor_") {
+            destination.write_from_interval(self, arg0_interval)?;
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let ans = lhs ^ rhs;
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+        }
+        if name.starts_with("nand_") {
+            destination.write_from_interval(self, arg0_interval)?;
+            let lhs = u128::from_le_bytes(pad16(arg0_interval.get(self)?, false));
+            let rhs = u128::from_le_bytes(pad16(arg1.get(self)?, false));
+            let ans = !(lhs & rhs);
+            return arg0_interval.write_from_bytes(self, &ans.to_le_bytes()[0..destination.size]);
+        }
+        let Some(arg2) = args.get(2) else {
+            return Err(MirEvalError::TypeError("atomic intrinsic arg2 is not provided"));
+        };
+        if name.starts_with("cxchg_") || name.starts_with("cxchgweak_") {
+            let dest = if arg1.get(self)? == arg0_interval.get(self)? {
+                arg0_interval.write_from_interval(self, arg2.interval)?;
+                (arg1.interval, true)
+            } else {
+                (arg0_interval, false)
+            };
+            let result_ty = TyKind::Tuple(
+                2,
+                Substitution::from_iter(Interner, [ty.clone(), TyBuilder::bool()]),
+            )
+            .intern(Interner);
+            let layout = self.layout(&result_ty)?;
+            let result = self.make_by_layout(
+                layout.size.bytes_usize(),
+                &layout,
+                None,
+                [IntervalOrOwned::Borrowed(dest.0), IntervalOrOwned::Owned(vec![u8::from(dest.1)])]
+                    .into_iter(),
+            )?;
+            return destination.write_from_bytes(self, &result);
+        }
+        not_supported!("unknown atomic intrinsic {name}");
     }
 }

@@ -8,14 +8,14 @@ use hir_def::{
     body::Body,
     data::adt::{StructKind, VariantData},
     hir::{
-        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ExprId, LabelId, Literal, MatchArm,
-        Pat, PatId, RecordFieldPat, RecordLitField,
+        ArithOp, Array, BinaryOp, BindingAnnotation, BindingId, ExprId, LabelId, Literal,
+        LiteralOrConst, MatchArm, Pat, PatId, RecordFieldPat, RecordLitField,
     },
     lang_item::{LangItem, LangItemTarget},
     path::Path,
-    resolver::{resolver_for_expr, ResolveValueResult, ValueNs},
+    resolver::{resolver_for_expr, HasResolver, ResolveValueResult, ValueNs},
     AdtId, DefWithBodyId, EnumVariantId, GeneralConstId, HasModule, ItemContainerId, LocalFieldId,
-    TraitId,
+    TraitId, TypeOrConstParamId,
 };
 use hir_expand::name::Name;
 use la_arena::ArenaMap;
@@ -29,9 +29,10 @@ use crate::{
     display::HirDisplay,
     infer::{CaptureKind, CapturedItem, TypeMismatch},
     inhabitedness::is_ty_uninhabited_from,
-    layout::{layout_of_ty, LayoutError},
+    layout::LayoutError,
     mapping::ToChalk,
     static_lifetime,
+    traits::FnTrait,
     utils::{generics, ClosureSubst},
     Adjust, Adjustment, AutoBorrow, CallableDefId, TyBuilder, TyExt,
 };
@@ -41,14 +42,13 @@ use super::*;
 mod as_place;
 mod pattern_matching;
 
-use pattern_matching::AdtPatternShape;
-
 #[derive(Debug, Clone)]
 struct LoopBlocks {
     begin: BasicBlockId,
     /// `None` for loops that are not terminating
     end: Option<BasicBlockId>,
     place: Place,
+    drop_scope_index: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -74,6 +74,7 @@ pub enum MirLowerError {
     ConstEvalError(String, Box<ConstEvalError>),
     LayoutError(LayoutError),
     IncompleteExpr,
+    IncompletePattern,
     /// Trying to lower a trait function, instead of an implementation
     TraitFunctionDefinition(TraitId, Name),
     UnresolvedName(String),
@@ -96,7 +97,39 @@ pub enum MirLowerError {
     UnresolvedLabel,
     UnresolvedUpvar(Place),
     UnaccessableLocal,
+
+    // monomorphization errors:
+    GenericArgNotProvided(TypeOrConstParamId, Substitution),
 }
+
+/// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
+struct DropScopeToken;
+impl DropScopeToken {
+    fn pop_and_drop(self, ctx: &mut MirLowerCtx<'_>, current: BasicBlockId) -> BasicBlockId {
+        std::mem::forget(self);
+        ctx.pop_drop_scope_internal(current)
+    }
+
+    /// It is useful when we want a drop scope is syntaxically closed, but we don't want to execute any drop
+    /// code. Either when the control flow is diverging (so drop code doesn't reached) or when drop is handled
+    /// for us (for example a block that ended with a return statement. Return will drop everything, so the block shouldn't
+    /// do anything)
+    fn pop_assume_dropped(self, ctx: &mut MirLowerCtx<'_>) {
+        std::mem::forget(self);
+        ctx.pop_drop_scope_assume_dropped_internal();
+    }
+}
+
+// Uncomment this to make `DropScopeToken` a drop bomb. Unfortunately we can't do this in release, since
+// in cases that mir lowering fails, we don't handle (and don't need to handle) drop scopes so it will be
+// actually reached. `pop_drop_scope_assert_finished` will also detect this case, but doesn't show useful
+// stack trace.
+//
+// impl Drop for DropScopeToken {
+//     fn drop(&mut self) {
+//         never!("Drop scope doesn't popped");
+//     }
+// }
 
 impl MirLowerError {
     pub fn pretty_print(
@@ -129,9 +162,24 @@ impl MirLowerError {
                     e.actual.display(db),
                 )?;
             }
+            MirLowerError::GenericArgNotProvided(id, subst) => {
+                let parent = id.parent;
+                let param = &db.generic_params(parent).type_or_consts[id.local_id];
+                writeln!(
+                    f,
+                    "Generic arg not provided for {}",
+                    param.name().unwrap_or(&Name::missing()).display(db.upcast())
+                )?;
+                writeln!(f, "Provided args: [")?;
+                for g in subst.iter(Interner) {
+                    write!(f, "    {},", g.display(db).to_string())?;
+                }
+                writeln!(f, "]")?;
+            }
             MirLowerError::LayoutError(_)
             | MirLowerError::UnsizedTemporary(_)
             | MirLowerError::IncompleteExpr
+            | MirLowerError::IncompletePattern
             | MirLowerError::UnaccessableLocal
             | MirLowerError::TraitFunctionDefinition(_, _)
             | MirLowerError::UnresolvedName(_)
@@ -460,9 +508,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     current,
                     None,
                     cond_place,
-                    self.expr_ty_after_adjustments(*expr),
                     *pat,
-                    BindingAnnotation::Unannotated,
                 )?;
                 self.write_bytes_to_place(
                     then_target,
@@ -490,7 +536,6 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     self.lower_loop(current, place.clone(), Some(*label), expr_id.into(), |this, begin| {
                         if let Some(current) = this.lower_block_to_place(statements, begin, *tail, place, expr_id.into())? {
                             let end = this.current_loop_end()?;
-                            let current = this.pop_drop_scope(current);
                             this.set_goto(current, end, expr_id.into());
                         }
                         Ok(())
@@ -500,89 +545,43 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 }
             }
             Expr::Loop { body, label } => self.lower_loop(current, place, *label, expr_id.into(), |this, begin| {
-                if let Some((_, current)) = this.lower_expr_as_place(begin, *body, true)? {
-                    let current = this.pop_drop_scope(current);
+                let scope = this.push_drop_scope();
+                if let Some((_, mut current)) = this.lower_expr_as_place(begin, *body, true)? {
+                    current = scope.pop_and_drop(this, current);
                     this.set_goto(current, begin, expr_id.into());
+                } else {
+                    scope.pop_assume_dropped(this);
                 }
                 Ok(())
             }),
             Expr::While { condition, body, label } => {
                 self.lower_loop(current, place, *label, expr_id.into(),|this, begin| {
+                    let scope = this.push_drop_scope();
                     let Some((discr, to_switch)) = this.lower_expr_to_some_operand(*condition, begin)? else {
                         return Ok(());
                     };
-                    let end = this.current_loop_end()?;
+                    let fail_cond = this.new_basic_block();
                     let after_cond = this.new_basic_block();
                     this.set_terminator(
                         to_switch,
                         TerminatorKind::SwitchInt {
                             discr,
-                            targets: SwitchTargets::static_if(1, after_cond, end),
+                            targets: SwitchTargets::static_if(1, after_cond, fail_cond),
                         },
                         expr_id.into(),
                     );
+                    let fail_cond = this.drop_until_scope(this.drop_scopes.len() - 1, fail_cond);
+                    let end = this.current_loop_end()?;
+                    this.set_goto(fail_cond, end, expr_id.into());
                     if let Some((_, block)) = this.lower_expr_as_place(after_cond, *body, true)? {
-                        let block = this.pop_drop_scope(block);
+                        let block = scope.pop_and_drop(this, block);
                         this.set_goto(block, begin, expr_id.into());
+                    } else {
+                        scope.pop_assume_dropped(this);
                     }
                     Ok(())
                 })
             }
-            &Expr::For { iterable, pat, body, label } => {
-                let into_iter_fn = self.resolve_lang_item(LangItem::IntoIterIntoIter)?
-                    .as_function().ok_or(MirLowerError::LangItemNotFound(LangItem::IntoIterIntoIter))?;
-                let iter_next_fn = self.resolve_lang_item(LangItem::IteratorNext)?
-                    .as_function().ok_or(MirLowerError::LangItemNotFound(LangItem::IteratorNext))?;
-                let option_some = self.resolve_lang_item(LangItem::OptionSome)?
-                    .as_enum_variant().ok_or(MirLowerError::LangItemNotFound(LangItem::OptionSome))?;
-                let option = option_some.parent;
-                let into_iter_fn_op = Operand::const_zst(
-                    TyKind::FnDef(
-                        self.db.intern_callable_def(CallableDefId::FunctionId(into_iter_fn)).into(),
-                        Substitution::from1(Interner, self.expr_ty_without_adjust(iterable))
-                    ).intern(Interner));
-                let iter_next_fn_op = Operand::const_zst(
-                    TyKind::FnDef(
-                        self.db.intern_callable_def(CallableDefId::FunctionId(iter_next_fn)).into(),
-                        Substitution::from1(Interner, self.expr_ty_without_adjust(iterable))
-                    ).intern(Interner));
-                let &Some(iterator_ty) = &self.infer.type_of_for_iterator.get(&expr_id) else {
-                    return Err(MirLowerError::TypeError("unknown for loop iterator type"));
-                };
-                let ref_mut_iterator_ty = TyKind::Ref(Mutability::Mut, static_lifetime(), iterator_ty.clone()).intern(Interner);
-                let item_ty = &self.infer.type_of_pat[pat];
-                let option_item_ty = TyKind::Adt(chalk_ir::AdtId(option.into()), Substitution::from1(Interner, item_ty.clone())).intern(Interner);
-                let iterator_place: Place = self.temp(iterator_ty.clone(), current, expr_id.into())?.into();
-                let option_item_place: Place = self.temp(option_item_ty.clone(), current, expr_id.into())?.into();
-                let ref_mut_iterator_place: Place = self.temp(ref_mut_iterator_ty, current, expr_id.into())?.into();
-                let Some(current) = self.lower_call_and_args(into_iter_fn_op, Some(iterable).into_iter(), iterator_place.clone(), current, false, expr_id.into())?
-                else {
-                    return Ok(None);
-                };
-                self.push_assignment(current, ref_mut_iterator_place.clone(), Rvalue::Ref(BorrowKind::Mut { allow_two_phase_borrow: false }, iterator_place), expr_id.into());
-                self.lower_loop(current, place, label, expr_id.into(), |this, begin| {
-                    let Some(current) = this.lower_call(iter_next_fn_op, Box::new([Operand::Copy(ref_mut_iterator_place)]), option_item_place.clone(), begin, false, expr_id.into())?
-                    else {
-                        return Ok(());
-                    };
-                    let end = this.current_loop_end()?;
-                    let (current, _) = this.pattern_matching_variant(
-                        option_item_ty.clone(),
-                        BindingAnnotation::Unannotated,
-                        option_item_place.into(),
-                        option_some.into(),
-                        current,
-                        pat.into(),
-                        Some(end),
-                        AdtPatternShape::Tuple { args: &[pat], ellipsis: None },
-                    )?;
-                    if let Some((_, block)) = this.lower_expr_as_place(current, body, true)? {
-                        let block = this.pop_drop_scope(block);
-                        this.set_goto(block, begin, expr_id.into());
-                    }
-                    Ok(())
-                })
-            },
             Expr::Call { callee, args, .. } => {
                 if let Some((func_id, generic_args)) =
                     self.infer.method_resolution(expr_id) {
@@ -619,7 +618,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
             }
             Expr::MethodCall { receiver, args, method_name, .. } => {
                 let (func_id, generic_args) =
-                    self.infer.method_resolution(expr_id).ok_or_else(|| MirLowerError::UnresolvedMethod(format!("{}", method_name)))?;
+                    self.infer.method_resolution(expr_id).ok_or_else(|| MirLowerError::UnresolvedMethod(method_name.display(self.db.upcast()).to_string()))?;
                 let func = Operand::from_fn(self.db, func_id, generic_args);
                 self.lower_call_and_args(
                     func,
@@ -635,16 +634,13 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 else {
                     return Ok(None);
                 };
-                let cond_ty = self.expr_ty_after_adjustments(*expr);
                 let mut end = None;
                 for MatchArm { pat, guard, expr } in arms.iter() {
                     let (then, mut otherwise) = self.pattern_match(
                         current,
                         None,
                         cond_place.clone(),
-                        cond_ty.clone(),
                         *pat,
-                        BindingAnnotation::Unannotated,
                     )?;
                     let then = if let &Some(guard) = guard {
                         let next = self.new_basic_block();
@@ -679,7 +675,9 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     Some(l) => self.labeled_loop_blocks.get(l).ok_or(MirLowerError::UnresolvedLabel)?,
                     None => self.current_loop_blocks.as_ref().ok_or(MirLowerError::ContinueWithoutLoop)?,
                 };
-                self.set_goto(current, loop_data.begin, expr_id.into());
+                let begin = loop_data.begin;
+                current = self.drop_until_scope(loop_data.drop_scope_index, current);
+                self.set_goto(current, begin, expr_id.into());
                 Ok(None)
             },
             &Expr::Break { expr, label } => {
@@ -693,10 +691,16 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     };
                     current = c;
                 }
-                let end = match label {
-                    Some(l) => self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?.end.expect("We always generate end for labeled loops"),
-                    None => self.current_loop_end()?,
+                let (end, drop_scope) = match label {
+                    Some(l) => {
+                        let loop_blocks = self.labeled_loop_blocks.get(&l).ok_or(MirLowerError::UnresolvedLabel)?;
+                        (loop_blocks.end.expect("We always generate end for labeled loops"), loop_blocks.drop_scope_index)
+                    },
+                    None => {
+                        (self.current_loop_end()?, self.current_loop_blocks.as_ref().unwrap().drop_scope_index)
+                    },
                 };
+                current = self.drop_until_scope(drop_scope, current);
                 self.set_goto(current, end, expr_id.into());
                 Ok(None)
             }
@@ -866,7 +870,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                         op,
                         BinaryOp::ArithOp(ArithOp::Shl | ArithOp::Shr) | BinaryOp::Assignment { op: Some(ArithOp::Shl | ArithOp::Shr) }
                     );
-                    lhs_ty.as_builtin().is_some() && rhs_ty.as_builtin().is_some() && (lhs_ty == rhs_ty || builtin_inequal_impls)
+                    lhs_ty.is_scalar() && rhs_ty.is_scalar() && (lhs_ty == rhs_ty || builtin_inequal_impls)
                 };
                 if !is_builtin {
                     if let Some((func_id, generic_args)) = self.infer.method_resolution(expr_id) {
@@ -918,6 +922,27 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 let Some((lhs_op, current)) = self.lower_expr_to_some_operand(*lhs, current)? else {
                     return Ok(None);
                 };
+                if let hir_def::hir::BinaryOp::LogicOp(op) = op {
+                    let value_to_short = match op {
+                        syntax::ast::LogicOp::And => 0,
+                        syntax::ast::LogicOp::Or => 1,
+                    };
+                    let start_of_then = self.new_basic_block();
+                    self.push_assignment(start_of_then, place.clone(), lhs_op.clone().into(), expr_id.into());
+                    let end_of_then = Some(start_of_then);
+                    let start_of_else = self.new_basic_block();
+                    let end_of_else =
+                        self.lower_expr_to_place(*rhs, place, start_of_else)?;
+                    self.set_terminator(
+                        current,
+                        TerminatorKind::SwitchInt {
+                            discr: lhs_op,
+                            targets: SwitchTargets::static_if(value_to_short, start_of_then, start_of_else),
+                        },
+                        expr_id.into(),
+                    );
+                    return Ok(self.merge_blocks(end_of_then, end_of_else, expr_id.into()));
+                }
                 let Some((rhs_op, current)) = self.lower_expr_to_some_operand(*rhs, current)? else {
                     return Ok(None);
                 };
@@ -1135,8 +1160,39 @@ impl<'ctx> MirLowerCtx<'ctx> {
         Ok(())
     }
 
+    fn lower_literal_or_const_to_operand(
+        &mut self,
+        ty: Ty,
+        loc: &LiteralOrConst,
+    ) -> Result<Operand> {
+        match loc {
+            LiteralOrConst::Literal(l) => self.lower_literal_to_operand(ty, l),
+            LiteralOrConst::Const(c) => {
+                let unresolved_name = || MirLowerError::unresolved_path(self.db, c);
+                let resolver = self.owner.resolver(self.db.upcast());
+                let pr = resolver
+                    .resolve_path_in_value_ns(self.db.upcast(), c)
+                    .ok_or_else(unresolved_name)?;
+                match pr {
+                    ResolveValueResult::ValueNs(v) => {
+                        if let ValueNs::ConstId(c) = v {
+                            self.lower_const_to_operand(Substitution::empty(Interner), c.into(), ty)
+                        } else {
+                            not_supported!("bad path in range pattern");
+                        }
+                    }
+                    ResolveValueResult::Partial(_, _) => {
+                        not_supported!("associated constants in range pattern")
+                    }
+                }
+            }
+        }
+    }
+
     fn lower_literal_to_operand(&mut self, ty: Ty, l: &Literal) -> Result<Operand> {
-        let size = layout_of_ty(self.db, &ty, self.owner.module(self.db.upcast()).krate())?
+        let size = self
+            .db
+            .layout_of_ty(ty.clone(), self.owner.module(self.db.upcast()).krate())?
             .size
             .bytes_usize();
         let bytes = match l {
@@ -1196,6 +1252,17 @@ impl<'ctx> MirLowerCtx<'ctx> {
         span: MirSpan,
         ty: Ty,
     ) -> Result<()> {
+        let c = self.lower_const_to_operand(subst, const_id, ty)?;
+        self.push_assignment(prev_block, place, c.into(), span);
+        Ok(())
+    }
+
+    fn lower_const_to_operand(
+        &mut self,
+        subst: Substitution,
+        const_id: GeneralConstId,
+        ty: Ty,
+    ) -> Result<Operand> {
         let c = if subst.len(Interner) != 0 {
             // We can't evaluate constant with substitution now, as generics are not monomorphized in lowering.
             intern_const_scalar(ConstScalar::UnevaluatedConst(const_id, subst), ty)
@@ -1205,18 +1272,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                 .const_eval(const_id.into(), subst)
                 .map_err(|e| MirLowerError::ConstEvalError(name, Box::new(e)))?
         };
-        self.write_const_to_place(c, prev_block, place, span)
-    }
-
-    fn write_const_to_place(
-        &mut self,
-        c: Const,
-        prev_block: BasicBlockId,
-        place: Place,
-        span: MirSpan,
-    ) -> Result<()> {
-        self.push_assignment(prev_block, place, Operand::Constant(c).into(), span);
-        Ok(())
+        Ok(Operand::Constant(c))
     }
 
     fn write_bytes_to_place(
@@ -1368,7 +1424,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
         let begin = self.new_basic_block();
         let prev = mem::replace(
             &mut self.current_loop_blocks,
-            Some(LoopBlocks { begin, end: None, place }),
+            Some(LoopBlocks { begin, end: None, place, drop_scope_index: self.drop_scopes.len() }),
         );
         let prev_label = if let Some(label) = label {
             // We should generate the end now, to make sure that it wouldn't change later. It is
@@ -1381,7 +1437,6 @@ impl<'ctx> MirLowerCtx<'ctx> {
             None
         };
         self.set_goto(prev_block, begin, span);
-        self.push_drop_scope();
         f(self, begin)?;
         let my = mem::replace(&mut self.current_loop_blocks, prev).ok_or(
             MirLowerError::ImplementationError("current_loop_blocks is corrupt".to_string()),
@@ -1462,9 +1517,6 @@ impl<'ctx> MirLowerCtx<'ctx> {
         span: MirSpan,
     ) -> Result<()> {
         self.drop_scopes.last_mut().unwrap().locals.push(l);
-        // FIXME: this storage dead is not neccessary, but since drop scope handling is broken, we need
-        // it to avoid falso positives in mutability errors
-        self.push_statement(current, StatementKind::StorageDead(l).with_span(span));
         self.push_statement(current, StatementKind::StorageLive(l).with_span(span));
         Ok(())
     }
@@ -1482,6 +1534,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
         place: Place,
         span: MirSpan,
     ) -> Result<Option<Idx<BasicBlock>>> {
+        let scope = self.push_drop_scope();
         for statement in statements.iter() {
             match statement {
                 hir_def::hir::Statement::Let { pat, initializer, else_branch, type_ref: _ } => {
@@ -1490,17 +1543,12 @@ impl<'ctx> MirLowerCtx<'ctx> {
                         let Some((init_place, c)) =
                             self.lower_expr_as_place(current, *expr_id, true)?
                         else {
+                            scope.pop_assume_dropped(self);
                             return Ok(None);
                         };
                         current = c;
-                        (current, else_block) = self.pattern_match(
-                            current,
-                            None,
-                            init_place,
-                            self.expr_ty_after_adjustments(*expr_id),
-                            *pat,
-                            BindingAnnotation::Unannotated,
-                        )?;
+                        (current, else_block) =
+                            self.pattern_match(current, None, init_place, *pat)?;
                         match (else_block, else_branch) {
                             (None, _) => (),
                             (Some(else_block), None) => {
@@ -1527,18 +1575,25 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     }
                 }
                 hir_def::hir::Statement::Expr { expr, has_semi: _ } => {
-                    self.push_drop_scope();
+                    let scope2 = self.push_drop_scope();
                     let Some((_, c)) = self.lower_expr_as_place(current, *expr, true)? else {
+                        scope2.pop_assume_dropped(self);
+                        scope.pop_assume_dropped(self);
                         return Ok(None);
                     };
-                    current = self.pop_drop_scope(c);
+                    current = scope2.pop_and_drop(self, c);
                 }
             }
         }
-        match tail {
-            Some(tail) => self.lower_expr_to_place(tail, place, current),
-            None => Ok(Some(current)),
+        if let Some(tail) = tail {
+            let Some(c) = self.lower_expr_to_place(tail, place, current)? else {
+                scope.pop_assume_dropped(self);
+                return Ok(None);
+            };
+            current = c;
         }
+        current = scope.pop_and_drop(self, current);
+        Ok(Some(current))
     }
 
     fn lower_params_and_bindings(
@@ -1580,14 +1635,7 @@ impl<'ctx> MirLowerCtx<'ctx> {
                     continue;
                 }
             }
-            let r = self.pattern_match(
-                current,
-                None,
-                local.into(),
-                self.result.locals[local].ty.clone(),
-                param,
-                BindingAnnotation::Unannotated,
-            )?;
+            let r = self.pattern_match(current, None, local.into(), param)?;
             if let Some(b) = r.1 {
                 self.set_terminator(b, TerminatorKind::Unreachable, param.into());
             }
@@ -1614,7 +1662,11 @@ impl<'ctx> MirLowerCtx<'ctx> {
             Ok(r) => Ok(r),
             Err(e) => {
                 let data = self.db.enum_data(variant.parent);
-                let name = format!("{}::{}", data.name, data.variants[variant.local_id].name);
+                let name = format!(
+                    "{}::{}",
+                    data.name.display(self.db.upcast()),
+                    data.variants[variant.local_id].name.display(self.db.upcast())
+                );
                 Err(MirLowerError::ConstEvalError(name, Box::new(e)))
             }
         }
@@ -1627,14 +1679,32 @@ impl<'ctx> MirLowerCtx<'ctx> {
         current
     }
 
-    fn push_drop_scope(&mut self) {
+    fn push_drop_scope(&mut self) -> DropScopeToken {
         self.drop_scopes.push(DropScope::default());
+        DropScopeToken
     }
 
-    fn pop_drop_scope(&mut self, mut current: BasicBlockId) -> BasicBlockId {
+    /// Don't call directly
+    fn pop_drop_scope_assume_dropped_internal(&mut self) {
+        self.drop_scopes.pop();
+    }
+
+    /// Don't call directly
+    fn pop_drop_scope_internal(&mut self, mut current: BasicBlockId) -> BasicBlockId {
         let scope = self.drop_scopes.pop().unwrap();
         self.emit_drop_and_storage_dead_for_scope(&scope, &mut current);
         current
+    }
+
+    fn pop_drop_scope_assert_finished(
+        &mut self,
+        mut current: BasicBlockId,
+    ) -> Result<BasicBlockId> {
+        current = self.pop_drop_scope_internal(current);
+        if !self.drop_scopes.is_empty() {
+            implementation_error!("Mismatched count between drop scope push and pops");
+        }
+        Ok(current)
     }
 
     fn emit_drop_and_storage_dead_for_scope(
@@ -1669,8 +1739,23 @@ fn cast_kind(source_ty: &Ty, target_ty: &Ty) -> Result<CastKind> {
         },
         (TyKind::Scalar(_), TyKind::Raw(..)) => CastKind::PointerFromExposedAddress,
         (TyKind::Raw(..), TyKind::Scalar(_)) => CastKind::PointerExposeAddress,
-        (TyKind::Raw(..) | TyKind::Ref(..), TyKind::Raw(..) | TyKind::Ref(..)) => {
-            CastKind::PtrToPtr
+        (TyKind::Raw(_, a) | TyKind::Ref(_, _, a), TyKind::Raw(_, b) | TyKind::Ref(_, _, b)) => {
+            CastKind::Pointer(if a == b {
+                PointerCast::MutToConstPointer
+            } else if matches!(a.kind(Interner), TyKind::Slice(_) | TyKind::Str)
+                && matches!(b.kind(Interner), TyKind::Slice(_) | TyKind::Str)
+            {
+                // slice to slice cast is no-op (metadata is not touched), so we use this
+                PointerCast::MutToConstPointer
+            } else if matches!(b.kind(Interner), TyKind::Slice(_) | TyKind::Dyn(_)) {
+                PointerCast::Unsize
+            } else if matches!(a.kind(Interner), TyKind::Slice(s) if s == b) {
+                PointerCast::ArrayToPointer
+            } else {
+                // cast between two sized pointer, like *const i32 to *const i8. There is no specific variant
+                // for it in `PointerCast` so we use `MutToConstPointer`
+                PointerCast::MutToConstPointer
+            })
         }
         // Enum to int casts
         (TyKind::Scalar(_), TyKind::Adt(..)) | (TyKind::Adt(..), TyKind::Scalar(_)) => {
@@ -1693,11 +1778,19 @@ pub fn mir_body_for_closure_query(
     let TyKind::Closure(_, substs) = &infer[expr].kind(Interner) else {
         implementation_error!("closure expression is not closure");
     };
-    let (captures, _) = infer.closure_info(&closure);
+    let (captures, kind) = infer.closure_info(&closure);
     let mut ctx = MirLowerCtx::new(db, owner, &body, &infer);
     // 0 is return local
     ctx.result.locals.alloc(Local { ty: infer[*root].clone() });
-    let closure_local = ctx.result.locals.alloc(Local { ty: infer[expr].clone() });
+    let closure_local = ctx.result.locals.alloc(Local {
+        ty: match kind {
+            FnTrait::FnOnce => infer[expr].clone(),
+            FnTrait::FnMut => TyKind::Ref(Mutability::Mut, static_lifetime(), infer[expr].clone())
+                .intern(Interner),
+            FnTrait::Fn => TyKind::Ref(Mutability::Not, static_lifetime(), infer[expr].clone())
+                .intern(Interner),
+        },
+    });
     ctx.result.param_locals.push(closure_local);
     let Some(sig) = ClosureSubst(substs).sig_ty().callable_sig(db) else {
         implementation_error!("closure has not callable sig");
@@ -1707,7 +1800,7 @@ pub fn mir_body_for_closure_query(
         |_| true,
     )?;
     if let Some(current) = ctx.lower_expr_to_place(*root, return_slot().into(), current)? {
-        let current = ctx.pop_drop_scope(current);
+        let current = ctx.pop_drop_scope_assert_finished(current)?;
         ctx.set_terminator(current, TerminatorKind::Return, (*root).into());
     }
     let mut upvar_map: FxHashMap<LocalId, Vec<(&CapturedItem, usize)>> = FxHashMap::default();
@@ -1717,6 +1810,10 @@ pub fn mir_body_for_closure_query(
     }
     let mut err = None;
     let closure_local = ctx.result.locals.iter().nth(1).unwrap().0;
+    let closure_projection = match kind {
+        FnTrait::FnOnce => vec![],
+        FnTrait::FnMut | FnTrait::Fn => vec![ProjectionElem::Deref],
+    };
     ctx.result.walk_places(|p| {
         if let Some(x) = upvar_map.get(&p.local) {
             let r = x.iter().find(|x| {
@@ -1739,7 +1836,8 @@ pub fn mir_body_for_closure_query(
             match r {
                 Some(x) => {
                     p.local = closure_local;
-                    let mut next_projs = vec![PlaceElem::TupleOrClosureField(x.1)];
+                    let mut next_projs = closure_projection.clone();
+                    next_projs.push(PlaceElem::TupleOrClosureField(x.1));
                     let prev_projs = mem::take(&mut p.projection);
                     if x.0.kind != CaptureKind::ByValue {
                         next_projs.push(ProjectionElem::Deref);
@@ -1766,14 +1864,19 @@ pub fn mir_body_for_closure_query(
 
 pub fn mir_body_query(db: &dyn HirDatabase, def: DefWithBodyId) -> Result<Arc<MirBody>> {
     let _p = profile::span("mir_body_query").detail(|| match def {
-        DefWithBodyId::FunctionId(it) => db.function_data(it).name.to_string(),
-        DefWithBodyId::StaticId(it) => db.static_data(it).name.clone().to_string(),
-        DefWithBodyId::ConstId(it) => {
-            db.const_data(it).name.clone().unwrap_or_else(Name::missing).to_string()
-        }
+        DefWithBodyId::FunctionId(it) => db.function_data(it).name.display(db.upcast()).to_string(),
+        DefWithBodyId::StaticId(it) => db.static_data(it).name.display(db.upcast()).to_string(),
+        DefWithBodyId::ConstId(it) => db
+            .const_data(it)
+            .name
+            .clone()
+            .unwrap_or_else(Name::missing)
+            .display(db.upcast())
+            .to_string(),
         DefWithBodyId::VariantId(it) => {
-            db.enum_data(it.parent).variants[it.local_id].name.to_string()
+            db.enum_data(it.parent).variants[it.local_id].name.display(db.upcast()).to_string()
         }
+        DefWithBodyId::InTypeConstId(it) => format!("in type const {it:?}"),
     });
     let body = db.body(def);
     let infer = db.infer(def);
@@ -1804,7 +1907,7 @@ pub fn lower_to_mir(
     }
     let mut ctx = MirLowerCtx::new(db, owner, body, infer);
     // 0 is return local
-    ctx.result.locals.alloc(Local { ty: infer[root_expr].clone() });
+    ctx.result.locals.alloc(Local { ty: ctx.expr_ty_after_adjustments(root_expr) });
     let binding_picker = |b: BindingId| {
         if root_expr == body.body_expr {
             body[b].owner.is_none()
@@ -1833,7 +1936,7 @@ pub fn lower_to_mir(
         ctx.lower_params_and_bindings([].into_iter(), binding_picker)?
     };
     if let Some(current) = ctx.lower_expr_to_place(root_expr, return_slot().into(), current)? {
-        let current = ctx.pop_drop_scope(current);
+        let current = ctx.pop_drop_scope_assert_finished(current)?;
         ctx.set_terminator(current, TerminatorKind::Return, root_expr.into());
     }
     Ok(ctx.result)
